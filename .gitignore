@@ -1,0 +1,19 @@
+# Локальні SRTM-тайли (великі .hgt); структура папки — через _srtm_/.gitkeep
+_srtm_/*
+!_srtm_/.gitkeep
+
+# Python / середовище
+.venv/
+venv/
+designs/
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# IDE (за потреби закомітьте .vscode/, якщо хочете спільні налаштування)
+.idea/

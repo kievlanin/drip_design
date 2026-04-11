@@ -1,0 +1,14 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "DripCAD (module)",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "main_app.main",
+      "cwd": "c:\\DRD",
+      "python": "c:\\DRD\\.venv\\Scripts\\python.exe",
+      "console": "integratedTerminal"
+    }
+  ]
+}

@@ -1,0 +1,66 @@
+{
+  "schema_version": 1,
+  "manufacturer": "Netafim",
+  "items": [
+    { "outside_diameter_mm": 7.90, "technical_data": [ { "model": "Landline™ 8", "inside_diameter_mm": 6.30, "wall_thickness_mm": 0.80, "working_pressure_bar": "4.0", "maximum_flushing_pressure_bar": null } ] },
+    { "outside_diameter_mm": 12.10, "technical_data": [ { "model": "Streamline™ X 12060", "inside_diameter_mm": 11.80, "wall_thickness_mm": 0.15, "working_pressure_bar": "1.60", "maximum_flushing_pressure_bar": "1.8" } ] },
+    { "outside_diameter_mm": 12.20, "technical_data": [ { "model": "Streamline™ X 12080", "inside_diameter_mm": 11.80, "wall_thickness_mm": 0.20, "working_pressure_bar": "1.90", "maximum_flushing_pressure_bar": "2.2" } ] },
+    { "outside_diameter_mm": 12.30, "technical_data": [ { "model": "Aries™ / Landline™ 12010", "inside_diameter_mm": 10.30, "wall_thickness_mm": 1.00, "working_pressure_bar": "3.5 - 4.0", "maximum_flushing_pressure_bar": "5.2" } ] },
+    { "outside_diameter_mm": 12.40, "technical_data": [ { "model": "DripNet PC™ HWD 12009", "inside_diameter_mm": 10.60, "wall_thickness_mm": 0.90, "working_pressure_bar": "2.5 - 3.5", "maximum_flushing_pressure_bar": "3.9" } ] },
+    { "outside_diameter_mm": 12.42, "technical_data": [ { "model": "DripNet PC™ / Typhoon Plus™ 12125", "inside_diameter_mm": 11.80, "wall_thickness_mm": 0.31, "working_pressure_bar": "2.5", "maximum_flushing_pressure_bar": "2.9" } ] },
+    { "outside_diameter_mm": 12.56, "technical_data": [ { "model": "DripNet PC™ / Typhoon Plus™ 12150", "inside_diameter_mm": 11.80, "wall_thickness_mm": 0.38, "working_pressure_bar": "3.0", "maximum_flushing_pressure_bar": "3.5" } ] },
+    { "outside_diameter_mm": 12.60, "technical_data": [ { "model": "DripNet PC™ HWD 12010", "inside_diameter_mm": 10.60, "wall_thickness_mm": 1.00, "working_pressure_bar": "2.5 - 3.5", "maximum_flushing_pressure_bar": "4.6" } ] },
+    { "outside_diameter_mm": 12.80, "technical_data": [ { "model": "DripNet PC™ / Aries™ 12200", "inside_diameter_mm": 11.80, "wall_thickness_mm": 0.50, "working_pressure_bar": "3.0", "maximum_flushing_pressure_bar": "3.9" } ] },
+    { "outside_diameter_mm": 13.06, "technical_data": [ { "model": "DripNet PC™ / Aries™ 12250", "inside_diameter_mm": 11.80, "wall_thickness_mm": 0.63, "working_pressure_bar": "3.0 - 3.5", "maximum_flushing_pressure_bar": "4.6" } ] },
+    { "outside_diameter_mm": 16.00, "technical_data": [ { "model": "UniRam™ / Aries™ / Leach Line A™ 16009", "inside_diameter_mm": 14.20, "wall_thickness_mm": 0.90, "working_pressure_bar": "3.0", "maximum_flushing_pressure_bar": "3.9" } ] },
+    { "outside_diameter_mm": 16.20, "technical_data": [ { "model": "UniRam™ / Aries™ / TechNet™ / Landline™ 16010", "inside_diameter_mm": 14.20, "wall_thickness_mm": 1.00, "working_pressure_bar": "3.5", "maximum_flushing_pressure_bar": "4.6" } ] },
+    { "outside_diameter_mm": 16.46, "technical_data": [ { "model": "Streamline™ X 16050", "inside_diameter_mm": 16.20, "wall_thickness_mm": 0.13, "working_pressure_bar": "0.8", "maximum_flushing_pressure_bar": "0.9" } ] },
+    { "outside_diameter_mm": 16.48, "technical_data": [ { "model": "Streamline™ Plus 16055", "inside_diameter_mm": 16.20, "wall_thickness_mm": 0.14, "working_pressure_bar": "0.9", "maximum_flushing_pressure_bar": "1.0" } ] },
+    { "outside_diameter_mm": 16.50, "technical_data": [ { "model": "Streamline™ Plus / X 16060", "inside_diameter_mm": 16.20, "wall_thickness_mm": 0.15, "working_pressure_bar": "1.0", "maximum_flushing_pressure_bar": "1.2" }, { "model": "DripNet PC™ / Aries™ 16200", "inside_diameter_mm": 15.50, "wall_thickness_mm": 0.50, "working_pressure_bar": "2.5", "maximum_flushing_pressure_bar": "3.3" } ] },
+    { "outside_diameter_mm": 16.56, "technical_data": [ { "model": "Streamline™ X 16070", "inside_diameter_mm": 16.20, "wall_thickness_mm": 0.18, "working_pressure_bar": "1.1", "maximum_flushing_pressure_bar": "1.3" } ] },
+    { "outside_diameter_mm": 16.60, "technical_data": [ { "model": "Streamline™ Plus / X 16080", "inside_diameter_mm": 16.20, "wall_thickness_mm": 0.20, "working_pressure_bar": "1.2", "maximum_flushing_pressure_bar": "1.4" }, { "model": "UniRam™ / Aries™ / TechNet™ 16012", "inside_diameter_mm": 14.20, "wall_thickness_mm": 1.20, "working_pressure_bar": "4.0", "maximum_flushing_pressure_bar": "5.2" } ] },
+    { "outside_diameter_mm": 16.70, "technical_data": [ { "model": "Streamline™ X / Typhoon Plus™ 16100", "inside_diameter_mm": 16.20, "wall_thickness_mm": 0.25, "working_pressure_bar": "1.4", "maximum_flushing_pressure_bar": "1.6" } ] },
+    { "outside_diameter_mm": 16.76, "technical_data": [ { "model": "DripNet PC™ / Aries™ 16250", "inside_diameter_mm": 15.50, "wall_thickness_mm": 0.63, "working_pressure_bar": "2.8", "maximum_flushing_pressure_bar": "3.6" } ] },
+    { "outside_diameter_mm": 16.82, "technical_data": [ { "model": "DripNet PC™ / Typhoon Plus™ / Aries™ 16125", "inside_diameter_mm": 16.20, "wall_thickness_mm": 0.31, "working_pressure_bar": "1.8", "maximum_flushing_pressure_bar": "2.1 - 2.3" } ] },
+    { "outside_diameter_mm": 16.96, "technical_data": [ { "model": "DripNet PC™ / Typhoon Plus™ 16150", "inside_diameter_mm": 16.20, "wall_thickness_mm": 0.38, "working_pressure_bar": "2.2", "maximum_flushing_pressure_bar": "2.5" } ] },
+    { "outside_diameter_mm": 17.00, "technical_data": [ { "model": "UniRam™ / UniWine™ 17012", "inside_diameter_mm": 14.60, "wall_thickness_mm": 1.20, "working_pressure_bar": "4.0", "maximum_flushing_pressure_bar": "5.2" } ] },
+    { "outside_diameter_mm": 17.10, "technical_data": [ { "model": "Aries™ 16008", "inside_diameter_mm": 15.50, "wall_thickness_mm": 0.80, "working_pressure_bar": "3.0", "maximum_flushing_pressure_bar": "3.9" }, { "model": "Typhoon Plus™ 16180", "inside_diameter_mm": 16.20, "wall_thickness_mm": 0.45, "working_pressure_bar": "2.5", "maximum_flushing_pressure_bar": null } ] },
+    { "outside_diameter_mm": 19.50, "technical_data": [ { "model": "UniRam™ / Aries™ 20010", "inside_diameter_mm": 17.50, "wall_thickness_mm": 1.00, "working_pressure_bar": "3.5", "maximum_flushing_pressure_bar": "4.6" } ] },
+    { "outside_diameter_mm": 19.90, "technical_data": [ { "model": "UniRam™ / Aries™ 20012", "inside_diameter_mm": 17.50, "wall_thickness_mm": 1.20, "working_pressure_bar": "4.0", "maximum_flushing_pressure_bar": "5.2" } ] },
+    { "outside_diameter_mm": 22.46, "technical_data": [ { "model": "Streamline™ X 22050", "inside_diameter_mm": 22.20, "wall_thickness_mm": 0.13, "working_pressure_bar": "0.75", "maximum_flushing_pressure_bar": "0.9" } ] },
+    { "outside_diameter_mm": 22.50, "technical_data": [ { "model": "Streamline™ Plus / X 22060", "inside_diameter_mm": 22.20, "wall_thickness_mm": 0.15, "working_pressure_bar": "0.8", "maximum_flushing_pressure_bar": "0.9" } ] },
+    { "outside_diameter_mm": 22.56, "technical_data": [ { "model": "Streamline™ X 22070", "inside_diameter_mm": 22.20, "wall_thickness_mm": 0.18, "working_pressure_bar": "0.9", "maximum_flushing_pressure_bar": "1.0" } ] },
+    { "outside_diameter_mm": 22.60, "technical_data": [ { "model": "Streamline™ Plus / X 22080", "inside_diameter_mm": 22.20, "wall_thickness_mm": 0.20, "working_pressure_bar": "1.0", "maximum_flushing_pressure_bar": "1.2" }, { "model": "DripNet PC™ HWD 23009", "inside_diameter_mm": 20.80, "wall_thickness_mm": 0.90, "working_pressure_bar": "2.5 - 3.5", "maximum_flushing_pressure_bar": "3.5" } ] },
+    { "outside_diameter_mm": 22.70, "technical_data": [ { "model": "Streamline™ X / Typhoon Plus™ 22100", "inside_diameter_mm": 22.20, "wall_thickness_mm": 0.25, "working_pressure_bar": "1.1", "maximum_flushing_pressure_bar": "1.3" } ] },
+    { "outside_diameter_mm": 22.80, "technical_data": [ { "model": "UniRam™ / UniGray™ 23010", "inside_diameter_mm": 20.80, "wall_thickness_mm": 1.00, "working_pressure_bar": "3.0", "maximum_flushing_pressure_bar": "3.5" } ] },
+    { "outside_diameter_mm": 22.82, "technical_data": [ { "model": "Aries™ 22125", "inside_diameter_mm": 22.20, "wall_thickness_mm": 0.31, "working_pressure_bar": "1.5", "maximum_flushing_pressure_bar": "2.0" } ] },
+    { "outside_diameter_mm": 22.88, "technical_data": [ { "model": "DripNet PC™ / Typhoon Plus™ 22135", "inside_diameter_mm": 22.20, "wall_thickness_mm": 0.34, "working_pressure_bar": "1.5", "maximum_flushing_pressure_bar": "1.7" } ] },
+    { "outside_diameter_mm": 22.96, "technical_data": [ { "model": "DripNet PC™ / Typhoon Plus™ 22150", "inside_diameter_mm": 22.20, "wall_thickness_mm": 0.38, "working_pressure_bar": "1.8", "maximum_flushing_pressure_bar": "2.1" } ] },
+    { "outside_diameter_mm": 23.10, "technical_data": [ { "model": "Typhoon Plus™ 22180", "inside_diameter_mm": 22.20, "wall_thickness_mm": 0.45, "working_pressure_bar": "2.1", "maximum_flushing_pressure_bar": "2.4" } ] },
+    { "outside_diameter_mm": 23.46, "technical_data": [ { "model": "DripNet PC™ 22250", "inside_diameter_mm": 22.20, "wall_thickness_mm": 0.63, "working_pressure_bar": "2.5", "maximum_flushing_pressure_bar": "2.9" } ] },
+    { "outside_diameter_mm": 23.56, "technical_data": [ { "model": "Aries™ 22250", "inside_diameter_mm": 22.20, "wall_thickness_mm": 0.63, "working_pressure_bar": "2.5", "maximum_flushing_pressure_bar": "3.3" } ] },
+    { "outside_diameter_mm": 25.68, "technical_data": [ { "model": "DripNet PC™ / Typhoon Plus™ 25135", "inside_diameter_mm": 25.00, "wall_thickness_mm": 0.34, "working_pressure_bar": "1.2", "maximum_flushing_pressure_bar": "1.4" } ] },
+    { "outside_diameter_mm": 25.76, "technical_data": [ { "model": "DripNet PC™ / Typhoon Plus™ 25150", "inside_diameter_mm": 25.00, "wall_thickness_mm": 0.38, "working_pressure_bar": "1.4", "maximum_flushing_pressure_bar": "1.6" } ] },
+    { "outside_diameter_mm": 26.26, "technical_data": [ { "model": "DripNet PC™ 25250", "inside_diameter_mm": 25.00, "wall_thickness_mm": 0.63, "working_pressure_bar": "2.0", "maximum_flushing_pressure_bar": "2.3" } ] },
+    {
+      "outside_diameter_mm": 16,
+      "technical_data": [
+        { "model": "Tape 16mm 6mil", "inside_diameter_mm": 15.70, "wall_thickness_mm": 0.15, "wall_thickness_mil": 6, "type": "Tape", "working_pressure_bar": "", "maximum_flushing_pressure_bar": null },
+        { "model": "Tape 16mm 8mil", "inside_diameter_mm": 15.60, "wall_thickness_mm": 0.20, "wall_thickness_mil": 8, "type": "Tape", "working_pressure_bar": "", "maximum_flushing_pressure_bar": null },
+        { "model": "Heavy Tape 16mm 15mil", "inside_diameter_mm": 15.24, "wall_thickness_mm": 0.38, "wall_thickness_mil": 15, "type": "Heavy Tape", "working_pressure_bar": "", "maximum_flushing_pressure_bar": null },
+        { "model": "Thin-wall Tube 16mm 25mil", "inside_diameter_mm": 14.72, "wall_thickness_mm": 0.64, "wall_thickness_mil": 25, "type": "Thin-wall Tube", "working_pressure_bar": "", "maximum_flushing_pressure_bar": null },
+        { "model": "Standard Multi-season 16mm 35mil", "inside_diameter_mm": 14.22, "wall_thickness_mm": 0.89, "wall_thickness_mil": 35, "type": "Standard Multi-season", "working_pressure_bar": "", "maximum_flushing_pressure_bar": null },
+        { "model": "Heavy-wall Tube 16mm 40mil", "inside_diameter_mm": 13.96, "wall_thickness_mm": 1.02, "wall_thickness_mil": 40, "type": "Heavy-wall Tube", "working_pressure_bar": "", "maximum_flushing_pressure_bar": null },
+        { "model": "Extra-heavy Tube 16mm 45mil", "inside_diameter_mm": 13.72, "wall_thickness_mm": 1.14, "wall_thickness_mil": 45, "type": "Extra-heavy Tube", "working_pressure_bar": "", "maximum_flushing_pressure_bar": null }
+      ]
+    },
+    {
+      "outside_diameter_mm": 20,
+      "technical_data": [
+        { "model": "Standard Tube 20mm 35mil", "inside_diameter_mm": 18.22, "wall_thickness_mm": 0.89, "wall_thickness_mil": 35, "type": "Standard Tube", "working_pressure_bar": "", "maximum_flushing_pressure_bar": null },
+        { "model": "Heavy-wall Tube 20mm 40mil", "inside_diameter_mm": 17.96, "wall_thickness_mm": 1.02, "wall_thickness_mil": 40, "type": "Heavy-wall Tube", "working_pressure_bar": "", "maximum_flushing_pressure_bar": null },
+        { "model": "Premium Tube 20mm 47mil", "inside_diameter_mm": 17.60, "wall_thickness_mm": 1.20, "wall_thickness_mil": 47, "type": "Premium Tube", "working_pressure_bar": "", "maximum_flushing_pressure_bar": null }
+      ]
+    }
+  ]
+}

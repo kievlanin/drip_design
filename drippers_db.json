@@ -1,0 +1,1805 @@
+{
+  "schema_version": 2,
+  "description": "База технічних даних крапельниць за моделями",
+  "models": [
+    {
+      "series": "ARIES HWD (0.9 and 1.0 mm wall thickness)",
+      "manufacturer": "Netafim",
+      "drippers_technical_data": [
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 0.55,
+          "constant_k": 0.191,
+          "exponent_x": 0.46,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.47 x 0.53 x 65",
+          "filtration_area_mm2": 36,
+          "recommended_filtration": "130 micron / 120 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 0.8,
+          "constant_k": 0.277,
+          "exponent_x": 0.46,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.54 x 0.69 x 65",
+          "filtration_area_mm2": 43,
+          "recommended_filtration": "130 micron / 120 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 1.0,
+          "constant_k": 0.347,
+          "exponent_x": 0.46,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.60 x 0.74 x 65",
+          "filtration_area_mm2": 49,
+          "recommended_filtration": "200 micron / 80 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 1.5,
+          "constant_k": 0.52,
+          "exponent_x": 0.46,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.71 x 0.85 x 65",
+          "filtration_area_mm2": 53,
+          "recommended_filtration": "200 micron / 80 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 2.0,
+          "constant_k": 0.693,
+          "exponent_x": 0.46,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.76 x 1.03 x 65",
+          "filtration_area_mm2": 54,
+          "recommended_filtration": "200 micron / 80 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 3.0,
+          "constant_k": 1.04,
+          "exponent_x": 0.46,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.90 x 1.20 x 65",
+          "filtration_area_mm2": 54,
+          "recommended_filtration": "200 micron / 80 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 4.0,
+          "constant_k": 1.387,
+          "exponent_x": 0.46,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.94 x 1.28 x 33",
+          "filtration_area_mm2": 54,
+          "recommended_filtration": "200 micron / 80 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 8.0,
+          "constant_k": 2.773,
+          "exponent_x": 0.46,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "1.52 x 1.28 x 28",
+          "filtration_area_mm2": 50,
+          "recommended_filtration": "200 micron / 80 mesh"
+        }
+      ],
+      "_citations": ""
+    },
+    {
+      "series": "ARIES HWD (1.2 mm wall thickness)",
+      "manufacturer": "Netafim",
+      "drippers_technical_data": [
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 0.55,
+          "constant_k": 0.191,
+          "exponent_x": 0.46,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.47 x 0.53 x 65",
+          "filtration_area_mm2": 36,
+          "recommended_filtration": "130 micron / 120 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 0.85,
+          "constant_k": 0.295,
+          "exponent_x": 0.46,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.54 x 0.69 x 65",
+          "filtration_area_mm2": 43,
+          "recommended_filtration": "130 micron / 120 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 1.05,
+          "constant_k": 0.364,
+          "exponent_x": 0.46,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.60 x 0.74 x 65",
+          "filtration_area_mm2": 49,
+          "recommended_filtration": "200 micron / 80 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 1.6,
+          "constant_k": 0.554,
+          "exponent_x": 0.46,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.71 x 0.85 x 65",
+          "filtration_area_mm2": 53,
+          "recommended_filtration": "200 micron / 80 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 2.1,
+          "constant_k": 0.728,
+          "exponent_x": 0.46,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.76 x 1.03 x 65",
+          "filtration_area_mm2": 54,
+          "recommended_filtration": "200 micron / 80 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 3.15,
+          "constant_k": 1.092,
+          "exponent_x": 0.46,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.90 x 1.20 x 65",
+          "filtration_area_mm2": 54,
+          "recommended_filtration": "200 micron / 80 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 4.2,
+          "constant_k": 1.455,
+          "exponent_x": 0.46,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.94 x 1.28 x 33",
+          "filtration_area_mm2": 54,
+          "recommended_filtration": "200 micron / 80 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 8.4,
+          "constant_k": 2.912,
+          "exponent_x": 0.46,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "1.52 x 1.28 x 28",
+          "filtration_area_mm2": 50,
+          "recommended_filtration": "200 micron / 80 mesh"
+        }
+      ],
+      "_citations": ""
+    },
+    {
+      "series": "ARIES MWD & TWD (0.50 and 0.63 mm wall thickness)",
+      "manufacturer": "Netafim",
+      "drippers_technical_data": [
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 0.5,
+          "constant_k": 0.173,
+          "exponent_x": 0.46,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.47 x 0.53 x 65",
+          "filtration_area_mm2": 36,
+          "recommended_filtration": "130 micron / 120 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 0.8,
+          "constant_k": 0.277,
+          "exponent_x": 0.46,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.54 x 0.69 x 65",
+          "filtration_area_mm2": 43,
+          "recommended_filtration": "130 micron / 120 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 1.0,
+          "constant_k": 0.347,
+          "exponent_x": 0.46,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.60 x 0.74 x 65",
+          "filtration_area_mm2": 49,
+          "recommended_filtration": "200 micron / 80 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 1.4,
+          "constant_k": 0.485,
+          "exponent_x": 0.46,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.71 x 0.85 x 65",
+          "filtration_area_mm2": 53,
+          "recommended_filtration": "200 micron / 80 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 1.9,
+          "constant_k": 0.659,
+          "exponent_x": 0.46,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.76 x 1.03 x 65",
+          "filtration_area_mm2": 54,
+          "recommended_filtration": "200 micron / 80 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 2.85,
+          "constant_k": 0.988,
+          "exponent_x": 0.46,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.90 x 1.20 x 65",
+          "filtration_area_mm2": 54,
+          "recommended_filtration": "200 micron / 80 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 3.8,
+          "constant_k": 1.316,
+          "exponent_x": 0.46,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.94 x 1.28 x 33",
+          "filtration_area_mm2": 54,
+          "recommended_filtration": "200 micron / 80 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 8.0,
+          "constant_k": 2.773,
+          "exponent_x": 0.46,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "1.52 x 1.28 x 28",
+          "filtration_area_mm2": 50,
+          "recommended_filtration": "200 micron / 80 mesh"
+        }
+      ],
+      "_citations": ""
+    },
+    {
+      "series": "ARIES MWD (0.8 mm wall thickness)",
+      "manufacturer": "Netafim",
+      "drippers_technical_data": [
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 0.55,
+          "constant_k": 0.191,
+          "exponent_x": 0.46,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.47 x 0.53 x 65",
+          "filtration_area_mm2": 36,
+          "recommended_filtration": "130 micron / 120 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 0.8,
+          "constant_k": 0.277,
+          "exponent_x": 0.46,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.54 x 0.69 x 65",
+          "filtration_area_mm2": 43,
+          "recommended_filtration": "130 micron / 120 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 1.0,
+          "constant_k": 0.347,
+          "exponent_x": 0.46,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.60 x 0.74 x 65",
+          "filtration_area_mm2": 49,
+          "recommended_filtration": "200 micron / 80 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 1.5,
+          "constant_k": 0.52,
+          "exponent_x": 0.46,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.71 x 0.85 x 65",
+          "filtration_area_mm2": 53,
+          "recommended_filtration": "200 micron / 80 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 2.0,
+          "constant_k": 0.693,
+          "exponent_x": 0.46,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.76 x 1.03 x 65",
+          "filtration_area_mm2": 54,
+          "recommended_filtration": "200 micron / 80 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 3.0,
+          "constant_k": 1.04,
+          "exponent_x": 0.46,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.90 x 1.20 x 65",
+          "filtration_area_mm2": 54,
+          "recommended_filtration": "200 micron / 80 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 4.0,
+          "constant_k": 1.387,
+          "exponent_x": 0.46,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.94 x 1.28 x 33",
+          "filtration_area_mm2": 54,
+          "recommended_filtration": "200 micron / 80 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 8.0,
+          "constant_k": 2.773,
+          "exponent_x": 0.46,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "1.52 x 1.28 x 28",
+          "filtration_area_mm2": 50,
+          "recommended_filtration": "200 micron / 80 mesh"
+        }
+      ],
+      "_citations": ""
+    },
+    {
+      "series": "DRIPNET PC",
+      "manufacturer": "Netafim",
+      "drippers_technical_data": [
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 0.4,
+          "constant_k": 0.4,
+          "exponent_x": 0.0,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.46 x 0.52 x 26",
+          "filtration_area_mm2": 29,
+          "recommended_filtration": "130 micron / 120 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 0.6,
+          "constant_k": 0.6,
+          "exponent_x": 0.0,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.52 x 0.60 x 22",
+          "filtration_area_mm2": 39,
+          "recommended_filtration": "130 micron / 120 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 1.0,
+          "constant_k": 1.0,
+          "exponent_x": 0.0,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.61 x 0.60 x 8",
+          "filtration_area_mm2": 39,
+          "recommended_filtration": "130 micron / 120 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 1.6,
+          "constant_k": 1.6,
+          "exponent_x": 0.0,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.76 x 0.73 x 8",
+          "filtration_area_mm2": 39,
+          "recommended_filtration": "200 micron / 80 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 2.0,
+          "constant_k": 2.0,
+          "exponent_x": 0.0,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.84 x 0.80 x 8",
+          "filtration_area_mm2": 39,
+          "recommended_filtration": "200 micron / 80 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 3.0,
+          "constant_k": 3.0,
+          "exponent_x": 0.0,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "1.02 x 0.88 x 8",
+          "filtration_area_mm2": 39,
+          "recommended_filtration": "200 micron / 80 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 3.8,
+          "constant_k": 3.8,
+          "exponent_x": 0.0,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "1.02 x 0.88 x 8",
+          "filtration_area_mm2": 39,
+          "recommended_filtration": "200 micron / 80 mesh"
+        }
+      ],
+      "_citations": ""
+    },
+    {
+      "series": "DRIPNET PC AS",
+      "manufacturer": "Netafim",
+      "drippers_technical_data": [
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 0.6,
+          "constant_k": 0.6,
+          "exponent_x": 0.0,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.52 x 0.60 x 22",
+          "filtration_area_mm2": 42,
+          "recommended_filtration": "130 micron / 120 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 1.0,
+          "constant_k": 1.0,
+          "exponent_x": 0.0,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.61 x 0.60 x 8",
+          "filtration_area_mm2": 42,
+          "recommended_filtration": "130 micron / 120 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 1.6,
+          "constant_k": 1.6,
+          "exponent_x": 0.0,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.76 x 0.73 x 8",
+          "filtration_area_mm2": 42,
+          "recommended_filtration": "200 micron / 80 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 2.0,
+          "constant_k": 2.0,
+          "exponent_x": 0.0,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.84 x 0.80 x 8",
+          "filtration_area_mm2": 42,
+          "recommended_filtration": "200 micron / 80 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 3.0,
+          "constant_k": 3.0,
+          "exponent_x": 0.0,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "1.02 x 0.88 x 8",
+          "filtration_area_mm2": 42,
+          "recommended_filtration": "200 micron / 80 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 3.8,
+          "constant_k": 3.8,
+          "exponent_x": 0.0,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "1.02 x 0.88 x 8",
+          "filtration_area_mm2": 42,
+          "recommended_filtration": "200 micron / 80 mesh"
+        }
+      ],
+      "_citations": ""
+    },
+    {
+      "series": "LEACH LINE A",
+      "manufacturer": "Netafim",
+      "drippers_technical_data": [
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 1.0,
+          "constant_k": 0.347,
+          "exponent_x": 0.46,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.60 x 0.74 x 65",
+          "filtration_area_mm2": 45,
+          "recommended_filtration": ""
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 1.5,
+          "constant_k": 0.52,
+          "exponent_x": 0.46,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.71 x 0.85 x 65",
+          "filtration_area_mm2": 48,
+          "recommended_filtration": ""
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 2.0,
+          "constant_k": 0.693,
+          "exponent_x": 0.46,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.76 x 1.03 x 65",
+          "filtration_area_mm2": 51,
+          "recommended_filtration": ""
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 3.0,
+          "constant_k": 1.04,
+          "exponent_x": 0.46,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.90 x 1.20 x 65",
+          "filtration_area_mm2": 51,
+          "recommended_filtration": ""
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 4.0,
+          "constant_k": 1.387,
+          "exponent_x": 0.46,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.94 x 1.28 x 33",
+          "filtration_area_mm2": 51,
+          "recommended_filtration": ""
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 8.0,
+          "constant_k": 2.773,
+          "exponent_x": 0.46,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "1.52 x 1.28 x 28",
+          "filtration_area_mm2": 50,
+          "recommended_filtration": ""
+        }
+      ],
+      "_citations": ""
+    },
+    {
+      "series": "PC DRIPPER (FLAT / NIPPLE MODEL)",
+      "manufacturer": "Netafim",
+      "drippers_technical_data": [
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 2.0,
+          "constant_k": 2.0,
+          "exponent_x": 0.0,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "1.17 x 1.07 x 61",
+          "filtration_area_mm2": 2,
+          "recommended_filtration": ""
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 4.0,
+          "constant_k": 4.0,
+          "exponent_x": 0.0,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "1.32 x 1.44 x 60",
+          "filtration_area_mm2": 2,
+          "recommended_filtration": ""
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 8.5,
+          "constant_k": 8.5,
+          "exponent_x": 0.0,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "1.60 x 1.60 x 17",
+          "filtration_area_mm2": 2,
+          "recommended_filtration": ""
+        }
+      ],
+      "_citations": ""
+    },
+    {
+      "series": "PCJ DRIPPER",
+      "manufacturer": "Netafim",
+      "drippers_technical_data": [
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 0.5,
+          "constant_k": 0.5,
+          "exponent_x": 0.0,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.54 x 0.60 x 35",
+          "filtration_area_mm2": 1,
+          "recommended_filtration": ""
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 1.2,
+          "constant_k": 1.2,
+          "exponent_x": 0.0,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.67 x 0.77 x 35",
+          "filtration_area_mm2": 2,
+          "recommended_filtration": ""
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 2.0,
+          "constant_k": 2.0,
+          "exponent_x": 0.0,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.98 x 0.79 x 35",
+          "filtration_area_mm2": 2,
+          "recommended_filtration": ""
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 3.0,
+          "constant_k": 3.0,
+          "exponent_x": 0.0,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "1.03 x 1.07 x 35",
+          "filtration_area_mm2": 2,
+          "recommended_filtration": ""
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 4.0,
+          "constant_k": 4.0,
+          "exponent_x": 0.0,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "1.32 x 0.92 x 35",
+          "filtration_area_mm2": 2,
+          "recommended_filtration": ""
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 8.0,
+          "constant_k": 8.0,
+          "exponent_x": 0.0,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "1.60 x 1.08 x 35",
+          "filtration_area_mm2": 2,
+          "recommended_filtration": ""
+        }
+      ],
+      "_citations": ""
+    },
+    {
+      "series": "PCJ-LCNL DRIPPER",
+      "manufacturer": "Netafim",
+      "drippers_technical_data": [
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 0.5,
+          "constant_k": 0.5,
+          "exponent_x": 0.0,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.54 x 0.60 x 35",
+          "filtration_area_mm2": 1,
+          "recommended_filtration": ""
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 1.2,
+          "constant_k": 1.2,
+          "exponent_x": 0.0,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.67 x 0.77 x 35",
+          "filtration_area_mm2": 2,
+          "recommended_filtration": ""
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 2.0,
+          "constant_k": 2.0,
+          "exponent_x": 0.0,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.98 x 0.79 x 35",
+          "filtration_area_mm2": 2,
+          "recommended_filtration": ""
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 3.0,
+          "constant_k": 3.0,
+          "exponent_x": 0.0,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "1.03 x 1.07 x 35",
+          "filtration_area_mm2": 2,
+          "recommended_filtration": ""
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 4.0,
+          "constant_k": 4.0,
+          "exponent_x": 0.0,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "1.32 x 0.92 x 35",
+          "filtration_area_mm2": 2,
+          "recommended_filtration": ""
+        }
+      ],
+      "_citations": ""
+    },
+    {
+      "series": "SLX 12060",
+      "manufacturer": "Netafim",
+      "drippers_technical_data": [
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 0.35,
+          "constant_k": 0.116,
+          "exponent_x": 0.48,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.35 x 0.34 x 23",
+          "filtration_area_mm2": 11,
+          "recommended_filtration": "130 micron / 120 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 0.75,
+          "constant_k": 0.248,
+          "exponent_x": 0.48,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.48 x 0.53 x 25",
+          "filtration_area_mm2": 15,
+          "recommended_filtration": "130 micron / 120 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 1.1,
+          "constant_k": 0.389,
+          "exponent_x": 0.45,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.51 x 0.51 x 13",
+          "filtration_area_mm2": 16,
+          "recommended_filtration": "130 micron / 120 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 1.6,
+          "constant_k": 0.568,
+          "exponent_x": 0.45,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.64 x 0.60 x 13",
+          "filtration_area_mm2": 14,
+          "recommended_filtration": "130 micron / 120 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 2.2,
+          "constant_k": 0.78,
+          "exponent_x": 0.45,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.75 x 0.70 x 13",
+          "filtration_area_mm2": 14,
+          "recommended_filtration": "130 micron / 120 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 2.8,
+          "constant_k": 0.993,
+          "exponent_x": 0.45,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.84 x 0.75 x 13",
+          "filtration_area_mm2": 15,
+          "recommended_filtration": "200 micron / 80 mesh"
+        }
+      ],
+      "_citations": ""
+    },
+    {
+      "series": "SLX 12080",
+      "manufacturer": "Netafim",
+      "drippers_technical_data": [
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 0.35,
+          "constant_k": 0.116,
+          "exponent_x": 0.48,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.35 x 0.34 x 23",
+          "filtration_area_mm2": 11,
+          "recommended_filtration": "130 micron / 120 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 0.75,
+          "constant_k": 0.248,
+          "exponent_x": 0.48,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.48 x 0.53 x 25",
+          "filtration_area_mm2": 15,
+          "recommended_filtration": "130 micron / 120 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 1.05,
+          "constant_k": 0.373,
+          "exponent_x": 0.45,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.51 x 0.51 x 13",
+          "filtration_area_mm2": 16,
+          "recommended_filtration": "130 micron / 120 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 1.6,
+          "constant_k": 0.568,
+          "exponent_x": 0.45,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.64 x 0.60 x 13",
+          "filtration_area_mm2": 14,
+          "recommended_filtration": "130 micron / 120 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 2.2,
+          "constant_k": 0.78,
+          "exponent_x": 0.45,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.75 x 0.70 x 13",
+          "filtration_area_mm2": 14,
+          "recommended_filtration": "130 micron / 120 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 2.8,
+          "constant_k": 0.993,
+          "exponent_x": 0.45,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.84 x 0.75 x 13",
+          "filtration_area_mm2": 15,
+          "recommended_filtration": "200 micron / 80 mesh"
+        }
+      ],
+      "_citations": ""
+    },
+    {
+      "series": "SLX 16050",
+      "manufacturer": "Netafim",
+      "drippers_technical_data": [
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 0.35,
+          "constant_k": 0.116,
+          "exponent_x": 0.48,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.35 x 0.34 x 23",
+          "filtration_area_mm2": 11,
+          "recommended_filtration": "130 micron / 120 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 0.75,
+          "constant_k": 0.248,
+          "exponent_x": 0.48,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.48 x 0.53 x 25",
+          "filtration_area_mm2": 15,
+          "recommended_filtration": "130 micron / 120 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 1.1,
+          "constant_k": 0.389,
+          "exponent_x": 0.45,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.51 x 0.51 x 13",
+          "filtration_area_mm2": 16,
+          "recommended_filtration": "130 micron / 120 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 1.6,
+          "constant_k": 0.568,
+          "exponent_x": 0.45,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.64 x 0.60 x 13",
+          "filtration_area_mm2": 14,
+          "recommended_filtration": "130 micron / 120 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 2.2,
+          "constant_k": 0.78,
+          "exponent_x": 0.45,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.75 x 0.70 x 13",
+          "filtration_area_mm2": 14,
+          "recommended_filtration": "130 micron / 120 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 2.8,
+          "constant_k": 0.993,
+          "exponent_x": 0.45,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.84 x 0.75 x 13",
+          "filtration_area_mm2": 15,
+          "recommended_filtration": "200 micron / 80 mesh"
+        }
+      ],
+      "_citations": ""
+    },
+    {
+      "series": "SLX 16060",
+      "manufacturer": "Netafim",
+      "drippers_technical_data": [
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 0.35,
+          "constant_k": 0.116,
+          "exponent_x": 0.48,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.35 x 0.34 x 23",
+          "filtration_area_mm2": 11,
+          "recommended_filtration": "130 micron / 120 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 0.75,
+          "constant_k": 0.248,
+          "exponent_x": 0.48,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.48 x 0.53 x 25",
+          "filtration_area_mm2": 15,
+          "recommended_filtration": "130 micron / 120 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 1.1,
+          "constant_k": 0.389,
+          "exponent_x": 0.45,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.51 x 0.51 x 13",
+          "filtration_area_mm2": 16,
+          "recommended_filtration": "130 micron / 120 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 1.6,
+          "constant_k": 0.568,
+          "exponent_x": 0.45,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.64 x 0.60 x 13",
+          "filtration_area_mm2": 14,
+          "recommended_filtration": "130 micron / 120 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 2.2,
+          "constant_k": 0.78,
+          "exponent_x": 0.45,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.75 x 0.70 x 13",
+          "filtration_area_mm2": 14,
+          "recommended_filtration": "130 micron / 120 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 2.8,
+          "constant_k": 0.993,
+          "exponent_x": 0.45,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.84 x 0.75 x 13",
+          "filtration_area_mm2": 15,
+          "recommended_filtration": "200 micron / 80 mesh"
+        }
+      ],
+      "_citations": ""
+    },
+    {
+      "series": "SLX 16070",
+      "manufacturer": "Netafim",
+      "drippers_technical_data": [
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 0.35,
+          "constant_k": 0.116,
+          "exponent_x": 0.48,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.35 x 0.34 x 23",
+          "filtration_area_mm2": 11,
+          "recommended_filtration": "130 micron / 120 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 0.75,
+          "constant_k": 0.248,
+          "exponent_x": 0.48,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.48 x 0.53 x 25",
+          "filtration_area_mm2": 15,
+          "recommended_filtration": "130 micron / 120 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 1.1,
+          "constant_k": 0.389,
+          "exponent_x": 0.45,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.51 x 0.51 x 13",
+          "filtration_area_mm2": 16,
+          "recommended_filtration": "130 micron / 120 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 1.6,
+          "constant_k": 0.568,
+          "exponent_x": 0.45,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.64 x 0.60 x 13",
+          "filtration_area_mm2": 14,
+          "recommended_filtration": "130 micron / 120 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 2.2,
+          "constant_k": 0.78,
+          "exponent_x": 0.45,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.75 x 0.70 x 13",
+          "filtration_area_mm2": 14,
+          "recommended_filtration": "130 micron / 120 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 2.8,
+          "constant_k": 0.993,
+          "exponent_x": 0.45,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.84 x 0.75 x 13",
+          "filtration_area_mm2": 15,
+          "recommended_filtration": "200 micron / 80 mesh"
+        }
+      ],
+      "_citations": ""
+    },
+    {
+      "series": "SLX 16080",
+      "manufacturer": "Netafim",
+      "drippers_technical_data": [
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 0.35,
+          "constant_k": 0.116,
+          "exponent_x": 0.48,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.35 x 0.34 x 23",
+          "filtration_area_mm2": 11,
+          "recommended_filtration": "130 micron / 120 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 0.35,
+          "constant_k": 0.116,
+          "exponent_x": 0.48,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.35 x 0.34 x 23",
+          "filtration_area_mm2": 11,
+          "recommended_filtration": "130 micron / 120 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 0.75,
+          "constant_k": 0.248,
+          "exponent_x": 0.48,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.48 x 0.53 x 25",
+          "filtration_area_mm2": 15,
+          "recommended_filtration": "130 micron / 120 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 1.05,
+          "constant_k": 0.373,
+          "exponent_x": 0.45,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.51 x 0.51 x 13",
+          "filtration_area_mm2": 16,
+          "recommended_filtration": "130 micron / 120 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 1.6,
+          "constant_k": 0.568,
+          "exponent_x": 0.45,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.64 x 0.60 x 13",
+          "filtration_area_mm2": 14,
+          "recommended_filtration": "130 micron / 120 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 2.2,
+          "constant_k": 0.78,
+          "exponent_x": 0.45,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.75 x 0.70 x 13",
+          "filtration_area_mm2": 14,
+          "recommended_filtration": "130 micron / 120 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 2.8,
+          "constant_k": 0.993,
+          "exponent_x": 0.45,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.84 x 0.75 x 13",
+          "filtration_area_mm2": 15,
+          "recommended_filtration": "200 micron / 80 mesh"
+        }
+      ],
+      "_citations": ""
+    },
+    {
+      "series": "SLX 16100",
+      "manufacturer": "Netafim",
+      "drippers_technical_data": [
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 0.35,
+          "constant_k": 0.116,
+          "exponent_x": 0.48,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.35 x 0.34 x 23",
+          "filtration_area_mm2": 11,
+          "recommended_filtration": "130 micron / 120 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 0.75,
+          "constant_k": 0.248,
+          "exponent_x": 0.48,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.48 x 0.53 x 25",
+          "filtration_area_mm2": 15,
+          "recommended_filtration": "130 micron / 120 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 1.05,
+          "constant_k": 0.373,
+          "exponent_x": 0.45,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.51 x 0.51 x 13",
+          "filtration_area_mm2": 16,
+          "recommended_filtration": "130 micron / 120 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 1.6,
+          "constant_k": 0.568,
+          "exponent_x": 0.45,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.64 x 0.60 x 13",
+          "filtration_area_mm2": 14,
+          "recommended_filtration": "130 micron / 120 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 2.2,
+          "constant_k": 0.78,
+          "exponent_x": 0.45,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.75 x 0.70 x 13",
+          "filtration_area_mm2": 14,
+          "recommended_filtration": "130 micron / 120 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 2.8,
+          "constant_k": 0.993,
+          "exponent_x": 0.45,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.84 x 0.75 x 13",
+          "filtration_area_mm2": 15,
+          "recommended_filtration": "200 micron / 80 mesh"
+        }
+      ],
+      "_citations": ""
+    },
+    {
+      "series": "SLX 22050",
+      "manufacturer": "Netafim",
+      "drippers_technical_data": [
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 0.35,
+          "constant_k": 0.116,
+          "exponent_x": 0.48,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.35 x 0.34 x 23",
+          "filtration_area_mm2": 11,
+          "recommended_filtration": "130 micron / 120 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 0.75,
+          "constant_k": 0.248,
+          "exponent_x": 0.48,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.48 x 0.53 x 25",
+          "filtration_area_mm2": 15,
+          "recommended_filtration": "130 micron / 120 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 1.1,
+          "constant_k": 0.389,
+          "exponent_x": 0.45,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.51 x 0.51 x 13",
+          "filtration_area_mm2": 16,
+          "recommended_filtration": "130 micron / 120 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 1.6,
+          "constant_k": 0.568,
+          "exponent_x": 0.45,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.64 x 0.60 x 13",
+          "filtration_area_mm2": 14,
+          "recommended_filtration": "130 micron / 120 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 2.2,
+          "constant_k": 0.78,
+          "exponent_x": 0.45,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.75 x 0.70 x 13",
+          "filtration_area_mm2": 14,
+          "recommended_filtration": "130 micron / 120 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 2.8,
+          "constant_k": 0.993,
+          "exponent_x": 0.45,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.84 x 0.75 x 13",
+          "filtration_area_mm2": 15,
+          "recommended_filtration": "200 micron / 80 mesh"
+        }
+      ],
+      "_citations": ""
+    },
+    {
+      "series": "SLX 22060",
+      "manufacturer": "Netafim",
+      "drippers_technical_data": [
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 0.35,
+          "constant_k": 0.116,
+          "exponent_x": 0.48,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.35 x 0.34 x 23",
+          "filtration_area_mm2": 11,
+          "recommended_filtration": "130 micron / 120 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 0.75,
+          "constant_k": 0.248,
+          "exponent_x": 0.48,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.48 x 0.53 x 25",
+          "filtration_area_mm2": 15,
+          "recommended_filtration": "130 micron / 120 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 1.1,
+          "constant_k": 0.389,
+          "exponent_x": 0.45,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.51 x 0.51 x 13",
+          "filtration_area_mm2": 16,
+          "recommended_filtration": "130 micron / 120 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 1.6,
+          "constant_k": 0.568,
+          "exponent_x": 0.45,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.64 x 0.60 x 13",
+          "filtration_area_mm2": 14,
+          "recommended_filtration": "130 micron / 120 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 2.2,
+          "constant_k": 0.78,
+          "exponent_x": 0.45,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.75 x 0.70 x 13",
+          "filtration_area_mm2": 14,
+          "recommended_filtration": "130 micron / 120 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 2.8,
+          "constant_k": 0.993,
+          "exponent_x": 0.45,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.84 x 0.75 x 13",
+          "filtration_area_mm2": 15,
+          "recommended_filtration": "200 micron / 80 mesh"
+        }
+      ],
+      "_citations": ""
+    },
+    {
+      "series": "SLX 22070",
+      "manufacturer": "Netafim",
+      "drippers_technical_data": [
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 0.35,
+          "constant_k": 0.116,
+          "exponent_x": 0.48,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.35 x 0.34 x 23",
+          "filtration_area_mm2": 11,
+          "recommended_filtration": "130 micron / 120 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 0.75,
+          "constant_k": 0.248,
+          "exponent_x": 0.48,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.48 x 0.53 x 25",
+          "filtration_area_mm2": 15,
+          "recommended_filtration": "130 micron / 120 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 1.1,
+          "constant_k": 0.389,
+          "exponent_x": 0.45,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.51 x 0.51 x 13",
+          "filtration_area_mm2": 16,
+          "recommended_filtration": "130 micron / 120 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 1.6,
+          "constant_k": 0.568,
+          "exponent_x": 0.45,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.64 x 0.60 x 13",
+          "filtration_area_mm2": 14,
+          "recommended_filtration": "130 micron / 120 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 2.2,
+          "constant_k": 0.78,
+          "exponent_x": 0.45,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.75 x 0.70 x 13",
+          "filtration_area_mm2": 14,
+          "recommended_filtration": "130 micron / 120 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 2.8,
+          "constant_k": 0.993,
+          "exponent_x": 0.45,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.84 x 0.75 x 13",
+          "filtration_area_mm2": 15,
+          "recommended_filtration": "200 micron / 80 mesh"
+        }
+      ],
+      "_citations": ""
+    },
+    {
+      "series": "SLX 22080",
+      "manufacturer": "Netafim",
+      "drippers_technical_data": [
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 0.35,
+          "constant_k": 0.116,
+          "exponent_x": 0.48,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.35 x 0.34 x 23",
+          "filtration_area_mm2": 11,
+          "recommended_filtration": "130 micron / 120 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 0.75,
+          "constant_k": 0.248,
+          "exponent_x": 0.48,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.48 x 0.53 x 25",
+          "filtration_area_mm2": 15,
+          "recommended_filtration": "130 micron / 120 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 1.05,
+          "constant_k": 0.373,
+          "exponent_x": 0.45,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.51 x 0.51 x 13",
+          "filtration_area_mm2": 16,
+          "recommended_filtration": "130 micron / 120 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 1.6,
+          "constant_k": 0.568,
+          "exponent_x": 0.45,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.64 x 0.60 x 13",
+          "filtration_area_mm2": 14,
+          "recommended_filtration": "130 micron / 120 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 2.2,
+          "constant_k": 0.78,
+          "exponent_x": 0.45,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.75 x 0.70 x 13",
+          "filtration_area_mm2": 14,
+          "recommended_filtration": "130 micron / 120 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 2.8,
+          "constant_k": 0.993,
+          "exponent_x": 0.45,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.84 x 0.75 x 13",
+          "filtration_area_mm2": 15,
+          "recommended_filtration": "200 micron / 80 mesh"
+        }
+      ],
+      "_citations": ""
+    },
+    {
+      "series": "SLX 22100",
+      "manufacturer": "Netafim",
+      "drippers_technical_data": [
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 0.35,
+          "constant_k": 0.116,
+          "exponent_x": 0.48,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.35 x 0.34 x 23",
+          "filtration_area_mm2": 11,
+          "recommended_filtration": "130 micron / 120 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 0.75,
+          "constant_k": 0.248,
+          "exponent_x": 0.48,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.48 x 0.53 x 25",
+          "filtration_area_mm2": 15,
+          "recommended_filtration": "130 micron / 120 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 1.05,
+          "constant_k": 0.373,
+          "exponent_x": 0.45,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.51 x 0.51 x 13",
+          "filtration_area_mm2": 16,
+          "recommended_filtration": "130 micron / 120 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 1.6,
+          "constant_k": 0.568,
+          "exponent_x": 0.45,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.64 x 0.60 x 13",
+          "filtration_area_mm2": 14,
+          "recommended_filtration": "130 micron / 120 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 2.2,
+          "constant_k": 0.78,
+          "exponent_x": 0.45,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.75 x 0.70 x 13",
+          "filtration_area_mm2": 14,
+          "recommended_filtration": "130 micron / 120 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 2.8,
+          "constant_k": 0.993,
+          "exponent_x": 0.45,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.84 x 0.75 x 13",
+          "filtration_area_mm2": 15,
+          "recommended_filtration": "200 micron / 80 mesh"
+        }
+      ],
+      "_citations": ""
+    },
+    {
+      "series": "STREAMLINE PLUS (0.14, 0.15, 0.18 mm wall thickness)",
+      "manufacturer": "Netafim",
+      "drippers_technical_data": [
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 0.8,
+          "constant_k": 0.265,
+          "exponent_x": 0.48,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.59 x 0.33 x 25",
+          "filtration_area_mm2": 12,
+          "recommended_filtration": "130 micron / 120 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 1.1,
+          "constant_k": 0.392,
+          "exponent_x": 0.45,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.51 x 0.44 x 13",
+          "filtration_area_mm2": 14,
+          "recommended_filtration": "130 micron / 120 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 1.6,
+          "constant_k": 0.568,
+          "exponent_x": 0.45,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.65 x 0.55 x 13",
+          "filtration_area_mm2": 15,
+          "recommended_filtration": "130 micron / 120 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 2.2,
+          "constant_k": 0.78,
+          "exponent_x": 0.45,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.72 x 0.65 x 13",
+          "filtration_area_mm2": 15,
+          "recommended_filtration": "130 micron / 120 mesh"
+        }
+      ],
+      "_citations": ""
+    },
+    {
+      "series": "TECHNET AS",
+      "manufacturer": "Netafim",
+      "drippers_technical_data": [
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 1.0,
+          "constant_k": 1.0,
+          "exponent_x": 0.0,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.61 x 0.60 x 8",
+          "filtration_area_mm2": 42,
+          "recommended_filtration": ""
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 1.6,
+          "constant_k": 1.6,
+          "exponent_x": 0.0,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.76 x 0.73 x 8",
+          "filtration_area_mm2": 42,
+          "recommended_filtration": ""
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 2.0,
+          "constant_k": 2.0,
+          "exponent_x": 0.0,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.84 x 0.80 x 8",
+          "filtration_area_mm2": 42,
+          "recommended_filtration": ""
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 3.0,
+          "constant_k": 3.0,
+          "exponent_x": 0.0,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "1.02 x 0.88 x 8",
+          "filtration_area_mm2": 42,
+          "recommended_filtration": ""
+        }
+      ],
+      "_citations": ""
+    },
+    {
+      "series": "UNIGRAY CNL AND HCNL",
+      "manufacturer": "Netafim",
+      "drippers_technical_data": [
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 0.7,
+          "constant_k": 0.7,
+          "exponent_x": 0.0,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.70 x 0.65 x 40",
+          "filtration_area_mm2": 110,
+          "recommended_filtration": "130 micron / 120 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 1.0,
+          "constant_k": 1.0,
+          "exponent_x": 0.0,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.83 x 0.74 x 40",
+          "filtration_area_mm2": 130,
+          "recommended_filtration": "130 micron / 120 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 1.6,
+          "constant_k": 1.6,
+          "exponent_x": 0.0,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "1.07 x 0.79 x 40",
+          "filtration_area_mm2": 130,
+          "recommended_filtration": "130 micron / 120 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 2.3,
+          "constant_k": 2.3,
+          "exponent_x": 0.0,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "1.26 x 0.95 x 40",
+          "filtration_area_mm2": 130,
+          "recommended_filtration": "130 micron / 120 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 3.5,
+          "constant_k": 3.5,
+          "exponent_x": 0.0,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "1.59 x 1.10 x 40",
+          "filtration_area_mm2": 150,
+          "recommended_filtration": "130 micron / 120 mesh"
+        }
+      ],
+      "_citations": ""
+    },
+    {
+      "series": "UNIRAM / UNIWINE / UNIGRAY / UNIRAM AS / UNIRAM RC",
+      "manufacturer": "Netafim",
+      "drippers_technical_data": [
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 0.7,
+          "constant_k": 0.7,
+          "exponent_x": 0.0,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.70 x 0.65 x 40",
+          "filtration_area_mm2": 110,
+          "recommended_filtration": "130 micron / 120 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 1.0,
+          "constant_k": 1.0,
+          "exponent_x": 0.0,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.83 x 0.74 x 40",
+          "filtration_area_mm2": 130,
+          "recommended_filtration": "130 micron / 120 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 1.6,
+          "constant_k": 1.6,
+          "exponent_x": 0.0,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "1.07 x 0.79 x 40",
+          "filtration_area_mm2": 130,
+          "recommended_filtration": "200 micron / 80 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 2.3,
+          "constant_k": 2.3,
+          "exponent_x": 0.0,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "1.26 x 0.95 x 40",
+          "filtration_area_mm2": 130,
+          "recommended_filtration": "200 micron / 80 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 3.5,
+          "constant_k": 3.5,
+          "exponent_x": 0.0,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "1.59 x 1.10 x 40",
+          "filtration_area_mm2": 150,
+          "recommended_filtration": "200 micron / 80 mesh"
+        }
+      ],
+      "_citations": ""
+    },
+    {
+      "series": "UNIRAM CNL",
+      "manufacturer": "Netafim",
+      "drippers_technical_data": [
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 0.85,
+          "constant_k": 0.85,
+          "exponent_x": 0.0,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.70 x 0.65 x 40",
+          "filtration_area_mm2": 110,
+          "recommended_filtration": "130 micron / 120 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 1.25,
+          "constant_k": 1.25,
+          "exponent_x": 0.0,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "0.83 x 0.74 x 40",
+          "filtration_area_mm2": 130,
+          "recommended_filtration": "130 micron / 120 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 2.0,
+          "constant_k": 2.0,
+          "exponent_x": 0.0,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "1.07 x 0.79 x 40",
+          "filtration_area_mm2": 130,
+          "recommended_filtration": "130 micron / 120 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 2.9,
+          "constant_k": 2.9,
+          "exponent_x": 0.0,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "1.26 x 0.95 x 40",
+          "filtration_area_mm2": 130,
+          "recommended_filtration": "130 micron / 120 mesh"
+        },
+        {
+          "manufacturer": "Netafim",
+          "nominal_flow_l_h": 4.4,
+          "constant_k": 4.4,
+          "exponent_x": 0.0,
+          "kd": 1.0,
+          "water_passages_dimensions_mm": "1.59 x 1.10 x 40",
+          "filtration_area_mm2": 150,
+          "recommended_filtration": "130 micron / 120 mesh"
+        }
+      ],
+      "_citations": ""
+    }
+  ]
+}

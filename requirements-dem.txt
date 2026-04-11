@@ -1,0 +1,9 @@
+# Optional dependencies for modules/geo_module/dem_contours (GeoTIFF → contours).
+# GDAL Python bindings are not always on PyPI for Windows; prefer:
+#   conda install -c conda-forge gdal
+# or OSGeo4W / wheels from https://github.com/cgohlke/geospatial-wheels/releases
+
+numpy>=1.20
+shapely>=2.0
+# scipy: only needed if using --smooth-sigma
+# scipy>=1.9

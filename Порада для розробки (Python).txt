@@ -1,0 +1,9 @@
+from scipy.optimize import bisect
+
+# Ваша функція розрахунку з кінця
+def check_pressure_diff(h_end_guess):
+    h_start_calc, q_total = backwards_step_method(h_end_guess)
+    return h_start_calc - H_target
+
+# Автоматичний пошук
+optimal_h_end = bisect(check_pressure_diff, 0, H_target)
