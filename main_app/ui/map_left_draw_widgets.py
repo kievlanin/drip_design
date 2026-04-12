@@ -19,6 +19,7 @@ def build_trunk_tools_tab(
     attach_tt=_attach_dark_tooltip,
     *,
     on_map_tab: bool = False,
+    app=None,
 ) -> None:
     """Кнопки магістралі; set_tool — на карті прямий _set_tool, без карти — маршрутизатор на embedded host."""
     tk.Label(
@@ -29,7 +30,7 @@ def build_trunk_tools_tab(
         font=("Segoe UI", 9, "bold"),
     ).pack(fill=tk.X, padx=8, pady=(8, 4))
     _sub = (
-        "Ламана на карті; дерево від насоса (кран — відведення/сток, розгалуження, Q(t))."
+        "Ламана на карті; дерево від насоса (пікет, розгалуження, споживач, Q(t))."
         if on_map_tab
         else "На «Без карти»: ЛКМ по полотну, ПКМ — зафіксувати вузол/лінію. Зона проєкту — лише на «Карті»; «Вибір»/«Інфо» працюють і на полотні."
     )
@@ -72,7 +73,7 @@ def build_trunk_tools_tab(
     _btn_select.bind("<Button-1>", _on_select_canvas_click)
     attach_tt(
         _btn_select,
-        "Вибір (стрілка): ЛКМ по об'єкту — підпис; на магістралі — жовтий шлях до насоса, біля розгалуження лайм до споживачів.",
+        "Вибір (стрілка): ЛКМ — об'єкт; Ctrl+ЛКМ — додати/зняти з групи; рамка — Ctrl додає до вже обраного; ПКМ — список обраного й скидання. На магістралі — жовтий шлях до насоса, біля розгалуження лайм до споживачів.",
         above=True,
     )
     _btn_map_pick_info = tk.Button(
@@ -126,19 +127,6 @@ def build_trunk_tools_tab(
         _btn_trunk_pump,
         "Єдиний насос (source): кожен ЛКМ переміщує його, ПКМ — вийти з команди.",
     )
-    _btn_trunk_valve = tk.Button(
-        tab_trunk,
-        text="⎔ Кран (відведення)",
-        command=lambda: set_tool("trunk_valve"),
-        bg="#4a3820",
-        fg="#E8D4A8",
-        relief=tk.FLAT,
-    )
-    _btn_trunk_valve.pack(fill=tk.X, padx=8, pady=3)
-    attach_tt(
-        _btn_trunk_valve,
-        "Кран (valve): ЛКМ — новий вузол на кожен клік, ПКМ — вийти з команди.",
-    )
     _btn_trunk_picket = tk.Button(
         tab_trunk,
         text="● Пікет (на трасі)",
@@ -178,6 +166,20 @@ def build_trunk_tools_tab(
         _btn_trunk_consumer,
         "Споживач (consumption): ЛКМ — новий вузол, ПКМ — вийти з команди.",
     )
+    if app is not None and hasattr(app, "open_pipe_selector"):
+        _btn_trunk_pipes = tk.Button(
+            tab_trunk,
+            text="✅ Труби для магістралі…",
+            command=lambda: app.open_pipe_selector("trunk"),
+            bg="#1b3d2f",
+            fg="#B9F6CA",
+            relief=tk.FLAT,
+        )
+        _btn_trunk_pipes.pack(fill=tk.X, padx=8, pady=(10, 3))
+        attach_tt(
+            _btn_trunk_pipes,
+            "Окремий набір дозволених труб для магістралі. Зберігається в JSON у trunk → allowed_pipes.",
+        )
 
 
 def build_draw_modes_tab(tab_draw: tk.Misc, app, attach_tt=_attach_dark_tooltip) -> None:
@@ -398,5 +400,5 @@ def build_off_canvas_draw_notebook(
     draw_nb.add(tab_trunk, text="Магістраль")
 
     build_draw_modes_tab(tab_draw, app, attach_tt)
-    build_trunk_tools_tab(tab_trunk, map_tool_router, attach_tt)
+    build_trunk_tools_tab(tab_trunk, map_tool_router, attach_tt, app=app)
     return draw_nb

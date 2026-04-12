@@ -56,11 +56,11 @@ from modules.hydraulic_module.trunk_map_graph import (
 
 # Інструменти магістралі на головному полотні («Без карти») — ті самі імена, що на карті.
 _CANVAS_TRUNK_POINT_TOOLS = frozenset(
-    {"trunk_pump", "trunk_valve", "trunk_picket", "trunk_junction", "trunk_consumer"}
+    {"trunk_pump", "trunk_picket", "trunk_junction", "trunk_consumer"}
 )
 # Підбір об'єкта: «Інфо» (рука) і «Вибір» (стрілка) — одна логіка, різний курсор.
 _CANVAS_PASSIVE_PICK_TOOLS = frozenset({"map_pick_info", "select"})
-_TRUNK_NODE_SNAP_CANVAS_M = 40.0
+_TRUNK_NODE_SNAP_CANVAS_M = 16.0
 _TRUNK_CANVAS_PATH_COLOR = "#8E24AA"
 # Інфо: шлях до насоса / шлях до споживачів від розгалуження
 _TRUNK_INFO_COLOR_PUMP_PATH = "#FFEB3B"
@@ -76,7 +76,6 @@ _PICK_LAT_SCENE_R_M = 12.0
 def _canvas_trunk_rubber_color(tool: str) -> str:
     return {
         "trunk_pump": "#EF5350",
-        "trunk_valve": "#E57373",
         "trunk_picket": "#42A5F5",
         "trunk_junction": "#1E88E5",
         "trunk_consumer": "#C4933A",
@@ -102,6 +101,7 @@ class DripCAD:
             self.allowed_pipes[mat] = {}
             for pn, ods in pns.items():
                 self.allowed_pipes[mat][pn] = list(ods.keys())
+        self.trunk_allowed_pipes = copy.deepcopy(self.allowed_pipes)
 
         self.MAX_FIELD_BLOCKS = 100
         self.points, self.dir_points = [], []
@@ -134,7 +134,7 @@ class DripCAD:
         self.geo_ref = None
         # Декоративні полілінії (карта / ситуація), не беруть участі в гідравліці; зберігаються в JSON як scene_lines.
         self.scene_lines = []
-        # Вузли магістралі на карті (WGS84 + локальні XY); kind: source | bend | junction | consumption — зберігаються в JSON.
+        # Вузли магістралі на карті (WGS84 + локальні XY); kind: source | bend | junction | consumption — у JSON (застарілий valve нормалізується при завантаженні).
         self.trunk_map_nodes = []
         # Відрізки магістралі: кожен запис — ребро (два вузли) + path_local (полілінія) у м.
         self.trunk_map_segments = []
@@ -281,6 +281,42 @@ class DripCAD:
         self.left_pane.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         self.top_bar = tk.Frame(self.left_pane, bg="#1a1a1e", height=32)
         self.top_bar.pack(side=tk.TOP, fill=tk.X)
+        self._btn_top_zoom_frame = tk.Button(
+            self.top_bar,
+            text="Зум рамкою",
+            command=self._top_bar_zoom_frame,
+            bg="#2d333b",
+            fg="#e8e8e8",
+            activebackground="#3d4a55",
+            activeforeground="#ffffff",
+            relief=tk.FLAT,
+            padx=8,
+            pady=2,
+            font=("Segoe UI", 9),
+        )
+        self._btn_top_zoom_frame.pack(side=tk.LEFT, padx=(8, 2), pady=4)
+        attach_tooltip(
+            self._btn_top_zoom_frame,
+            "«Без карти»: рамка на полотні (ЛКМ — кут, ще ЛКМ — протилежний кут). «Карта»: прямокутник на мапі.",
+        )
+        self._btn_top_zoom_extents = tk.Button(
+            self.top_bar,
+            text="Зум екстенти",
+            command=self._top_bar_zoom_extents,
+            bg="#2d333b",
+            fg="#e8e8e8",
+            activebackground="#3d4a55",
+            activeforeground="#ffffff",
+            relief=tk.FLAT,
+            padx=8,
+            pady=2,
+            font=("Segoe UI", 9),
+        )
+        self._btn_top_zoom_extents.pack(side=tk.LEFT, padx=(0, 2), pady=4)
+        attach_tooltip(
+            self._btn_top_zoom_extents,
+            "Умістити весь проєкт у вікні: на полотні — локальна геометрія; на карті — увімкнені шари overlay.",
+        )
         tk.Label(
             self.top_bar,
             text="Активний блок:",
@@ -662,15 +698,35 @@ class DripCAD:
         except Exception:
             return 1e18
 
+    @staticmethod
+    def _resolve_trunk_node_vs_segment_pick(
+        node_hits: List[Tuple[int, float, str, object, str]],
+        seg_hits: List[Tuple[int, float, str, object, str]],
+        ambiguous_radius_m: float,
+    ) -> Optional[Tuple[int, float, str, object, str]]:
+        """
+        Одне попадання по магістралі: за замовчуванням — ближчий об'єкт (вузол або ребро).
+        Якщо одночасно «під курсором» (обидва в межах ambiguous_radius_m) — вузол
+        (для розкладу включень споживачів); інакше перемагає менша відстань.
+        """
+        best_n = min(node_hits, key=lambda h: h[1]) if node_hits else None
+        best_s = min(seg_hits, key=lambda h: h[1]) if seg_hits else None
+        if best_n is None:
+            return best_s
+        if best_s is None:
+            return best_n
+        dn, ds = float(best_n[1]), float(best_s[1])
+        amb = max(1e-6, float(ambiguous_radius_m))
+        if dn <= amb and ds <= amb:
+            return best_n
+        return best_n if dn <= ds else best_s
+
     def _collect_world_pick_hits(self, wx: float, wy: float) -> List[Tuple[int, float, str, object, str]]:
         """
-        Упорядковані попадання (пріоритет ↑, відстань ↑).
+        Упорядковані попадання: спочатку за відстанню (найближчий об'єкт), тім за пріоритетом.
         Кортеж: (priority, dist, category, payload, label).
-        category: trunk_node | trunk_seg | field_valve | submain | block | lateral | scene
-        payload: int (індекс вузла / відрізка) або None.
 
-        Серед вузла магістралі (пр. 0) і відрізка (пр. 2) лишається один запис — з меншою
-        відстанню до курсора, щоб підпис «Інфо» збігався з підсвіткою. Інші пріоритети без змін.
+        Вузол магістралі vs ребро: див. _resolve_trunk_node_vs_segment_pick (не глушить сабмейн/секцію).
         """
         hits: List[Tuple[int, float, str, object, str]] = []
         p_mouse = Point(wx, wy)
@@ -690,13 +746,11 @@ class DripCAD:
             nid = str(node.get("id", "")).strip() or f"T{i}"
             if kind == "source":
                 lab = f"Насос (витік), {nid}"
-            elif kind == "valve":
-                lab = f"Кран (відведення / сток), {nid}"
             elif kind == "bend":
                 lab = f"Пікет, {nid}"
             elif kind == "junction":
                 lab = f"Розгалуження (сумматор), {nid}"
-            elif kind == "consumption":
+            elif kind in ("consumption", "valve"):
                 lab = f"Споживач (сток), {nid}"
             else:
                 lab = f"Вузол магістралі, {nid}"
@@ -779,9 +833,12 @@ class DripCAD:
         trunk_hits = [h for h in hits if h[2] in ("trunk_node", "trunk_seg")]
         other_hits = [h for h in hits if h[2] not in ("trunk_node", "trunk_seg")]
         if trunk_hits:
-            best_trunk = min(trunk_hits, key=lambda h: h[1])
-            hits = [best_trunk] + other_hits
-        hits.sort(key=lambda t: (t[0], t[1]))
+            node_hits = [h for h in trunk_hits if h[2] == "trunk_node"]
+            seg_hits = [h for h in trunk_hits if h[2] == "trunk_seg"]
+            amb_m = max(0.6, self._world_m_from_screen_px(14.0))
+            best_trunk = self._resolve_trunk_node_vs_segment_pick(node_hits, seg_hits, amb_m)
+            hits = ([best_trunk] if best_trunk is not None else []) + other_hits
+        hits.sort(key=lambda t: (t[1], t[0]))
         return hits
 
     def _trunk_topology_oriented(self):
@@ -874,7 +931,7 @@ class DripCAD:
                 continue
             seen.add(cur)
             k = str(nodes[cur].get("kind", "")).lower()
-            if k == "consumption":
+            if k in ("consumption", "valve"):
                 out.append(cur)
             for ch in children[cur]:
                 stack.append(ch)
@@ -1049,13 +1106,11 @@ class DripCAD:
             nid = str(node.get("id", "")).strip() or f"T{i}"
             if kind == "source":
                 lab = f"Насос (витік), {nid}"
-            elif kind == "valve":
-                lab = f"Кран (відведення / сток), {nid}"
             elif kind == "bend":
                 lab = f"Пікет, {nid}"
             elif kind == "junction":
                 lab = f"Розгалуження (сумматор), {nid}"
-            elif kind == "consumption":
+            elif kind in ("consumption", "valve"):
                 lab = f"Споживач (сток), {nid}"
             else:
                 lab = f"Вузол магістралі, {nid}"
@@ -1131,6 +1186,23 @@ class DripCAD:
             if line_ok(flat):
                 add("scene", si, f"Лінія ситуації (ескіз) #{si + 1}")
 
+        _pri_cat = (
+            "trunk_node",
+            "field_valve",
+            "trunk_seg",
+            "submain",
+            "block",
+            "lateral",
+            "scene",
+        )
+
+        def _rect_pick_cat_order(c: str) -> int:
+            try:
+                return _pri_cat.index(c)
+            except ValueError:
+                return 99
+
+        out.sort(key=lambda h: (_rect_pick_cat_order(h[0]), h[2]))
         return out
 
     def _draw_canvas_selection_layer(self) -> None:
@@ -5205,8 +5277,8 @@ class DripCAD:
         return float(px) / max(self.zoom, 0.01)
 
     def _trunk_snap_radius_m(self) -> float:
-        """Радіус прив’язки до вузла магістралі: не менше фіксованого м і ~28 px на екрані."""
-        return max(_TRUNK_NODE_SNAP_CANVAS_M, self._world_m_from_screen_px(28.0))
+        """Радіус прив’язки до вузла магістралі: не менше фіксованого м і ~14 px на екрані (легше клацати ребро)."""
+        return max(_TRUNK_NODE_SNAP_CANVAS_M, self._world_m_from_screen_px(14.0))
 
     def _pick_tolerance_m(self, min_m: float, px: float = 22.0) -> float:
         """Поріг попадання в об’єкт при підборі: мінімум у метрах або ~px пікселів на полотні."""
@@ -5247,7 +5319,7 @@ class DripCAD:
                 ok = src_ix is not None and ni == src_ix
                 return ni, ok
             k = str(nodes[ni].get("kind", "")).lower()
-            ok = ni == last_end or k in ("junction", "valve")
+            ok = ni == last_end or k == "junction"
             return ni, ok
         if ni == draft_i[-1]:
             return ni, False
@@ -5270,7 +5342,6 @@ class DripCAD:
 
         kind_engine = {
             "trunk_pump": "source",
-            "trunk_valve": "valve",
             "trunk_picket": "bend",
             "trunk_junction": "junction",
             "trunk_consumer": "consumption",
@@ -5367,11 +5438,11 @@ class DripCAD:
                     return
             else:
                 k = str(nodes[ni].get("kind", "")).lower()
-                start_ok = ni == last_end or k in ("junction", "valve")
+                start_ok = ni == last_end or k == "junction"
                 if not start_ok:
                     messagebox.showwarning(
                         "Магістраль",
-                        "Початок нового відрізка: кінець попереднього вузла або вузол «Розгалуження» / «Кран» (нова гілка).",
+                        "Початок нового відрізка: кінець попереднього вузла або вузол «Розгалуження» (нова гілка).",
                     )
                     return
         else:
@@ -5434,8 +5505,22 @@ class DripCAD:
         self._canvas_trunk_route_draft_indices = []
         self.redraw()
 
+    @staticmethod
+    def _trunk_map_node_caption(node: dict, index: int) -> str:
+        kind = str(node.get("kind", "")).lower()
+        nid = str(node.get("id", "")).strip() or f"T{index + 1}"
+        if kind == "source":
+            return f"Витік {nid}"
+        if kind == "bend":
+            return f"Пікет {nid}"
+        if kind == "junction":
+            return f"Розг. {nid}"
+        if kind in ("consumption", "valve"):
+            return f"Спож. {nid}"
+        return nid
+
     def _draw_trunk_map_on_canvas(self) -> None:
-        for seg in getattr(self, "trunk_map_segments", []) or []:
+        for si, seg in enumerate(getattr(self, "trunk_map_segments", []) or []):
             pl = self._trunk_segment_world_path(seg)
             if len(pl) < 2:
                 continue
@@ -5449,13 +5534,29 @@ class DripCAD:
                     width=5,
                     tags="trunk_map_canvas",
                 )
+            mi = len(pl) // 2
+            try:
+                sx, sy = self.to_screen(float(pl[mi][0]), float(pl[mi][1]))
+            except (TypeError, ValueError, IndexError):
+                pass
+            else:
+                self.canvas.create_text(
+                    sx + 8,
+                    sy - 12,
+                    text=f"М{si + 1}",
+                    anchor=tk.W,
+                    fill="#E1BEE7",
+                    font=("Segoe UI", 8, "bold"),
+                    tags="trunk_map_canvas",
+                )
         nodes = list(getattr(self, "trunk_map_nodes", []) or [])
         g = 11.0
-        for node in nodes:
+        for i, node in enumerate(nodes):
             try:
                 cx, cy = self.to_screen(float(node["x"]), float(node["y"]))
             except (KeyError, TypeError, ValueError):
                 continue
+            cap = self._trunk_map_node_caption(node, i)
             kind = str(node.get("kind", "")).lower()
             if kind == "source":
                 self.canvas.create_polygon(
@@ -5472,29 +5573,6 @@ class DripCAD:
                     width=2,
                     tags="trunk_map_canvas",
                 )
-            elif kind == "valve":
-                self.canvas.create_polygon(
-                    cx,
-                    cy - g * 1.05,
-                    cx - g * 0.92,
-                    cy + g * 0.58,
-                    cx + g * 0.92,
-                    cy + g * 0.58,
-                    fill="#C4933A",
-                    outline="#1565C0",
-                    width=2,
-                    tags="trunk_map_canvas",
-                )
-                self.canvas.create_oval(
-                    cx - g * 0.35,
-                    cy - g * 0.15,
-                    cx + g * 0.35,
-                    cy + g * 0.55,
-                    fill="#1565C0",
-                    outline="#E3F2FD",
-                    width=1,
-                    tags="trunk_map_canvas",
-                )
             elif kind == "bend":
                 self.canvas.create_oval(
                     cx - g,
@@ -5506,7 +5584,7 @@ class DripCAD:
                     width=2,
                     tags="trunk_map_canvas",
                 )
-            elif kind == "consumption":
+            elif kind in ("consumption", "valve"):
                 self.canvas.create_polygon(
                     cx,
                     cy - g * 1.05,
@@ -5544,6 +5622,16 @@ class DripCAD:
                     width=1,
                     tags="trunk_map_canvas",
                 )
+            _ty = cy - g - 5 if kind != "junction" else cy - g * 1.35 - 4
+            self.canvas.create_text(
+                cx + g + 5,
+                _ty,
+                text=cap,
+                anchor=tk.W,
+                fill="#ECEFF1",
+                font=("Segoe UI", 8),
+                tags="trunk_map_canvas",
+            )
 
     def _draw_canvas_polyline_and_route_drafts(self) -> None:
         ct = getattr(self, "_canvas_special_tool", None)
@@ -5596,6 +5684,19 @@ class DripCAD:
         wx, wy = self.to_world(event.x, event.y)
         self._handle_left_click_world(wx, wy, scr_x=event.x, scr_y=event.y)
 
+    @staticmethod
+    def _merge_pick_selection_hits(
+        base: List[Tuple[str, object, str]], extra: List[Tuple[str, object, str]]
+    ) -> List[Tuple[str, object, str]]:
+        seen = {(b[0], b[1]) for b in base}
+        out = list(base)
+        for h in extra:
+            key = (h[0], h[1])
+            if key not in seen:
+                seen.add(key)
+                out.append(h)
+        return out
+
     def handle_left_release(self, event):
         wx, wy = self.to_world(event.x, event.y)
         ct = getattr(self, "_canvas_special_tool", None)
@@ -5616,31 +5717,52 @@ class DripCAD:
         self._select_marquee_curr_screen = None
         self._select_marquee_start_world = None
         self._select_marquee_curr_world = None
+        ctrl = bool(event.state & 0x0004)
         if dragged and (maxx - minx) > 1e-3 and (maxy - miny) > 1e-3:
             hits = self._pick_hits_in_world_rect(
                 w0[0], w0[1], wx, wy, crossing=crossing
             )
-            self._canvas_selection_keys = list(hits)
-            if hits:
+            prev = list(getattr(self, "_canvas_selection_keys", []) or [])
+            if ctrl:
+                if hits:
+                    self._canvas_selection_keys = self._merge_pick_selection_hits(prev, hits)
+                else:
+                    self._canvas_selection_keys = prev
+            else:
+                self._canvas_selection_keys = list(hits)
+            if hits and not ctrl:
                 lines = [h[2] for h in hits[:18]]
                 msg = "\n".join(lines)
                 if len(hits) > 18:
                     msg += f"\n… ще {len(hits) - 18}."
                 messagebox.showinfo("Вибір", f"Обрано: {len(hits)}\n\n{msg}")
-            else:
+            elif not hits and not ctrl:
                 messagebox.showinfo("Вибір", "У прямокутнику немає об'єктів.")
         else:
             hits = self._collect_world_pick_hits(wx, wy)
             if hits:
                 pri, _d, cat, payload, label = hits[0]
-                self._canvas_selection_keys = [(cat, payload, label)]
-                messagebox.showinfo("Вибір", label)
+                new_item = (cat, payload, label)
+                key = (cat, payload)
+                prev = list(getattr(self, "_canvas_selection_keys", []) or [])
+                if ctrl:
+                    idx = next((i for i, e in enumerate(prev) if (e[0], e[1]) == key), None)
+                    if idx is not None:
+                        prev.pop(idx)
+                        self._canvas_selection_keys = prev
+                    else:
+                        prev.append(new_item)
+                        self._canvas_selection_keys = prev
+                else:
+                    self._canvas_selection_keys = [new_item]
+                    messagebox.showinfo("Вибір", label)
             else:
-                self._canvas_selection_keys = []
-                messagebox.showinfo(
-                    "Вибір",
-                    "Об'єкт не знайдено. Клацніть ближче до вузла магістралі, труби, блоку чи лінії мережі.",
-                )
+                if not ctrl:
+                    self._canvas_selection_keys = []
+                    messagebox.showinfo(
+                        "Вибір",
+                        "Об'єкт не знайдено. Клацніть ближче до вузла магістралі, труби, блоку чи лінії мережі.",
+                    )
         self.redraw()
 
     def _canvas_b1_motion(self, event):
@@ -5937,7 +6059,18 @@ class DripCAD:
             return
         ct = getattr(self, "_canvas_special_tool", None)
         if ct == "select":
-            if getattr(self, "_canvas_selection_keys", None):
+            keys = list(getattr(self, "_canvas_selection_keys", []) or [])
+            if keys:
+                lines = [h[2] for h in keys]
+                n = len(lines)
+                head = min(n, 50)
+                msg = "\n".join(f"{i + 1}. {lines[i]}" for i in range(head))
+                if n > head:
+                    msg += f"\n… ще {n - head}."
+                messagebox.showinfo(
+                    "Вибір — обрані об'єкти",
+                    f"Усього: {n}\n\n{msg}",
+                )
                 self._canvas_selection_keys = []
                 self.redraw()
                 return
@@ -6628,6 +6761,19 @@ class DripCAD:
             points_to_check.extend(sm)
         for lat in self._flatten_all_lats():
             points_to_check.extend(list(lat.coords))
+        for seg in getattr(self, "trunk_map_segments", []) or []:
+            pl = self._trunk_segment_world_path(seg)
+            for xy in pl:
+                if isinstance(xy, (list, tuple)) and len(xy) >= 2:
+                    try:
+                        points_to_check.append((float(xy[0]), float(xy[1])))
+                    except (TypeError, ValueError):
+                        pass
+        for node in getattr(self, "trunk_map_nodes", []) or []:
+            try:
+                points_to_check.append((float(node["x"]), float(node["y"])))
+            except (KeyError, TypeError, ValueError):
+                pass
         if self.topo.elevation_points:
             points_to_check.extend([(p[0], p[1]) for p in self.topo.elevation_points])
         if self.topo.srtm_boundary_pts_local:
@@ -6742,6 +6888,49 @@ class DripCAD:
         self._zoom_box_start = None
         self._zoom_box_end = None
         self.redraw()
+
+    def _top_bar_zoom_frame(self) -> None:
+        try:
+            tab_idx = int(self.view_notebook.index("current"))
+        except Exception:
+            tab_idx = 0
+        if tab_idx == 1:
+            if not self._ensure_embedded_map_panel():
+                messagebox.showerror(
+                    "Карта",
+                    "Не вдалося відкрити панель карти (перевірте tkintermapview).",
+                )
+                return
+            host = getattr(self, "_embedded_map_host", None)
+            fn = getattr(host, "_zoom_box_on", None) if host is not None else None
+            if callable(fn):
+                fn()
+            else:
+                messagebox.showinfo("Карта", "Функція зуму рамкою на карті недоступна.")
+        else:
+            self.enable_zoom_box_mode()
+
+    def _top_bar_zoom_extents(self) -> None:
+        try:
+            tab_idx = int(self.view_notebook.index("current"))
+        except Exception:
+            tab_idx = 0
+        if tab_idx == 1:
+            if not self._ensure_embedded_map_panel():
+                messagebox.showerror(
+                    "Карта",
+                    "Не вдалося відкрити панель карти (перевірте tkintermapview).",
+                )
+                return
+            host = getattr(self, "_embedded_map_host", None)
+            fn = getattr(host, "_zoom_extents_project", None) if host is not None else None
+            if callable(fn):
+                fn()
+            else:
+                messagebox.showinfo("Карта", "Функція зуму екстентів на карті недоступна.")
+        else:
+            self.zoom_to_fit()
+            self.redraw()
 
     def redraw(self, skip_heavy_canvas_layers: bool = False):
         if not hasattr(self, "canvas") or not self.canvas.winfo_exists():
@@ -7687,6 +7876,7 @@ class DripCAD:
             self.allowed_pipes[mat] = {}
             for pn, ods in pns.items():
                 self.allowed_pipes[mat][pn] = list(ods.keys())
+        self.trunk_allowed_pipes = copy.deepcopy(self.allowed_pipes)
 
         avail = list(self.pipe_db.keys())
         if hasattr(self, "cb_mat"):
@@ -7746,7 +7936,14 @@ class DripCAD:
         editor_target_block_bi = None
         dlg_title = f"Вибір дозволених труб для проекту: {self.var_proj_name.get()}"
         scope_body = "Відмітьте труби, які можна використовувати в цьому проєкті (глобально, allowed_pipes у JSON)."
-        if scope == "block":
+        if scope == "trunk":
+            pipe_allow_ref = self.trunk_allowed_pipes
+            dlg_title = f"Труби для магістралі — {self.var_proj_name.get()}"
+            scope_body = (
+                "Окремий набір дозволених труб для магістралі. У JSON: розділ trunk → allowed_pipes "
+                "(поряд із nodes та segments)."
+            )
+        elif scope == "block":
             bi = self._safe_active_block_idx()
             if bi is None:
                 messagebox.showwarning("Увага", "Немає блоків поля.")

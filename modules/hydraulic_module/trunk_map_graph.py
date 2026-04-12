@@ -3,10 +3,11 @@
 
 Семантика (узгоджено з trunk_tree_compute.TrunkTreeNode.kind):
 - source      — насос / витік (єдиний корінь дерева, без вхідних ребер).
-- valve       — кран на магістралі: споживання з можливим відведенням (лист, прохід як пікет, або розгалуження).
 - consumption — споживач / сток (лист, без вихідних ребер).
 - junction    — розгалуження / сумматор (один вхід; у зібраному графі ≥2 виходи, див. validate_trunk_map_graph(..., complete_only)).
 - bend        — пікет / проміжна точка на осі труби (рівно один вхід і один вихід).
+
+Застарілий kind «valve» у JSON підвантаження нормалізується (див. normalize_legacy_trunk_valve_kinds).
 
 У файлі/пам’яті кожен запис trunk_map_segments — одне ребро (труба між двома вузлами);
 полілінія зберігається в path_local цього ребра. Ребро після орієнтації від витоку
@@ -32,17 +33,48 @@ from typing import (
 
 # Допустимі kind у JSON/карті (як у validate_trunk_tree)
 KIND_SOURCE = "source"
-KIND_VALVE = "valve"
 KIND_CONSUMPTION = "consumption"
 KIND_JUNCTION = "junction"
 KIND_BEND = "bend"
-VALID_KINDS = frozenset({KIND_SOURCE, KIND_VALVE, KIND_CONSUMPTION, KIND_JUNCTION, KIND_BEND})
+VALID_KINDS = frozenset({KIND_SOURCE, KIND_CONSUMPTION, KIND_JUNCTION, KIND_BEND})
 
 
 def is_trunk_root_kind(kind: str) -> bool:
-    """Єдиний корінь дерева — лише насос (source). Кран (valve) не є витоком."""
+    """Єдиний корінь дерева — лише насос (source)."""
     k = (kind or "").strip().lower()
     return k == KIND_SOURCE
+
+
+def normalize_legacy_trunk_valve_kinds(
+    nodes: MutableSequence[MutableMapping[str, Any]],
+    segments: Sequence[Mapping[str, Any]],
+) -> None:
+    """
+    Замінює застарілий kind «valve» на bend / junction / consumption за степенем вузла в графі ребер.
+    Викликати після збору trunk_map_segments (канонічні або ланцюгові відрізки).
+    """
+    n = len(nodes)
+    if n == 0:
+        return
+    deg = [0] * n
+    edges, _ = undirected_edges_from_segments(segments)
+    for a, b in edges:
+        if 0 <= a < n:
+            deg[a] += 1
+        if 0 <= b < n:
+            deg[b] += 1
+    for i, row in enumerate(nodes):
+        if not isinstance(row, MutableMapping):
+            continue
+        if str(row.get("kind", "")).strip().lower() != "valve":
+            continue
+        d = deg[i] if i < len(deg) else 0
+        if d <= 1:
+            row["kind"] = KIND_CONSUMPTION
+        elif d == 2:
+            row["kind"] = KIND_BEND
+        else:
+            row["kind"] = KIND_JUNCTION
 
 
 def ensure_trunk_node_ids(nodes: MutableSequence[MutableMapping[str, Any]]) -> None:

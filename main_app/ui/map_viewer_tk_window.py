@@ -47,11 +47,11 @@ MAP_BG_DARK = "#0b0f14"
 # Спецінструменти карти: полілінії (ЛКМ — вершини, ПКМ — завершити) та одна точка (ЛКМ — позиція, ПКМ — зафіксувати).
 _MAP_TOOLS_POLYLINE = frozenset({"capture_tiles", "block_contour", "trunk_route", "scene_lines"})
 _MAP_TOOLS_TRUNK_POINT = frozenset(
-    {"trunk_pump", "trunk_valve", "trunk_picket", "trunk_junction", "trunk_consumer"}
+    {"trunk_pump", "trunk_picket", "trunk_junction", "trunk_consumer"}
 )
 _MAP_TOOLS_PASSIVE = frozenset({"map_pick_info", "select"})
 # Магістраль по вузлах: прив’язка ЛКМ у межах цього радіусу (м, локальні XY).
-TRUNK_NODE_SNAP_M = 40.0
+TRUNK_NODE_SNAP_M = 18.0
 # Відображення магістралі та підказок «Інфо»
 TRUNK_PATH_COLOR = "#8E24AA"
 TRUNK_PICK_NODE_R_M = 26.0
@@ -256,11 +256,20 @@ def create_embedded_map_panel(parent: tk.Misc, app=None):
         return inside
 
     def _register_pick_disc(
-        wx: float, wy: float, r_m: float, label: str, priority: int, *, trunk_geom: bool = False
+        wx: float,
+        wy: float,
+        r_m: float,
+        label: str,
+        priority: int,
+        *,
+        trunk_geom: bool = False,
+        trunk_node_pick: bool = False,
     ) -> None:
         row: dict = {"kind": "disc", "x": wx, "y": wy, "r": r_m, "label": label, "p": priority}
         if trunk_geom:
             row["trunk_geom"] = True
+        if trunk_node_pick:
+            row["trunk_node_pick"] = True
         view_state.setdefault("map_pick_regions", []).append(row)
 
     def _register_pick_polyline(
@@ -283,29 +292,44 @@ def create_embedded_map_panel(parent: tk.Misc, app=None):
         )
 
     def _pick_map_object_at_world(wx: float, wy: float) -> str | None:
-        hits: list[tuple[int, float, str, bool]] = []
+        hits: list[tuple[int, float, str, bool, bool]] = []
         for reg in view_state.get("map_pick_regions", []):
             kind = reg["kind"]
             pr = int(reg["p"])
             tg = bool(reg.get("trunk_geom"))
+            tn = bool(reg.get("trunk_node_pick"))
             if kind == "disc":
                 d = math.hypot(wx - reg["x"], wy - reg["y"])
                 if d <= float(reg["r"]):
-                    hits.append((pr, d, reg["label"], tg))
+                    hits.append((pr, d, reg["label"], tg, tn))
             elif kind == "polyline":
                 d = _polyline_min_dist_m(wx, wy, reg["pts"])
                 if d <= float(reg["r"]):
-                    hits.append((pr, d, reg["label"], tg))
+                    hits.append((pr, d, reg["label"], tg, False))
             elif kind == "ring" and _point_in_ring(wx, wy, reg["pts"]):
-                hits.append((pr, 0.0, reg["label"], False))
+                hits.append((pr, 0.0, reg["label"], False, False))
         if not hits:
             return None
         trunk_hits = [h for h in hits if h[3]]
         other_hits = [h for h in hits if not h[3]]
         if trunk_hits:
-            best_trunk = min(trunk_hits, key=lambda h: h[1])
-            hits = [best_trunk] + other_hits
-        hits.sort(key=lambda t: (t[0], t[1]))
+            node_hits = [h for h in trunk_hits if h[4]]
+            seg_hits = [h for h in trunk_hits if not h[4]]
+            best_n = min(node_hits, key=lambda h: h[1]) if node_hits else None
+            best_s = min(seg_hits, key=lambda h: h[1]) if seg_hits else None
+            if best_n is None:
+                best_trunk = best_s
+            elif best_s is None:
+                best_trunk = best_n
+            else:
+                dn, ds = float(best_n[1]), float(best_s[1])
+                amb_m = 2.0
+                if dn <= amb_m and ds <= amb_m:
+                    best_trunk = best_n
+                else:
+                    best_trunk = best_n if dn <= ds else best_s
+            hits = ([best_trunk] if best_trunk is not None else []) + other_hits
+        hits.sort(key=lambda t: (t[1], t[0]))
         return hits[0][2]
 
     def _draw_trunk_map_node_glyphs() -> None:
@@ -326,17 +350,17 @@ def create_embedded_map_panel(parent: tk.Misc, app=None):
             nid = str(node.get("id", "")).strip() or f"#{i}"
             if kind == "source":
                 label = f"Насос (витік), {nid}"
-            elif kind == "valve":
-                label = f"Кран (відведення / сток), {nid}"
             elif kind == "bend":
                 label = f"Пікет, {nid}"
             elif kind == "junction":
                 label = f"Розгалуження (сумматор), {nid}"
-            elif kind == "consumption":
+            elif kind in ("consumption", "valve"):
                 label = f"Споживач (сток), {nid}"
             else:
                 label = f"Вузол магістралі, {nid}"
-            _register_pick_disc(wx, wy, TRUNK_PICK_NODE_R_M, label, 0, trunk_geom=True)
+            _register_pick_disc(
+                wx, wy, TRUNK_PICK_NODE_R_M, label, 0, trunk_geom=True, trunk_node_pick=True
+            )
             p = _latlon_to_canvas_xy(lat, lon)
             if p is None:
                 continue
@@ -359,29 +383,6 @@ def create_embedded_map_panel(parent: tk.Misc, app=None):
                     width=2,
                     tags="trunk_map_glyph",
                 )
-            elif kind == "valve":
-                c.create_polygon(
-                    cx,
-                    cy - g * 1.05,
-                    cx - g * 0.92,
-                    cy + g * 0.58,
-                    cx + g * 0.92,
-                    cy + g * 0.58,
-                    fill="#C4933A",
-                    outline="#1565C0",
-                    width=2,
-                    tags="trunk_map_glyph",
-                )
-                c.create_oval(
-                    cx - g * 0.35,
-                    cy - g * 0.15,
-                    cx + g * 0.35,
-                    cy + g * 0.55,
-                    fill="#1565C0",
-                    outline="#E3F2FD",
-                    width=1,
-                    tags="trunk_map_glyph",
-                )
             elif kind == "bend":
                 c.create_oval(
                     cx - g,
@@ -393,7 +394,7 @@ def create_embedded_map_panel(parent: tk.Misc, app=None):
                     width=2,
                     tags="trunk_map_glyph",
                 )
-            elif kind == "consumption":
+            elif kind in ("consumption", "valve"):
                 c.create_polygon(
                     cx,
                     cy - g * 1.05,
@@ -431,6 +432,52 @@ def create_embedded_map_panel(parent: tk.Misc, app=None):
                     width=1,
                     tags="trunk_map_glyph",
                 )
+            cap = (
+                app._trunk_map_node_caption(node, i)
+                if hasattr(app, "_trunk_map_node_caption")
+                else nid
+            )
+            _ty = cy - g - 5 if kind != "junction" else cy - g * 1.35 - 4
+            c.create_text(
+                cx + g + 5,
+                _ty,
+                text=cap,
+                anchor=tk.W,
+                fill="#ECEFF1",
+                font=("Segoe UI", 8),
+                tags="trunk_map_glyph",
+            )
+
+        segs = list(getattr(app, "trunk_map_segments", []) or [])
+        for si, seg in enumerate(segs):
+            if not hasattr(app, "_trunk_segment_world_path"):
+                break
+            plw = app._trunk_segment_world_path(seg)
+            if len(plw) < 2:
+                continue
+            mi = len(plw) // 2
+            try:
+                x0, y0 = float(plw[mi][0]), float(plw[mi][1])
+            except (TypeError, ValueError, IndexError):
+                continue
+            ll = _project_local_to_latlon(x0, y0)
+            if not ll:
+                continue
+            plat, plon = float(ll[0]), float(ll[1])
+            pseg = _latlon_to_canvas_xy(plat, plon)
+            if pseg is None:
+                continue
+            tcx, tcy = float(pseg[0]), float(pseg[1])
+            if not (-80 < tcx < float(map_widget.width) + 80 and -80 < tcy < float(map_widget.height) + 80):
+                continue
+            c.create_text(
+                tcx + 8,
+                tcy - 8,
+                text=f"М{si + 1}",
+                fill="#E1BEE7",
+                font=("Segoe UI", 8, "bold"),
+                tags="trunk_map_glyph",
+            )
 
     def _safe_delete(path_obj):
         if not path_obj:
@@ -731,8 +778,6 @@ def create_embedded_map_panel(parent: tk.Misc, app=None):
             color = "#B8C0CC"
         elif tool == "trunk_pump":
             color = "#EF5350"
-        elif tool == "trunk_valve":
-            color = "#E57373"
         elif tool == "trunk_picket":
             color = "#42A5F5"
         elif tool == "trunk_junction":
@@ -1116,8 +1161,6 @@ def create_embedded_map_panel(parent: tk.Misc, app=None):
                 hint.set("Траса в блок (без вузлів на карті): ЛКМ вершини, ПКМ завершити → сабмейн активного блоку")
         elif name == "trunk_pump":
             hint.set("Насос: лише один — кожен ЛКМ переміщує, ПКМ — вийти з команди")
-        elif name == "trunk_valve":
-            hint.set("Кран: ЛКМ — новий вузол, ПКМ — вийти з команди")
         elif name == "map_pick_info":
             hint.set(
                 "Інфо: ЛКМ — назва; біля магістралі — жовтий шлях до насоса, "
@@ -1587,7 +1630,7 @@ def create_embedded_map_panel(parent: tk.Misc, app=None):
             if ni is None:
                 messagebox.showinfo(
                     "Магістраль",
-                    f"Немає вузла в радіусі {int(TRUNK_NODE_SNAP_M)} м. Наведіть курсор на насос, кран (відведення), пікет, розгалуження або споживача.",
+                    f"Немає вузла в радіусі {int(TRUNK_NODE_SNAP_M)} м. Наведіть курсор на насос, пікет, розгалуження або споживача.",
                 )
                 return "break"
             nodes = list(app.trunk_map_nodes)
@@ -1610,11 +1653,11 @@ def create_embedded_map_panel(parent: tk.Misc, app=None):
                         return "break"
                 else:
                     knd = str(nodes[ni].get("kind", "")).lower()
-                    start_ok = ni == last_end or knd in ("junction", "valve")
+                    start_ok = ni == last_end or knd == "junction"
                     if not start_ok:
                         messagebox.showwarning(
                             "Магістраль",
-                            "Початок нового відрізка: кінець попереднього вузла або вузол «Розгалуження» / «Кран» (нова гілка).",
+                            "Початок нового відрізка: кінець попереднього вузла або вузол «Розгалуження» (нова гілка).",
                         )
                         return "break"
             else:
@@ -2143,7 +2186,11 @@ def create_embedded_map_panel(parent: tk.Misc, app=None):
         fill=tk.X, padx=10, pady=(0, 8)
     )
 
-    build_trunk_tools_tab(tab_trunk, _set_tool, _attach_dark_tooltip, on_map_tab=True)
+    build_trunk_tools_tab(tab_trunk, _set_tool, _attach_dark_tooltip, on_map_tab=True, app=app)
+
+    def _zoom_extents_project():
+        _show_project_overlay(True)
+
     build_draw_modes_tab(tab_draw, app, _attach_dark_tooltip)
 
     try:
@@ -2154,6 +2201,8 @@ def create_embedded_map_panel(parent: tk.Misc, app=None):
     host._refresh_project_overlay = _show_project_overlay
     host._set_map_tool = _set_tool
     host._map_hint_var = hint
+    host._zoom_box_on = _zoom_box_on
+    host._zoom_extents_project = _zoom_extents_project
 
     def _init_geo_ref_from_map_center() -> None:
         """Відкрита карта задає геоприв’язку: початок локальної СК — центр поточного виду."""

@@ -22,21 +22,6 @@ class TestTrunkMapGraph(unittest.TestCase):
         self.assertEqual(tg.validate_trunk_map_graph(nodes, segs), [])
         self.assertEqual(tg.validate_trunk_map_graph(nodes, segs, complete_only=False), [])
 
-    def test_pump_valve_consumer_ok(self):
-        nodes = [_n("source"), _n("valve"), _n("consumption")]
-        segs = [{"node_indices": [0, 1, 2], "path_local": [(0, 0), (1, 0), (2, 0)]}]
-        self.assertEqual(tg.validate_trunk_map_graph(nodes, segs), [])
-
-    def test_valve_branching_relaxed_ok(self):
-        nodes = [_n("source"), _n("valve"), _n("consumption"), _n("consumption")]
-        segs = [
-            {"node_indices": [0, 1], "path_local": [(0, 0), (10, 0)]},
-            {"node_indices": [1, 2], "path_local": [(10, 0), (10, 10)]},
-            {"node_indices": [1, 3], "path_local": [(10, 0), (10, -10)]},
-        ]
-        self.assertEqual(tg.validate_trunk_map_graph(nodes, segs, complete_only=False), [])
-        self.assertEqual(tg.validate_trunk_map_graph(nodes, segs, complete_only=True), [])
-
     def test_pump_bend_consumer_ok(self):
         nodes = [_n("source"), _n("bend"), _n("consumption")]
         segs = [{"node_indices": [0, 1, 2], "path_local": [(0, 0), (1, 0), (2, 0)]}]
@@ -135,6 +120,25 @@ class TestTrunkMapGraph(unittest.TestCase):
         exp = tg.expand_trunk_segments_to_pair_edges(segs, nodes)
         self.assertEqual(len(exp), 1)
         self.assertEqual(len(exp[0]["path_local"]), 3)
+
+    def test_normalize_legacy_valve_kinds(self):
+        nodes = [_n("source"), {"kind": "valve", "x": 0.0, "y": 0.0}, _n("consumption")]
+        segs = [{"node_indices": [0, 1, 2], "path_local": [(0, 0), (1, 0), (2, 0)]}]
+        tg.normalize_legacy_trunk_valve_kinds(nodes, segs)
+        self.assertEqual(nodes[1]["kind"], "bend")
+        nodes2 = [
+            _n("source"),
+            {"kind": "valve", "x": 0.0, "y": 0.0},
+            _n("consumption"),
+            _n("consumption"),
+        ]
+        segs2 = [
+            {"node_indices": [0, 1], "path_local": [(0, 0), (10, 0)]},
+            {"node_indices": [1, 2], "path_local": [(10, 0), (10, 10)]},
+            {"node_indices": [1, 3], "path_local": [(10, 0), (10, -10)]},
+        ]
+        tg.normalize_legacy_trunk_valve_kinds(nodes2, segs2)
+        self.assertEqual(nodes2[1]["kind"], "junction")
 
 
 if __name__ == "__main__":

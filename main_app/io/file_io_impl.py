@@ -1,3 +1,4 @@
+import copy
 import os
 import json
 import math
@@ -8,7 +9,10 @@ from shapely.ops import unary_union
 
 from main_app.paths import DESIGNS_DIR, PIPES_DB_PATH
 from modules.geo_module import srtm_tiles
-from modules.hydraulic_module.trunk_map_graph import ensure_trunk_node_ids
+from modules.hydraulic_module.trunk_map_graph import (
+    ensure_trunk_node_ids,
+    normalize_legacy_trunk_valve_kinds,
+)
 
 
 def _field_block_from_dict(item):
@@ -95,6 +99,15 @@ def _collect_project_data(app, force_georeferenced=False):
     trunk_nodes = getattr(app, "trunk_map_nodes", None) or []
     if trunk_nodes:
         ensure_trunk_node_ids(trunk_nodes)
+    trunk_segments = list(getattr(app, "trunk_map_segments", []) or [])
+    _tap = getattr(app, "trunk_allowed_pipes", None)
+    if not isinstance(_tap, dict):
+        _tap = {}
+    trunk_payload = {
+        "nodes": list(trunk_nodes),
+        "segments": trunk_segments,
+        "allowed_pipes": copy.deepcopy(_tap),
+    }
 
     fb_data, fb_rings = field_blocks_to_save_payload(app)
     fbs = getattr(app, "field_blocks", []) or []
@@ -121,8 +134,9 @@ def _collect_project_data(app, force_georeferenced=False):
         "trunk_tree": getattr(app, "trunk_tree_data", {}),
         "trunk_tree_results": getattr(app, "trunk_tree_results", {}),
         "scene_lines": list(getattr(app, "scene_lines", []) or []),
-        "trunk_map_nodes": list(getattr(app, "trunk_map_nodes", []) or []),
-        "trunk_map_segments": list(getattr(app, "trunk_map_segments", []) or []),
+        "trunk": trunk_payload,
+        "trunk_map_nodes": list(trunk_nodes),
+        "trunk_map_segments": trunk_segments,
         "project_zone_bounds_local": (
             list(app.project_zone_bounds_local)
             if getattr(app, "project_zone_bounds_local", None) is not None
@@ -381,8 +395,17 @@ def load_project(app):
                     line.append((float(p[0]), float(p[1])))
             if len(line) >= 2:
                 app.scene_lines.append(line)
+        tr_pkg = data.get("trunk")
+        if not isinstance(tr_pkg, dict):
+            tr_pkg = {}
+        _node_rows = tr_pkg.get("nodes")
+        if not isinstance(_node_rows, list):
+            _node_rows = data.get("trunk_map_nodes") or []
+        _seg_rows = tr_pkg.get("segments")
+        if not isinstance(_seg_rows, list):
+            _seg_rows = data.get("trunk_map_segments") or []
         app.trunk_map_nodes = []
-        for row in data.get("trunk_map_nodes") or []:
+        for row in _node_rows:
             if not isinstance(row, dict):
                 continue
             kind = str(row.get("kind", "")).strip().lower()
@@ -417,7 +440,7 @@ def load_project(app):
         ensure_trunk_node_ids(app.trunk_map_nodes)
         app.trunk_map_segments = []
         app._trunk_route_last_node_idx = None
-        for seg in data.get("trunk_map_segments") or []:
+        for seg in _seg_rows:
             if not isinstance(seg, dict):
                 continue
             ni = seg.get("node_indices")
@@ -455,6 +478,10 @@ def load_project(app):
                 app.sync_trunk_segment_paths_from_nodes()
             except Exception:
                 pass
+        try:
+            normalize_legacy_trunk_valve_kinds(app.trunk_map_nodes, app.trunk_map_segments)
+        except Exception:
+            pass
         if app.trunk_map_segments:
             li = app.trunk_map_segments[-1].get("node_indices") or []
             if li:
@@ -497,7 +524,37 @@ def load_project(app):
                     app.allowed_pipes[mat][pn_key] = [
                         x for x in ods if str(x).strip() in allowed_od
                     ]
-        
+
+        app.trunk_allowed_pipes = {}
+        for mat, pns in app.pipe_db.items():
+            app.trunk_allowed_pipes[mat] = {}
+            for pn, ods in pns.items():
+                app.trunk_allowed_pipes[mat][pn] = list(ods.keys())
+        trunk_ap_loaded = {}
+        if isinstance(tr_pkg.get("allowed_pipes"), dict):
+            trunk_ap_loaded = tr_pkg["allowed_pipes"]
+        elif isinstance(data.get("trunk_allowed_pipes"), dict):
+            trunk_ap_loaded = data["trunk_allowed_pipes"]
+        if trunk_ap_loaded:
+            for mat in trunk_ap_loaded:
+                if mat not in app.trunk_allowed_pipes:
+                    continue
+                src = trunk_ap_loaded[mat]
+                if not isinstance(src, dict):
+                    continue
+                for pn_raw, ods in src.items():
+                    pn_key = _resolve_pn_key(app.trunk_allowed_pipes[mat], pn_raw)
+                    if pn_key is None:
+                        continue
+                    allowed_list = app.trunk_allowed_pipes[mat][pn_key]
+                    allowed_od = {str(x).strip() for x in allowed_list}
+                    if isinstance(ods, list):
+                        app.trunk_allowed_pipes[mat][pn_key] = [
+                            x for x in ods if str(x).strip() in allowed_od
+                        ]
+        else:
+            app.trunk_allowed_pipes = copy.deepcopy(app.allowed_pipes)
+
         p = data.get("params", {})
         app.var_lat_step.set(p.get("lat", "0.9"))
         app.var_emit_step.set(p.get("emit", "0.3"))
