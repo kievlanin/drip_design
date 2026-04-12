@@ -8009,7 +8009,9 @@ class DripCAD:
             dlg,
             text="ЛКМ по заголовку стовпця (крім «Вик.») — меню фільтра. "
             "Одне ЛКМ у клітинці «Вик.» рядка — перемкнути ✅/❌. "
-            "Подвійне ЛКМ по заголовку «Вик.» — інвертувати всі рядки або лише виділені (Ctrl/Shift+ЛКМ).",
+            "Подвійне ЛКМ по заголовку «Вик.» — увімкнути всі ✅ або вимкнути всі ❌: "
+            "якщо є виділені рядки — лише вони; інакше всі рядки, видимі за фільтром. "
+            "Якщо серед цілі хоч один ❌ — усі стають ✅; якщо всі вже ✅ — усі стають ❌.",
             bg="#1e1e1e",
             fg="#AAAAAA",
             font=("Arial", 8),
@@ -8109,6 +8111,15 @@ class DripCAD:
                     values=("✅" if is_allowed else "❌", it["mat"], it["pn"], it["od"], it["len"]),
                 )
 
+        def _after_pipe_allow_change():
+            refresh_selector()
+            self.redraw()
+            self.sync_hydro_pipe_summary()
+            try:
+                dlg.after(0, _raise_pipe_dialog)
+            except tk.TclError:
+                pass
+
         def invert_for_items(items_list):
             for it in items_list:
                 mat, pn, od = it["mat"], it["pn"], it["od"]
@@ -8121,13 +8132,33 @@ class DripCAD:
                     cur.remove(od)
                 else:
                     cur.append(od)
-            refresh_selector()
-            self.redraw()
-            self.sync_hydro_pipe_summary()
-            try:
-                dlg.after(0, _raise_pipe_dialog)
-            except tk.TclError:
-                pass
+            _after_pipe_allow_change()
+
+        def set_allow_for_items(items_list, enable: bool):
+            for it in items_list:
+                mat, pn, od = it["mat"], it["pn"], it["od"]
+                if mat not in pipe_allow_ref:
+                    pipe_allow_ref[mat] = {}
+                if pn not in pipe_allow_ref[mat]:
+                    pipe_allow_ref[mat][pn] = []
+                cur = pipe_allow_ref[mat][pn]
+                if enable:
+                    if od not in cur:
+                        cur.append(od)
+                else:
+                    if od in cur:
+                        cur.remove(od)
+            _after_pipe_allow_change()
+
+        def visible_filtered_items():
+            out = []
+            for it in all_items:
+                if var_only_driplines.get() and str(it.get("mat", "")).strip() != "Крапельні лінії":
+                    continue
+                if not row_passes_filters(it):
+                    continue
+                out.append(it)
+            return out
 
         def on_heading_double_vyk(event):
             if str(tree.identify_region(event.x, event.y)) != "heading":
@@ -8136,13 +8167,21 @@ class DripCAD:
                 return
             sel = tree.selection()
             if sel:
-                rows = []
+                items_list = []
                 for iid in sel:
                     v = tree.item(iid, "values")
-                    rows.append({"mat": v[1], "pn": str(v[2]), "od": str(v[3])})
-                invert_for_items(rows)
+                    if len(v) < 4:
+                        continue
+                    items_list.append({"mat": v[1], "pn": str(v[2]), "od": str(v[3])})
             else:
-                invert_for_items(list(all_items))
+                items_list = list(visible_filtered_items())
+            if not items_list:
+                return
+            all_on = all(
+                it["od"] in pipe_allow_ref.get(it["mat"], {}).get(it["pn"], [])
+                for it in items_list
+            )
+            set_allow_for_items(items_list, not all_on)
 
         def on_heading_release_filter(event):
             if str(tree.identify_region(event.x, event.y)) != "heading":
