@@ -17,7 +17,9 @@ from __future__ import annotations
 import sys
 import tkinter as tk
 from pathlib import Path
-from tkinter import ttk, messagebox
+from tkinter import ttk
+
+from main_app.ui.silent_messagebox import silent_showerror, silent_showwarning
 
 ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
@@ -302,7 +304,7 @@ class LateralFieldCalculator(tk.Tk):
         try:
             d_in, L, slope, c_hw, e_step, e_flow, h_ref, h_tip_in, h_sub, h_min = self._parse()
         except ValueError:
-            messagebox.showerror("Помилка", "Перевірте числові поля.")
+            silent_showerror(self, "Помилка", "Перевірте числові поля.")
             return
 
         mode: Mode = "shoot" if self.var_mode.get().strip().lower() == "shoot" else "tip"
@@ -312,7 +314,8 @@ class LateralFieldCalculator(tk.Tk):
 
         if bool(self.var_manifold_couple.get()):
             if mode != "shoot":
-                messagebox.showwarning(
+                silent_showwarning(
+                    self,
                     "Увага",
                     "Сумісний полив з дальнім блоком рахується в режимі «Підбір H тупика під H врізки».",
                 )
@@ -322,7 +325,7 @@ class LateralFieldCalculator(tk.Tk):
                 d_man_mm = float(self.var_d_man_mm.get().replace(",", "."))
                 L_far = float(self.var_L_far.get().replace(",", "."))
             except ValueError:
-                messagebox.showerror("Помилка", "Перевірте поля магістралі (нога, D, довжина дальнього).")
+                silent_showerror(self, "Помилка", "Перевірте поля магістралі (нога, D, довжина дальнього).")
                 return
             d_man_m = d_man_mm / 1000.0
             near_inp = self._lateral_input(
@@ -352,7 +355,7 @@ class LateralFieldCalculator(tk.Tk):
                     )
                 )
             except ValueError as e:
-                messagebox.showwarning("Увага", str(e))
+                silent_showwarning(self, "Увага", str(e))
                 return
             res = mf.near
             self._out_h.set(
@@ -394,7 +397,7 @@ class LateralFieldCalculator(tk.Tk):
                 )
             )
         except ValueError as e:
-            messagebox.showwarning("Увага", str(e))
+            silent_showwarning(self, "Увага", str(e))
             return
 
         self._out_h.set(f"H біля врізки: {res.h_at_connection_m:.3f} м вод. ст.")

@@ -3,7 +3,9 @@ import os
 import json
 import math
 import re
-from tkinter import filedialog, messagebox
+from tkinter import filedialog
+
+from main_app.ui.silent_messagebox import silent_showerror, silent_showinfo, silent_showwarning
 from shapely.geometry import LineString, Polygon, Point
 from shapely.ops import unary_union
 
@@ -13,6 +15,65 @@ from modules.hydraulic_module.trunk_map_graph import (
     ensure_trunk_node_ids,
     normalize_legacy_trunk_valve_kinds,
 )
+
+
+def _normalize_consumer_schedule_payload(raw) -> dict:
+    """Розклад: групи (legacy) + 48 слотів поливу (irrigation_slots[i] = id вузлів)."""
+    out_groups = []
+    if isinstance(raw, dict):
+        groups = raw.get("groups")
+        if isinstance(groups, list):
+            for g in groups:
+                if not isinstance(g, dict):
+                    continue
+                title = str(g.get("title", "")).strip() or "Група"
+                ids = g.get("node_ids")
+                if ids is None:
+                    ids = g.get("nodes")
+                if not isinstance(ids, list):
+                    ids = []
+                clean = []
+                for x in ids:
+                    s = str(x).strip()
+                    if s and s not in clean:
+                        clean.append(s)
+                out_groups.append({"title": title, "node_ids": clean})
+
+    slots: list = []
+    sraw = None
+    if isinstance(raw, dict):
+        sraw = raw.get("irrigation_slots")
+    if isinstance(sraw, list):
+        for i in range(48):
+            cell: list = []
+            if i < len(sraw) and isinstance(sraw[i], list):
+                for x in sraw[i]:
+                    s = str(x).strip()
+                    if s and s not in cell:
+                        cell.append(s)
+            slots.append(cell)
+    else:
+        slots = [[] for _ in range(48)]
+
+    out: dict = {"groups": out_groups, "irrigation_slots": slots}
+    if isinstance(raw, dict):
+        try:
+            v = raw.get("max_pump_head_m")
+            if v is not None and str(v).strip() != "":
+                fv = float(v)
+                if fv > 0.0:
+                    out["max_pump_head_m"] = float(fv)
+        except (TypeError, ValueError):
+            pass
+        try:
+            vm = raw.get("trunk_schedule_v_max_mps")
+            if vm is not None and str(vm).strip() != "":
+                fvm = float(vm)
+                if fvm > 0.0:
+                    out["trunk_schedule_v_max_mps"] = max(0.2, min(8.0, float(fvm)))
+        except (TypeError, ValueError):
+            pass
+    return out
 
 
 def _field_block_from_dict(item):
@@ -96,6 +157,22 @@ def ensure_project_dir(app):
 
 
 def _collect_project_data(app, force_georeferenced=False):
+    cp = getattr(app, "control_panel", None)
+    if cp is not None and hasattr(cp, "_flush_schedule_max_pump_head_to_app"):
+        try:
+            cp._flush_schedule_max_pump_head_to_app()
+        except Exception:
+            pass
+    if cp is not None and hasattr(cp, "_flush_schedule_trunk_v_max_to_app"):
+        try:
+            cp._flush_schedule_trunk_v_max_to_app()
+        except Exception:
+            pass
+    if hasattr(app, "sync_trunk_tree_data_from_trunk_map"):
+        try:
+            app.sync_trunk_tree_data_from_trunk_map()
+        except Exception:
+            pass
     trunk_nodes = getattr(app, "trunk_map_nodes", None) or []
     if trunk_nodes:
         ensure_trunk_node_ids(trunk_nodes)
@@ -137,6 +214,9 @@ def _collect_project_data(app, force_georeferenced=False):
         "trunk": trunk_payload,
         "trunk_map_nodes": list(trunk_nodes),
         "trunk_map_segments": trunk_segments,
+        "consumer_schedule": copy.deepcopy(
+            _normalize_consumer_schedule_payload(getattr(app, "consumer_schedule", None))
+        ),
         "project_zone_bounds_local": (
             list(app.project_zone_bounds_local)
             if getattr(app, "project_zone_bounds_local", None) is not None
@@ -219,7 +299,7 @@ def _write_project_to_disk(app, filepath, data):
 
 def save_project(app, force_georeferenced=False):
     if force_georeferenced and not getattr(app, "geo_ref", None):
-        messagebox.showwarning(
+        silent_showwarning(app.root, 
             "Геоприв'язка",
             "Неможливо зберегти як геоприв'язаний: у проєкті немає geo_ref.",
         )
@@ -230,14 +310,14 @@ def save_project(app, force_georeferenced=False):
     data = _collect_project_data(app, force_georeferenced)
     try:
         _write_project_to_disk(app, filepath, data)
-        messagebox.showinfo("Збережено", f"Проект успішно збережено в:\n{filepath}")
+        silent_showinfo(app.root, "Збережено", f"Проект успішно збережено в:\n{filepath}")
     except Exception as e:
-        messagebox.showerror("Помилка", f"Не вдалося зберегти проект:\n{e}")
+        silent_showerror(app.root, "Помилка", f"Не вдалося зберегти проект:\n{e}")
 
 
 def save_project_as(app, force_georeferenced=False):
     if force_georeferenced and not getattr(app, "geo_ref", None):
-        messagebox.showwarning(
+        silent_showwarning(app.root, 
             "Геоприв'язка",
             "Неможливо зберегти як геоприв'язаний: у проєкті немає geo_ref.",
         )
@@ -268,12 +348,12 @@ def save_project_as(app, force_georeferenced=False):
     data["proj_name"] = app.var_proj_name.get()
     try:
         _write_project_to_disk(app, filepath, data)
-        messagebox.showinfo(
+        silent_showinfo(app.root, 
             "Збережено",
             f"Проект збережено:\n{filepath}\n\nТека проєкту:\n{proj_dir}",
         )
     except Exception as e:
-        messagebox.showerror("Помилка", f"Не вдалося зберегти проект:\n{e}")
+        silent_showerror(app.root, "Помилка", f"Не вдалося зберегти проект:\n{e}")
 
 
 def save_project_georeferenced(app):
@@ -436,6 +516,17 @@ def load_project(app):
             tid = str(row.get("id", "")).strip()
             if tid:
                 rec["id"] = tid
+            slab = row.get("schedule_label")
+            if slab is not None:
+                s = str(slab).strip()
+                if s:
+                    rec["schedule_label"] = s
+            qm = row.get("q_demand_m3s")
+            if qm is not None:
+                try:
+                    rec["q_demand_m3s"] = float(qm)
+                except (TypeError, ValueError):
+                    pass
             app.trunk_map_nodes.append(rec)
         ensure_trunk_node_ids(app.trunk_map_nodes)
         app.trunk_map_segments = []
@@ -489,6 +580,33 @@ def load_project(app):
                     app._trunk_route_last_node_idx = int(li[-1])
                 except (TypeError, ValueError):
                     pass
+
+        if hasattr(app, "sync_trunk_tree_data_from_trunk_map"):
+            try:
+                app.sync_trunk_tree_data_from_trunk_map()
+            except Exception:
+                pass
+
+        if hasattr(app, "consumer_schedule"):
+            app.consumer_schedule = _normalize_consumer_schedule_payload(
+                data.get("consumer_schedule")
+            )
+        if hasattr(app, "normalize_consumer_schedule"):
+            try:
+                app.normalize_consumer_schedule()
+            except Exception:
+                pass
+        cp = getattr(app, "control_panel", None)
+        if cp is not None and hasattr(cp, "_sync_schedule_max_pump_head_ui"):
+            try:
+                cp._sync_schedule_max_pump_head_ui()
+            except Exception:
+                pass
+        if cp is not None and hasattr(cp, "_sync_schedule_trunk_v_max_ui"):
+            try:
+                cp._sync_schedule_trunk_v_max_ui()
+            except Exception:
+                pass
 
         loaded_allowed = data.get("allowed_pipes", {})
         app.allowed_pipes = {}
@@ -643,7 +761,7 @@ def load_project(app):
         if hasattr(app, "refresh_map_after_project_load"):
             app.refresh_map_after_project_load()
     except Exception as e:
-        messagebox.showerror("Помилка", f"Не вдалося завантажити проект:\n{e}")
+        silent_showerror(app.root, "Помилка", f"Не вдалося завантажити проект:\n{e}")
 
 def import_kml(app):
     filepath = filedialog.askopenfilename(title="Імпорт KML", filetypes=[("KML Files", "*.kml")])
@@ -654,7 +772,7 @@ def import_kml(app):
             
         coords_match = re.search(r'<coordinates>(.*?)</coordinates>', content, re.DOTALL)
         if not coords_match:
-            messagebox.showerror("Помилка", "Координати не знайдені в KML!")
+            silent_showerror(app.root, "Помилка", "Координати не знайдені в KML!")
             return
             
         raw_coords = coords_match.group(1).strip().split()
@@ -698,12 +816,12 @@ def import_kml(app):
         if hasattr(app, "zoom_to_fit"):
             app.zoom_to_fit()
         app.redraw()
-        messagebox.showinfo(
+        silent_showinfo(app.root, 
             "Успіх",
             "Контур завантажено. За потреби намалюйте ще блоки (ПКМ — замкнути), потім «Завершити блоки → напрямок рядів» і два кліки напрямку.",
         )
     except Exception as e:
-        messagebox.showerror("Помилка", f"Не вдалося імпортувати KML:\n{e}")
+        silent_showerror(app.root, "Помилка", f"Не вдалося імпортувати KML:\n{e}")
 
 def import_srtm_kml(app):
     filepath = filedialog.askopenfilename(title="Імпорт контуру для SRTM (KML)", filetypes=[("KML Files", "*.kml")])
@@ -714,7 +832,7 @@ def import_srtm_kml(app):
             
         coords_match = re.search(r'<coordinates>(.*?)</coordinates>', content, re.DOTALL)
         if not coords_match:
-            messagebox.showerror("Помилка", "Координати не знайдені в KML!")
+            silent_showerror(app.root, "Помилка", "Координати не знайдені в KML!")
             return
             
         raw_coords = coords_match.group(1).strip().split()
@@ -743,15 +861,15 @@ def import_srtm_kml(app):
         app.redraw()
         if hasattr(app, "sync_srtm_model_status"):
             app.sync_srtm_model_status()
-        messagebox.showinfo("Успіх", "Контур для SRTM успішно завантажено. Встановіть роздільну здатність та натисніть 'Завантажити з супутника'.")
+        silent_showinfo(app.root, "Успіх", "Контур для SRTM успішно завантажено. Встановіть роздільну здатність та натисніть 'Завантажити з супутника'.")
     except Exception as e:
-        messagebox.showerror("Помилка", f"Не вдалося імпортувати KML для SRTM:\n{e}")
+        silent_showerror(app.root, "Помилка", f"Не вдалося імпортувати KML для SRTM:\n{e}")
 
 def export_dxf(app):
     """Лише ізолінії (локальні координати проєкту), DXF R12: POLYLINE + висота в групі 38."""
     cached = getattr(app, "cached_contours", None) or []
     if not cached:
-        messagebox.showwarning(
+        silent_showwarning(app.root, 
             "Увага",
             "Немає ізоліній для експорту.\n"
             "У блоці рельєфу натисніть «Побудувати ізолінії» — гідравлічний розрахунок не потрібен.",
@@ -775,13 +893,13 @@ def export_dxf(app):
 
         features = [(item["geom"], float(item["z"])) for item in cached]
         n = write_contours_dxf(features, filepath, layer_name="ISOLINES")
-        messagebox.showinfo("Експорт", f"Збережено {n} поліліній ізоліній (DXF R12):\n{filepath}")
+        silent_showinfo(app.root, "Експорт", f"Збережено {n} поліліній ізоліній (DXF R12):\n{filepath}")
     except Exception as e:
-        messagebox.showerror("Помилка", f"Не вдалося експортувати DXF:\n{e}")
+        silent_showerror(app.root, "Помилка", f"Не вдалося експортувати DXF:\n{e}")
 
 def export_kml(app):
     if not app.geo_ref:
-        messagebox.showwarning("Помилка", "Проект не має гео-прив'язки!")
+        silent_showwarning(app.root, "Помилка", "Проект не має гео-прив'язки!")
         return
         
     proj_dir = ensure_project_dir(app)
@@ -835,15 +953,15 @@ def export_kml(app):
         kml.extend(['</Document>', '</kml>'])
         
         with open(filepath, "w", encoding="utf-8") as f: f.write("\n".join(kml))
-        messagebox.showinfo("Експорт", f"KML збережено:\n{filepath}")
-    except Exception as e: messagebox.showerror("Помилка", f"Не вдалося експортувати KML:\n{e}")
+        silent_showinfo(app.root, "Експорт", f"KML збережено:\n{filepath}")
+    except Exception as e: silent_showerror(app.root, "Помилка", f"Не вдалося експортувати KML:\n{e}")
 
 def export_elevation_grid_kml(app):
     rings = [b["ring"] for b in getattr(app, "field_blocks", []) or []]
     if app.points and len(app.points) >= 3:
         rings.append(list(app.points))
     if not app.geo_ref or not rings:
-        messagebox.showwarning("Помилка", "Потрібен хоча б один замкнений контур поля з гео-прив'язкою!")
+        silent_showwarning(app.root, "Помилка", "Потрібен хоча б один замкнений контур поля з гео-прив'язкою!")
         return
         
     proj_dir = ensure_project_dir(app)
@@ -891,19 +1009,19 @@ def export_elevation_grid_kml(app):
         kml.extend(['</Document>', '</kml>'])
         
         with open(filepath, "w", encoding="utf-8") as f: f.write("\n".join(kml))
-        messagebox.showinfo("Експорт", f"Сітка (точок: {len(grid_points)}) збережена у KML!")
-    except Exception as e: messagebox.showerror("Помилка", f"Не вдалося створити сітку:\n{e}")
+        silent_showinfo(app.root, "Експорт", f"Сітка (точок: {len(grid_points)}) збережена у KML!")
+    except Exception as e: silent_showerror(app.root, "Помилка", f"Не вдалося створити сітку:\n{e}")
 
 def export_pdf(app):
     if not hasattr(app, "last_report") or not app.last_report:
-        messagebox.showwarning("Увага", "Спочатку виконайте розрахунок для генерації звіту!", parent=app.root)
+        silent_showwarning(app.root, "Увага", "Спочатку виконайте розрахунок для генерації звіту!")
         return
         
     try:
         from fpdf import FPDF
         from PIL import ImageGrab
     except ImportError:
-        messagebox.showerror("Помилка", "Не встановлено бібліотеку fpdf2 або Pillow.", parent=app.root)
+        silent_showerror(app.root, "Помилка", "Не встановлено бібліотеку fpdf2 або Pillow.")
         return
 
     proj_dir = ensure_project_dir(app)
@@ -918,7 +1036,7 @@ def export_pdf(app):
     try:
         ImageGrab.grab(bbox=(x, y, x+w, y+h)).save(temp_img_path)
     except Exception as e:
-        messagebox.showwarning("Увага", f"Не вдалося зробити скріншот креслення:\n{e}", parent=app.root)
+        silent_showwarning(app.root, "Увага", f"Не вдалося зробити скріншот креслення:\n{e}")
         pass 
         
     default_name = f"{app.var_proj_name.get().strip()}_Report.pdf"
@@ -959,9 +1077,9 @@ def export_pdf(app):
             pdf.multi_cell(0, 6, text=line, new_x="LMARGIN", new_y="NEXT")
             
         pdf.output(filepath)
-        messagebox.showinfo("Експорт", f"PDF звіт успішно збережено:\n{filepath}", parent=app.root)
+        silent_showinfo(app.root, "Експорт", f"PDF звіт успішно збережено:\n{filepath}")
     except Exception as e: 
-        messagebox.showerror("Помилка", f"Не вдалося експортувати PDF:\n{e}", parent=app.root)
+        silent_showerror(app.root, "Помилка", f"Не вдалося експортувати PDF:\n{e}")
     finally:
         if os.path.exists(temp_img_path):
             try: os.remove(temp_img_path)

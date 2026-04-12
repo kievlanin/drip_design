@@ -14,6 +14,8 @@ DripCAD is a specialized CAD application for agricultural drip irrigation: field
 - **Tooltips:** `main_app/ui/tooltips.py` — спільні `attach_tooltip` (панель) та `attach_tooltip_dark` (карта); підказки на кнопках у панелі, на карті, діалогах `dripcad_legacy`, редакторі сабмейну та окремих калькуляторах кореня репо.
 - **Hydraulics:** `modules/hydraulic_module/hydraulics_core.py` (`HydraulicEngine.calculate_network`), `lateral_solver`, `submain_telescope_opt`, etc.
 - **Топологія магістралі з карти/полотна:** `modules/hydraulic_module/trunk_map_graph.py` — валідація дерева, `build_oriented_edges`, **`expand_trunk_segments_to_pair_edges`** (один запис сегмента = одне ребро між двома вузлами; полілінія в `path_local`). Тести: `tests/test_trunk_map_graph.py`.
+- **Гідравліка магістралі за поливами:** `modules/hydraulic_module/trunk_irrigation_schedule_hydro.py` — `compute_trunk_irrigation_schedule_hydro` (HW по дереву, слоти `irrigation_slots`, конверт у кеш для кольорів сегментів). На вузлі-споживачі опційно **`trunk_schedule_q_m3h`** / **`trunk_schedule_h_m`** (індивідуальні Q та цільовий напір замість типових 60 м³/год і 40 м).
+- **Діалоги без beep (Windows):** `main_app/ui/silent_messagebox.py` — `silent_showinfo` / `silent_showwarning` / `silent_showerror` / `silent_askyesno` (Toplevel + Text); замість `tkinter.messagebox` у основному UI, `file_io_impl`, карті, калькуляторах кореня.
 - **Geo / relief:** `modules/geo_module/`, `TopoEngine` in `dripcad_legacy`.
 
 (Legacy names in older docs: `main.py`, `control_panel.py`, `hydraulics.py` — replaced by the layout above.)
@@ -34,6 +36,7 @@ DripCAD is a specialized CAD application for agricultural drip irrigation: field
 ## 6. WORKSPACE & FILE MANAGEMENT
 - Projects: `designs/[Project_Name]/[name].json` + project `pipes_db.json`.
 - `field_blocks_data[]`: per block `ring`, `submain`, `auto`/`manual` coords, optional `params` (grid + emitter snapshot for that block).
+- **«Улюблені» / pinned у IDE:** перелік шляхів для швидкого доступу — у [PROJECT_STATE.md](PROJECT_STATE.md), секція **«Ключові файли для швидкого доступу»** (разом із цим файлом тримайте під рукою в редакторі).
 
 ## 7. RECENT BEHAVIOR (snapshot 2026-04-10)
 - **reset_calc:** not on every LMB while drafting a new contour (`DRAW` + not closed); not immediately after closing a new block polygon — existing hydraulic results stay until something else invalidates them.
@@ -93,8 +96,14 @@ DripCAD is a specialized CAD application for agricultural drip irrigation: field
 - **`scene_lines`:** декоративні полілінії (ескіз на карті), зберігаються в JSON проєкту, **не** беруть участі в гідравліці; малювання на полотні та інструмент **«Лінії»** на карті.
 - **Підказки (tooltips):** українські пояснення на кнопках по всьому основному UI та на окремих утилітах (`lateral_field_calculator.py`, `submain_telescope_calculator.py`); спільний модуль `main_app/ui/tooltips.py`.
 
+### Snapshot 2026-04-12 (GitHub, silent UI, магістраль поливів, споживач)
+- **Git:** репозиторій підключено до **GitHub** (`origin`); робочі коміти з осмисленими повідомленнями; оновлювати **PROJECT_CONTEXT.md** / **PROJECT_STATE.md** разом із змінами коду.
+- **Беззвучні сповіщення:** у проєкті прибрано прямі виклики `messagebox.*` на користь **`main_app/ui/silent_messagebox.py`** (у т.ч. `app_ui`, `control_panel_impl`, `file_io_impl`, `map_viewer_tk_window`, `dripcad_legacy`, `submain_segment_editor`, `lateral_field_calculator`, `submain_telescope_calculator`).
+- **Магістраль за поливами:** кнопка/потік у `dripcad_legacy.run_trunk_irrigation_schedule_hydro` → `compute_trunk_irrigation_schedule_hydro`; кеш **`trunk_irrigation_hydro_cache`**; графік дефіциту напору по слотах (Canvas) після попереджень; підпис насоса: **H баж.** і **(розр. … м)**.
+- **Подвійний ЛКМ:** по **відрізку** магістралі — діалог труби (матеріал, PN, Ø) з `trunk_allowed_pipes` / `pipe_db`; по **споживачу** (`consumption` / `valve`) — витрата та цільовий напір для сценарію поливу, далі **перерахунок** поливів. Працює на полотні та на вкладці «Карта» (спільний `handle_trunk_segment_double_click_world`).
+
 ## 8. UPCOMING ROADMAP (idea backlog)
-- **Магістраль — розрахунок (перший крок):** `modules/hydraulic_module/trunk_tree_compute.py` — стійкий HW-розрахунок **дерева** (`TrunkTreeSpec`, `compute_trunk_tree_steady`, `validate_trunk_tree`); юніт-тести `tests/test_trunk_tree_compute.py`. Далі: UI/JSON, Q(t), прив’язка до блоків.
+- **Магістраль — розрахунок:** `trunk_tree_compute.py` уже в проді; **наступне** — глибша прив’язка споживачів до **кранів/блоків** і повний цикл Q(t) / гідравліки поля (див. PROJECT_STATE.md).
 - **Наступний спроектований етап — магістраль (див. PROJECT_STATE.md):** окрема модель **відкритого графа-дерева** від **витоку** (джерело/насосна точка): вершини типів **поворот**, **розгалуження**, **споживання** (підключення зон поля / блоків / вузлів навантаження); ребра — ділянки трубопроводу. До вузлів споживання — **графік споживання** (часові ряди Q(t) або еквівалентні профілі) для гідравліки та планування поливу. Інтеграція з поточними сабмейнами блоків — поетапно (прив’язка навантажень, сумісність JSON).
 - **Near-term (деталі в PROJECT_STATE.md):** per-block BOM + trunk BOM; active-block selector; submain segment editor з квантуванням довжин під «штанги» з `pipes_db`.
 - KML export polish; SRTM / relief workflows; DXF refinements.

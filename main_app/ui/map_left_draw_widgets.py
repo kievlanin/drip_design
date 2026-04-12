@@ -166,6 +166,20 @@ def build_trunk_tools_tab(
         _btn_trunk_consumer,
         "Споживач (consumption): ЛКМ — новий вузол, ПКМ — вийти з команди.",
     )
+    if app is not None and hasattr(app, "commit_trunk_graph_topology"):
+        _btn_trunk_save = tk.Button(
+            tab_trunk,
+            text="💾 Зберегти граф магістралі",
+            command=app.commit_trunk_graph_topology,
+            bg="#1f3d2e",
+            fg="#C8F5D8",
+            relief=tk.FLAT,
+        )
+        _btn_trunk_save.pack(fill=tk.X, padx=8, pady=(8, 3))
+        attach_tt(
+            _btn_trunk_save,
+            "Завершити редагування (вимкнути інструменти), перевірити топологію дерева та оновити trunk_tree з вузлів і відрізків.",
+        )
     if app is not None and hasattr(app, "open_pipe_selector"):
         _btn_trunk_pipes = tk.Button(
             tab_trunk,

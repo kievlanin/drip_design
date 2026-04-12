@@ -2,6 +2,27 @@
 
 **Призначення цього файлу:** швидкий огляд структури та запуску після змін у середовищі (перейменування папки, новий ПК, інший Python). **На початку сесії** переглядайте його, **наприкінці** — оновлюйте зміст і дату внизу. Рішення з роботи з AI теж коротко фіксуйте тут; код зберігайте на диск (`Ctrl+S`), за можливості робіть commit — так контекст не залежить лише від історії чату.
 
+**Репозиторій:** підключено до **GitHub** (`origin`); перед push — `git pull` / вирішення конфліктів за потреби.
+
+---
+
+## Ключові файли для швидкого доступу («улюблені» в IDE)
+
+Закріпіть у Cursor/VS Code (pinned tabs / швидкий перехід) разом із цим файлом і [PROJECT_CONTEXT.md](PROJECT_CONTEXT.md):
+
+| Файл | Навіщо |
+|------|--------|
+| `main_app/main.py` | Точка входу |
+| `main_app/ui/dripcad_legacy.py` | Полотно, магістраль, поливи, подвійний ЛКМ (труба / споживач) |
+| `main_app/ui/app_ui.py` | `DripCADUI`, оркестратор, прогрес, SRTM |
+| `main_app/ui/control_panel_impl.py` | Панель, розклад поливів, напір насоса |
+| `main_app/ui/map_viewer_tk_window.py` | Вкладка «Карта», ліва колонка, SRTM |
+| `main_app/ui/silent_messagebox.py` | Діалоги без системного звуку |
+| `main_app/io/file_io_impl.py` | Збереження/завантаження проєкту, KML/PDF |
+| `modules/hydraulic_module/trunk_irrigation_schedule_hydro.py` | Розрахунок магістралі за слотами поливу |
+| `modules/hydraulic_module/trunk_tree_compute.py` | HW по дереву магістралі |
+| `modules/hydraulic_module/trunk_map_graph.py` | Граф магістралі, нормалізація сегментів |
+
 ---
 
 ## Що це за проєкт
@@ -57,6 +78,8 @@ python -m main_app.main
 | `modules/hydraulic_module/hydraulics_core.py` | `HydraulicEngine`: секції сабмейну, **submain_profiles**, емітери по латералях |
 | `modules/hydraulic_module/trunk_tree_compute.py` | **Магістраль-деверо (стійкий режим):** `TrunkTreeSpec` / `compute_trunk_tree_steady` — підсумовування Q з листя, HW по ребрах, опційно `dz_m` на ребрі; `validate_trunk_tree` для перевірок топології. Тести: `tests/test_trunk_tree_compute.py` |
 | `modules/hydraulic_module/trunk_map_graph.py` | Граф магістралі з UI: вузли/сегменти, валідація дерева, **`expand_trunk_segments_to_pair_edges`** (канон: один сегмент = одне ребро), **`build_oriented_edges`**. Тести: `tests/test_trunk_map_graph.py` |
+| `modules/hydraulic_module/trunk_irrigation_schedule_hydro.py` | **Поливи по магістралі:** сценарії `irrigation_slots`, кеш для кольорів сегментів; опційно на вузлі **`trunk_schedule_q_m3h`**, **`trunk_schedule_h_m`** (індивідуальні Q / цільовий напір) |
+| `main_app/ui/silent_messagebox.py` | **`silent_showinfo` / `showwarning` / `showerror` / `askyesno`** замість `tkinter.messagebox` (без MessageBeep на Windows) |
 | `modules/hydraulic_module/engine.py` | `HydraulicModule` |
 | `modules/bom_module/engine.py` | `BOMModule` |
 | `lateral_field_calculator.py` (корінь) | Tk: один крило, опція «дальнє поле на магістралі» |
@@ -76,7 +99,7 @@ python -m main_app.main
 
 - **`field_blocks_data`** — список блоків поля; кожен елемент містить `ring`, опційно `edge_angle`, `submain` (полілінії сабмейнів), `auto` / `manual` (координати латералів), **`params`** (словник знімка налаштувань блоку: крок ліній/емітерів, max довжина, групування рядів, опційно поля емітерів). У старих файлах без `params` використовується fallback на глобальні поля після завантаження.
 - **`scene_lines`** — список декоративних поліліній (локальні XY), ескіз/ситуація; не використовується в розрахунках.
-- **`trunk_map_nodes`** / **`trunk_map_segments`** — магістраль на карті/полотні: вузли (`kind`: source, valve, bend, junction, consumption; координати `x`,`y`, опційно `lat`,`lon`), сегменти як **ребра** (два індекси в `node_indices` + **`path_local`** — полілінія труби в метрах). Після завантаження/завершення траси нормалізація до пар ребер у `file_io_impl.py` / `DripCAD.normalize_trunk_segments_to_graph_edges`.
+- **`trunk_map_nodes`** / **`trunk_map_segments`** — магістраль на карті/полотні: вузли (`kind`: source, valve, bend, junction, consumption; координати `x`,`y`, опційно `lat`,`lon`; у споживачів опційно **`trunk_schedule_q_m3h`**, **`trunk_schedule_h_m`** для сценарію «магістраль за поливами»), сегменти як **ребра** (два індекси в `node_indices` + **`path_local`** — полілінія труби в метрах; опційно **`pipe_material`**, **`pipe_pn`**, **`pipe_od`** після діалогу труби). Після завантаження/завершення траси нормалізація до пар ребер у `file_io_impl.py` / `DripCAD.normalize_trunk_segments_to_graph_edges`.
 - **`field_blocks`** — лише кільця для сумісності; повне відновлення — з `field_blocks_data`.
 
 ---
@@ -140,6 +163,7 @@ python -m main_app.main
 - **«Вибір» (`select`):** лише на **полотні «Без карти»** (на вкладці «Карта» інструмент маршрутизується на віджет карти). Та сама логіка підбору, що **«Інфо»**, але **після ЛКМ** вибір **залишається підсвіченим**; **рамка / кросрамка** для множинного вибору; **ПКМ** — спочатку скинути вибір, потім вийти. Код: `dripcad_legacy.py` (`handle_left_release`, `_draw_canvas_selection_layer`, `_pick_hits_in_world_rect`); кнопка з діагональною стрілкою — `map_left_draw_widgets.py`.
 - **Меню Файл:** пункт **«Зберегти проект як (JSON)…»** (поруч із звичайним збереженням).
 - **Гідравліка:** перемикання **бісекція / Ньютон / порівняння** для латералів **не** скидає `calc_results` по всіх блоках; оновлення після **«▶ РОЗРАХУНОК»**.
+- **Магістраль за поливами:** розрахунок і кеш кольорів сегментів; **беззвучні** діалоги результату; **подвійний ЛКМ** по відрізку — каталог труби; по **споживачу** — Q (м³/год) і цільовий H (м) з перерахунком. Далі планується прив’язка споживачів до **кранів блоків** і повний цикл поля.
 
 Дубль короткого знімка «останніх правок» — у [PROJECT_CONTEXT.md](PROJECT_CONTEXT.md), §7.
 
@@ -282,4 +306,10 @@ py -c "import tkinter, shapely; print('ok')"
 - **Репозиторій:** розширений `.gitignore` (в т.ч. `.venv`, кеші); перший **commit** з повідомленням **назва проєкту + дата + час**.
 - Оновлено **PROJECT_CONTEXT.md** / **PROJECT_STATE.md**.
 
-*Останнє оновлення опису: 2026-04-11 18:34 — DripCAD: «Вибір» (рамка/кросрамка, підсвітка), `.gitignore`, документація*
+## Нотатка сесії 2026-04-12
+
+- **GitHub:** `origin` на головну гілку; коміт зі змінами магістралі поливів, silent-діалогів, подвійного ЛКМ (труба / споживач), оновлення **PROJECT_CONTEXT.md** / **PROJECT_STATE.md** та таблиці **«улюблених»** файлів для IDE.
+- **Silent messagebox:** уніфікація сповіщень без системного beep; **`silent_askyesno`** для підтверджень (очищення слотів поливу, завантаження SRTM тощо).
+- **Транк поливів:** `trunk_irrigation_schedule_hydro.py` у репозиторії; індивідуальні **`trunk_schedule_q_m3h`** / **`trunk_schedule_h_m`** на вузлах споживачів.
+
+*Останнє оновлення опису: 2026-04-12 — DripCAD: GitHub, silent UI, магістраль поливів, діалог споживача, документація*

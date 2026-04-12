@@ -4,7 +4,7 @@ import sys
 from pathlib import Path
 import re
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, ttk
 import math
 import threading
 
@@ -30,6 +30,12 @@ from modules.hydraulic_module.trunk_map_graph import (
 )
 from main_app.paths import SRTM_DIR
 from main_app.ui.map_left_draw_widgets import build_draw_modes_tab, build_trunk_tools_tab
+from main_app.ui.silent_messagebox import (
+    silent_askyesno,
+    silent_showerror,
+    silent_showinfo,
+    silent_showwarning,
+)
 from main_app.ui.tooltips import attach_tooltip_dark as _attach_dark_tooltip
 
 DARK_TILE_URL = "https://a.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png"
@@ -72,6 +78,12 @@ def create_embedded_map_panel(parent: tk.Misc, app=None):
         )
 
     host = tk.Frame(parent, bg="#1e1e1e")
+
+    def _map_silent_parent():
+        if app is not None and getattr(app, "root", None) is not None:
+            return app.root
+        return host
+
     host.pack(fill="both", expand=True)
 
     top_bar = tk.Frame(host, bg="#1e1e1e", height=34)
@@ -355,7 +367,10 @@ def create_embedded_map_panel(parent: tk.Misc, app=None):
             elif kind == "junction":
                 label = f"Розгалуження (сумматор), {nid}"
             elif kind in ("consumption", "valve"):
-                label = f"Споживач (сток), {nid}"
+                if hasattr(app, "trunk_consumer_display_caption"):
+                    label = app.trunk_consumer_display_caption(node, i)
+                else:
+                    label = f"Споживач (сток), {nid}"
             else:
                 label = f"Вузол магістралі, {nid}"
             _register_pick_disc(
@@ -383,6 +398,27 @@ def create_embedded_map_panel(parent: tk.Misc, app=None):
                     width=2,
                     tags="trunk_map_glyph",
                 )
+                if hasattr(app, "trunk_irrigation_hydro_pump_label_lines"):
+                    plab = app.trunk_irrigation_hydro_pump_label_lines()
+                    if plab:
+                        c.create_text(
+                            cx,
+                            cy + g + 14,
+                            text=plab[0],
+                            anchor=tk.N,
+                            fill="#FFE082",
+                            font=("Segoe UI", 8, "bold"),
+                            tags="trunk_map_glyph",
+                        )
+                        c.create_text(
+                            cx,
+                            cy + g + 28,
+                            text=plab[1],
+                            anchor=tk.N,
+                            fill="#9E9E9E",
+                            font=("Segoe UI", 7),
+                            tags="trunk_map_glyph",
+                        )
             elif kind == "bend":
                 c.create_oval(
                     cx - g,
@@ -395,6 +431,11 @@ def create_embedded_map_panel(parent: tk.Misc, app=None):
                     tags="trunk_map_glyph",
                 )
             elif kind in ("consumption", "valve"):
+                nid_map = str(node.get("id", "")).strip() or f"__{i}"
+                stg = set(getattr(app, "_rozklad_staging_ids", []) or [])
+                _fill = "#FFCA28" if nid_map in stg else "#C4933A"
+                _outline = "#F57F17" if nid_map in stg else "#5D4037"
+                _w = 3 if nid_map in stg else 2
                 c.create_polygon(
                     cx,
                     cy - g * 1.05,
@@ -402,11 +443,14 @@ def create_embedded_map_panel(parent: tk.Misc, app=None):
                     cy + g * 0.58,
                     cx + g * 0.92,
                     cy + g * 0.58,
-                    fill="#C4933A",
-                    outline="#5D4037",
-                    width=2,
+                    fill=_fill,
+                    outline=_outline,
+                    width=_w,
                     tags="trunk_map_glyph",
                 )
+                _nid_r = str(node.get("id", "")).strip()
+                if _nid_r and hasattr(app, "_draw_consumer_irrigation_slot_rings"):
+                    app._draw_consumer_irrigation_slot_rings(c, cx, cy, _nid_r, "trunk_map_glyph")
             elif kind == "junction":
                 Ro, Ri = g * 1.05, g * 0.42
                 coords: list[float] = []
@@ -432,21 +476,45 @@ def create_embedded_map_panel(parent: tk.Misc, app=None):
                     width=1,
                     tags="trunk_map_glyph",
                 )
-            cap = (
-                app._trunk_map_node_caption(node, i)
-                if hasattr(app, "_trunk_map_node_caption")
-                else nid
-            )
+            if hasattr(app, "trunk_consumer_caption_lines"):
+                cap_main, cap_sub = app.trunk_consumer_caption_lines(node, i)
+            else:
+                cap_main = (
+                    app._trunk_map_node_caption(node, i)
+                    if hasattr(app, "_trunk_map_node_caption")
+                    else nid
+                )
+                cap_sub = None
             _ty = cy - g - 5 if kind != "junction" else cy - g * 1.35 - 4
-            c.create_text(
-                cx + g + 5,
-                _ty,
-                text=cap,
-                anchor=tk.W,
-                fill="#ECEFF1",
-                font=("Segoe UI", 8),
-                tags="trunk_map_glyph",
-            )
+            if cap_sub is not None:
+                c.create_text(
+                    cx + g + 5,
+                    _ty,
+                    text=cap_main,
+                    anchor=tk.W,
+                    fill="#FFF8E1",
+                    font=("Segoe UI", 9, "bold"),
+                    tags="trunk_map_glyph",
+                )
+                c.create_text(
+                    cx + g + 5,
+                    _ty + 12,
+                    text=cap_sub,
+                    anchor=tk.W,
+                    fill="#B0BEC5",
+                    font=("Segoe UI", 7),
+                    tags="trunk_map_glyph",
+                )
+            else:
+                c.create_text(
+                    cx + g + 5,
+                    _ty,
+                    text=cap_main,
+                    anchor=tk.W,
+                    fill="#ECEFF1",
+                    font=("Segoe UI", 8),
+                    tags="trunk_map_glyph",
+                )
 
         segs = list(getattr(app, "trunk_map_segments", []) or [])
         for si, seg in enumerate(segs):
@@ -470,10 +538,20 @@ def create_embedded_map_panel(parent: tk.Misc, app=None):
             tcx, tcy = float(pseg[0]), float(pseg[1])
             if not (-80 < tcx < float(map_widget.width) + 80 and -80 < tcy < float(map_widget.height) + 80):
                 continue
+            try:
+                dmm = float(seg.get("d_inner_mm", 90.0) or 90.0)
+            except (TypeError, ValueError):
+                dmm = 90.0
+            if hasattr(app, "trunk_pipe_label_for_inner_mm"):
+                cap = app.trunk_pipe_label_for_inner_mm(dmm)
+            else:
+                cap = f"М{si + 1}"
+            if len(cap) > 26:
+                cap = cap[:23] + "…"
             c.create_text(
                 tcx + 8,
                 tcy - 8,
-                text=f"М{si + 1}",
+                text=cap,
                 fill="#E1BEE7",
                 font=("Segoe UI", 8, "bold"),
                 tags="trunk_map_glyph",
@@ -952,6 +1030,16 @@ def create_embedded_map_panel(parent: tk.Misc, app=None):
                         p0[0], p0[1], p1[0], p1[1],
                         fill="#FF8800", dash=(4, 4), width=2, tags="map_live_preview",
                     )
+            if hasattr(app, "paint_trunk_hydro_hover_on_map_canvas") and m not in (
+                "RULER",
+                "DEL",
+                "INFO",
+                "LAT_TIP",
+            ):
+                try:
+                    app.paint_trunk_hydro_hover_on_map_canvas(c, cx, cy, _canvas_xy_from_world)
+                except Exception:
+                    pass
             try:
                 if c.find_withtag("map_live_preview"):
                     c.lift("map_live_preview")
@@ -1095,7 +1183,10 @@ def create_embedded_map_panel(parent: tk.Misc, app=None):
                     pass
             seg_draw = view_state.setdefault("trunk_segment_paths", [])
             for si, seg in enumerate(list(getattr(app, "trunk_map_segments", []) or [])):
-                pl = seg.get("path_local") or []
+                if hasattr(app, "_trunk_segment_world_path"):
+                    pl = app._trunk_segment_world_path(seg)
+                else:
+                    pl = seg.get("path_local") or []
                 if len(pl) < 2:
                     continue
                 lg = []
@@ -1106,8 +1197,13 @@ def create_embedded_map_panel(parent: tk.Misc, app=None):
                             lg.append(ll)
                 if len(lg) >= 2:
                     try:
+                        col = TRUNK_PATH_COLOR
+                        if hasattr(app, "trunk_hydro_segment_line_color"):
+                            hc = app.trunk_hydro_segment_line_color(si)
+                            if hc:
+                                col = hc
                         seg_draw.append(
-                            map_widget.set_path(lg, color=TRUNK_PATH_COLOR, width=5)
+                            map_widget.set_path(lg, color=col, width=6)
                         )
                     except Exception:
                         pass
@@ -1236,7 +1332,7 @@ def create_embedded_map_panel(parent: tk.Misc, app=None):
                 if len(ring_local) >= 3:
                     max_b = int(getattr(app, "MAX_FIELD_BLOCKS", 100) or 100)
                     if len(app.field_blocks) >= max_b:
-                        messagebox.showwarning(
+                        silent_showwarning(_map_silent_parent(), 
                             "Карта",
                             f"Досягнуто максимум блоків поля ({max_b}).",
                         )
@@ -1251,7 +1347,7 @@ def create_embedded_map_panel(parent: tk.Misc, app=None):
                         if hasattr(app, "redraw"):
                             app.redraw()
                 elif len(pts) >= 3:
-                    messagebox.showwarning(
+                    silent_showwarning(_map_silent_parent(), 
                         "Карта",
                         "Не вдалося перевести вершини контуру в локальні координати. "
                         "Перевірте геоприв'язку проєкту або намалюйте контур ще раз.",
@@ -1265,13 +1361,13 @@ def create_embedded_map_panel(parent: tk.Misc, app=None):
                     ok = True
                     for ii in idxs:
                         if not (0 <= ii < len(nodes)):
-                            messagebox.showerror("Магістраль", "Некоректні індекси вузлів.")
+                            silent_showerror(_map_silent_parent(), "Магістраль", "Некоректні індекси вузлів.")
                             ok = False
                             break
                         try:
                             path_local.append((float(nodes[ii]["x"]), float(nodes[ii]["y"])))
                         except (KeyError, TypeError, ValueError):
-                            messagebox.showerror("Магістраль", "Не вдалося прочитати координати вузла.")
+                            silent_showerror(_map_silent_parent(), "Магістраль", "Не вдалося прочитати координати вузла.")
                             ok = False
                             break
                     if ok:
@@ -1289,7 +1385,7 @@ def create_embedded_map_panel(parent: tk.Misc, app=None):
                             msg = "\n".join(graph_errs[:10])
                             if len(graph_errs) > 10:
                                 msg += f"\n… ще {len(graph_errs) - 10}."
-                            messagebox.showwarning("Граф магістралі", msg)
+                            silent_showwarning(_map_silent_parent(), "Граф магістралі", msg)
                             view_state["trunk_draft_indices"] = []
                             view_state["draft_points"] = []
                             _safe_delete(view_state.get("draft_path"))
@@ -1327,7 +1423,7 @@ def create_embedded_map_panel(parent: tk.Misc, app=None):
                             keep_tool_active = True
                 else:
                     if len(idxs) == 1:
-                        messagebox.showinfo(
+                        silent_showinfo(_map_silent_parent(), 
                             "Магістраль",
                             "Для відрізка потрібні щонайменше два вузли. Додайте ще один ЛКМ або почніть спочатку.",
                         )
@@ -1390,7 +1486,7 @@ def create_embedded_map_panel(parent: tk.Misc, app=None):
                 pts = pts_kml
                 src_label = "відкритий KML"
             else:
-                messagebox.showwarning(
+                silent_showwarning(_map_silent_parent(), 
                     "SRTM",
                     "Немає зони для завантаження.\n"
                     "Задайте «Зону проєкту (рамка)» на карті або намалюйте контур захвату / KML.",
@@ -1412,13 +1508,13 @@ def create_embedded_map_panel(parent: tk.Misc, app=None):
         if not missing_tiles:
             dl_status.set(f"SRTM: уже в кеші {existing_n}/{len(tiles)}")
             _show_cached_tiles_overlay()
-            messagebox.showinfo(
+            silent_showinfo(_map_silent_parent(), 
                 "SRTM",
                 f"Усі тайли вже завантажені.\n"
                 f"Знайдено в кеші: {existing_n}/{len(tiles)}.",
             )
             return
-        if not messagebox.askyesno(
+        if not silent_askyesno(_map_silent_parent(), 
             "SRTM",
             f"Джерело меж: {src_label}\n"
             f"Всього в межах: {len(tiles)}\n"
@@ -1527,7 +1623,7 @@ def create_embedded_map_panel(parent: tk.Misc, app=None):
             lons = [p[1] for p in coords]
             _fit_bounds(min(lats), min(lons), max(lats), max(lons))
         except Exception as ex:
-            messagebox.showerror("KML", f"Не вдалося прочитати KML:\n{ex}")
+            silent_showerror(_map_silent_parent(), "KML", f"Не вдалося прочитати KML:\n{ex}")
 
     def _zoom_box_on():
         zoom_box_state["on"] = True
@@ -1595,7 +1691,7 @@ def create_embedded_map_panel(parent: tk.Misc, app=None):
         tool = view_state.get("active_tool")
         if tool in _MAP_TOOLS_PASSIVE:
             if app is None or not getattr(app, "geo_ref", None):
-                messagebox.showinfo(
+                silent_showinfo(_map_silent_parent(), 
                     "Інфо",
                     "На карті для підбору об'єктів потрібна геоприв’язка (geo_ref).\n"
                     "Відкрийте вкладку «Без карти» — там працюють інструменти «Вибір» та «Інфо» в локальних координатах.",
@@ -1614,9 +1710,9 @@ def create_embedded_map_panel(parent: tk.Misc, app=None):
             label = _pick_map_object_at_world(wx, wy)
             title = "Вибір" if tool == "select" else "Інфо"
             if label:
-                messagebox.showinfo(title, label)
+                silent_showinfo(_map_silent_parent(), title, label)
             else:
-                messagebox.showinfo(
+                silent_showinfo(_map_silent_parent(), 
                     title,
                     "Об'єкт не знайдено. Увімкніть шари «Блоки» / «Сабмейни», оновіть накладення або наблизьте карту.",
                 )
@@ -1628,7 +1724,7 @@ def create_embedded_map_panel(parent: tk.Misc, app=None):
                 return "break"
             ni, _dist = _nearest_trunk_node_index(lat, lon)
             if ni is None:
-                messagebox.showinfo(
+                silent_showinfo(_map_silent_parent(), 
                     "Магістраль",
                     f"Немає вузла в радіусі {int(TRUNK_NODE_SNAP_M)} м. Наведіть курсор на насос, пікет, розгалуження або споживача.",
                 )
@@ -1640,13 +1736,13 @@ def create_embedded_map_panel(parent: tk.Misc, app=None):
                 if last_end is None:
                     src_ix = _first_trunk_source_index()
                     if src_ix is None:
-                        messagebox.showwarning(
+                        silent_showwarning(_map_silent_parent(), 
                             "Магістраль",
                             "Спочатку задайте на карті вузол витоку — «Насос».",
                         )
                         return "break"
                     if ni != src_ix:
-                        messagebox.showwarning(
+                        silent_showwarning(_map_silent_parent(), 
                             "Магістраль",
                             "Перший клік першого відрізка має бути на насосі (витік).",
                         )
@@ -1655,14 +1751,14 @@ def create_embedded_map_panel(parent: tk.Misc, app=None):
                     knd = str(nodes[ni].get("kind", "")).lower()
                     start_ok = ni == last_end or knd == "junction"
                     if not start_ok:
-                        messagebox.showwarning(
+                        silent_showwarning(_map_silent_parent(), 
                             "Магістраль",
                             "Початок нового відрізка: кінець попереднього вузла або вузол «Розгалуження» (нова гілка).",
                         )
                         return "break"
             else:
                 if ni == draft_i[-1]:
-                    messagebox.showinfo(
+                    silent_showinfo(_map_silent_parent(), 
                         "Магістраль",
                         "Оберіть наступний вузол по трасі (не дублюйте попередній).",
                     )
@@ -1748,6 +1844,25 @@ def create_embedded_map_panel(parent: tk.Misc, app=None):
                 pass
         if app is None or not getattr(app, "geo_ref", None):
             return
+        try:
+            m_nav = app.mode.get()
+            tool_nav = view_state.get("active_tool")
+            if (
+                m_nav in ("VIEW", "PAN")
+                and isinstance(getattr(app, "trunk_irrigation_hydro_cache", None), dict)
+                and tool_nav not in _MAP_TOOLS_POLYLINE
+                and tool_nav not in _MAP_TOOLS_TRUNK_POINT
+                and tool_nav != "project_zone_rect"
+            ):
+                lat, lon = map_widget.convert_canvas_coords_to_decimal_coords(int(event.x), int(event.y))
+                ref_lon, ref_lat = app.geo_ref
+                wx, wy = srtm_tiles.lat_lon_to_local_xy(
+                    float(lat), float(lon), float(ref_lon), float(ref_lat)
+                )
+                app.feed_map_pointer_world(wx, wy, redraw_canvas=False)
+                _paint_map_live_preview()
+        except Exception:
+            pass
         if not _map_tool_or_draw_blocks_pan():
             return
         m = app.mode.get()
@@ -1893,6 +2008,23 @@ def create_embedded_map_panel(parent: tk.Misc, app=None):
         pass
 
     map_widget.canvas.bind("<ButtonRelease-1>", _release, add="+")
+
+    def _map_double_b1(event):
+        if app is None or not getattr(app, "geo_ref", None):
+            return
+        tool = view_state.get("active_tool")
+        if tool in _MAP_TOOLS_POLYLINE or tool in _MAP_TOOLS_TRUNK_POINT or tool == "project_zone_rect":
+            return
+        try:
+            lat, lon = map_widget.convert_canvas_coords_to_decimal_coords(int(event.x), int(event.y))
+            ref_lon, ref_lat = app.geo_ref
+            wx, wy = srtm_tiles.lat_lon_to_local_xy(float(lat), float(lon), float(ref_lon), float(ref_lat))
+            if hasattr(app, "handle_trunk_segment_double_click_world"):
+                app.handle_trunk_segment_double_click_world(wx, wy)
+        except Exception:
+            pass
+
+    map_widget.canvas.bind("<Double-Button-1>", _map_double_b1, add="+")
     map_widget.canvas.bind("<Motion>", _map_canvas_motion, add="+")
     map_widget.canvas.bind("<MouseWheel>", lambda _e: _schedule_cached_tiles_overlay_refresh(), add="+")
     map_widget.canvas.bind("<Button-4>", lambda _e: _schedule_cached_tiles_overlay_refresh(), add="+")
@@ -2227,7 +2359,7 @@ def main() -> None:
     if TkinterMapView is None:
         root = tk.Tk()
         root.withdraw()
-        messagebox.showerror(
+        silent_showerror(root, 
             "Мапа",
             "Не вдалося імпортувати tkintermapview.\n"
             "Встановіть: py -m pip install tkintermapview\n\n"
@@ -2241,6 +2373,14 @@ def main() -> None:
     root.geometry("1200x800")
     root.minsize(900, 600)
     root.configure(bg="#1e1e1e")
+    app = None  # автономне вікно карти без екземпляра DripCAD
+
+    def _standalone_save_trunk_graph() -> None:
+        silent_showinfo(root, 
+            "Магістраль",
+            "Зберегти граф магістралі можна у головному вікні DripCAD: вкладка «Карта» → «Магістраль», "
+            "або меню «Інструменти» → «Зберегти граф магістралі».",
+        )
 
     top_bar = tk.Frame(root, bg="#1e1e1e", height=34)
     top_bar.pack(side=tk.TOP, fill=tk.X)
@@ -2372,7 +2512,7 @@ def main() -> None:
     def _download_tiles_for_capture() -> None:
         pts = list(view_state.get("capture_points") or [])
         if len(pts) < 3:
-            messagebox.showwarning(
+            silent_showwarning(root, 
                 "SRTM",
                 "Спершу намалюйте контур захвату тайлів (мінімум 3 вершини) і завершіть ПКМ.",
             )
@@ -2383,9 +2523,9 @@ def main() -> None:
         lon_min, lon_max = min(lons), max(lons)
         tiles = srtm_tiles.iter_tiles_covering_bbox(lat_min, lat_max, lon_min, lon_max)
         if not tiles:
-            messagebox.showinfo("SRTM", "Немає тайлів для завантаження у вибраному контурі.")
+            silent_showinfo(root, "SRTM", "Немає тайлів для завантаження у вибраному контурі.")
             return
-        if not messagebox.askyesno(
+        if not silent_askyesno(root, 
             "SRTM",
             f"Буде завантажено до {len(tiles)} тайлів у:\n{SRTM_DIR}\n\nПродовжити?",
         ):
@@ -2417,7 +2557,7 @@ def main() -> None:
             lines = "\n".join(f"{n}: {m}" for n, m in results[:30])
             if len(results) > 30:
                 lines += f"\n… ще {len(results) - 30} рядків"
-            messagebox.showinfo(
+            silent_showinfo(root, 
                 "SRTM",
                 f"Папка: {SRTM_DIR}\nУспішно: {ok_n}/{total_n}\n\n{lines}",
             )
@@ -2537,13 +2677,13 @@ def main() -> None:
             lats = [p[0] for p in coords]
             lons = [p[1] for p in coords]
             _fit_bounds(min(lats), min(lons), max(lats), max(lons))
-            messagebox.showinfo(
+            silent_showinfo(root, 
                 "KML",
                 f"Завантажено координат: {len(coords)}\n"
                 f"Сегментів: {len(path_segments)}",
             )
         except Exception as ex:
-            messagebox.showerror("KML", f"Не вдалося прочитати KML:\n{ex}")
+            silent_showerror(root, "KML", f"Не вдалося прочитати KML:\n{ex}")
 
     zoom_box_state = {"on": False, "x0": 0, "y0": 0, "rect": None}
 
@@ -2708,6 +2848,21 @@ def main() -> None:
     )
     _main_btn_trunk.pack(fill=tk.X, padx=8, pady=3)
     _attach_dark_tooltip(_main_btn_trunk, "Намалювати ламану траси магістралі на карті.")
+    _btn_trunk_save = tk.Button(
+        left_toolbar,
+        text="💾 Зберегти граф магістралі",
+        command=_standalone_save_trunk_graph,
+        bg="#1f3d2e",
+        fg="#C8F5D8",
+        relief=tk.FLAT,
+        padx=8,
+        pady=6,
+    )
+    _btn_trunk_save.pack(fill=tk.X, padx=8, pady=3)
+    _attach_dark_tooltip(
+        _btn_trunk_save,
+        "Завершити редагування (інструменти вимикаються), перевірити дерево магістралі та оновити trunk_tree з вузлів і відрізків карти.",
+    )
     _main_btn_cancel = tk.Button(
         left_toolbar,
         text="❌ Скасувати інструмент",

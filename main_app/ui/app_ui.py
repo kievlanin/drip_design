@@ -2,8 +2,9 @@ import threading
 import time
 import tkinter as tk
 from typing import Optional
-from tkinter import messagebox, ttk
+from tkinter import ttk
 
+from main_app.ui.silent_messagebox import silent_showerror, silent_showinfo, silent_showwarning
 from main_app.ui.dripcad_legacy import DripCAD
 from main_app.orchestrator import IrrigationOrchestrator
 
@@ -51,19 +52,19 @@ class DripCADUI(DripCAD):
     def build_contours(self, interp_method: str = "idw"):
         geom = self.contour_clip_geometry()
         if geom is None:
-            messagebox.showwarning(
+            silent_showwarning(self.root, 
                 "Увага",
                 "Потрібна зона проєкту (рамка на карті), контур поля, KML зони SRTM або щонайменше три точки висоти для меж ізоліній.",
             )
             return
         if not self.topo.elevation_points:
-            messagebox.showwarning("Увага", "Немає точок висоти! Розставте точки для побудови рельєфу.")
+            silent_showwarning(self.root, "Увага", "Немає точок висоти! Розставте точки для побудови рельєфу.")
             return
         try:
             step_z = float(self.var_topo_step.get().replace(",", "."))
             grid_size = float(self.var_topo_grid.get().replace(",", "."))
         except ValueError:
-            messagebox.showerror("Помилка", "Некоректні значення параметрів рельєфу.")
+            silent_showerror(self.root, "Помилка", "Некоректні значення параметрів рельєфу.")
             return
 
         elev_snapshot = [tuple(p) for p in self.topo.elevation_points]
@@ -154,10 +155,10 @@ class DripCADUI(DripCAD):
                         )
                         if note:
                             msg += f"\n\n{note}"
-                        messagebox.showinfo("Інфо", msg)
+                        silent_showinfo(self.root, "Інфо", msg)
                     else:
                         if note:
-                            messagebox.showinfo(
+                            silent_showinfo(self.root, 
                                 "Ізолінії (велике поле)",
                                 note
                                 + "\n\nЗа потреби збільште крок сітки або крок ізоліній на вкладці «Рельєф» для дрібнішої сітки.",
@@ -169,7 +170,7 @@ class DripCADUI(DripCAD):
                 def _err():
                     _restore_title()
                     _reset_contour_buttons()
-                    messagebox.showerror("Помилка", f"Побудова ізоліній:\n{err}")
+                    silent_showerror(self.root, "Помилка", f"Побудова ізоліній:\n{err}")
 
                 root.after(0, _err)
 
@@ -180,13 +181,13 @@ class DripCADUI(DripCAD):
     def fetch_srtm_data(self):
         geom = self.contour_clip_geometry()
         if geom is None or geom.is_empty:
-            messagebox.showwarning(
+            silent_showwarning(self.root, 
                 "Увага",
                 "Потрібна зона проєкту (рамка на карті), контур поля (KML) або KML зони SRTM.",
             )
             return
         if getattr(self, "geo_ref", None) is None:
-            messagebox.showwarning("Увага", "Проект не має гео-прив'язки (імпортуйте KML з Google Earth)!")
+            silent_showwarning(self.root, "Увага", "Проект не має гео-прив'язки (імпортуйте KML з Google Earth)!")
             return
 
         try:
@@ -213,7 +214,7 @@ class DripCADUI(DripCAD):
                 self.sync_srtm_model_status()
             if hasattr(self.control_panel, "btn_srtm"):
                 self.control_panel.btn_srtm.config(state=tk.NORMAL, text="🌐 Завантажити з супутника")
-            messagebox.showinfo(
+            silent_showinfo(self.root, 
                 "Успіх",
                 f"Побудовано {count} точок висоти.\n"
                 "Дані з папки _srtm_, за відсутності тайла — з відкритого API (Open-Meteo).",
@@ -222,7 +223,7 @@ class DripCADUI(DripCAD):
         def _on_error(err):
             if hasattr(self.control_panel, "btn_srtm"):
                 self.control_panel.btn_srtm.config(state=tk.NORMAL, text="🌐 Завантажити з супутника")
-            messagebox.showerror("Помилка", f"Не вдалося завантажити SRTM:\n{err}")
+            silent_showerror(self.root, "Помилка", f"Не вдалося завантажити SRTM:\n{err}")
 
         if hasattr(self.control_panel, "btn_srtm"):
             self.control_panel.btn_srtm.config(state=tk.DISABLED, text="⏳ Очікування API...")
@@ -232,13 +233,13 @@ class DripCADUI(DripCAD):
     def download_srtm_tiles(self):
         bb = self.field_download_bounds_xy()
         if bb is None:
-            messagebox.showwarning(
+            silent_showwarning(self.root, 
                 "Увага",
                 "Потрібна рамка зони проєкту на карті, замкнений контур поля або KML зони SRTM.",
             )
             return
         if getattr(self, "geo_ref", None) is None:
-            messagebox.showwarning("Увага", "Потрібна гео-прив'язка (KML з координатами).")
+            silent_showwarning(self.root, "Увага", "Потрібна гео-прив'язка (KML з координатами).")
             return
 
         self.orchestrator.sync_topography_from_ui(self.topo)
@@ -259,7 +260,7 @@ class DripCADUI(DripCAD):
             lines = "\n".join(f"{n}: {msg}" for n, msg in results[:40])
             if len(results) > 40:
                 lines += f"\n… ще {len(results) - 40} рядків"
-            messagebox.showinfo(
+            silent_showinfo(self.root, 
                 "Тайли SRTM",
                 f"Папка: _srtm_ у корені проєкту.\nУспішно: {ok_n} / {len(results)}\n\n{lines}",
             )
@@ -267,7 +268,7 @@ class DripCADUI(DripCAD):
         def _on_err(err):
             if hasattr(self.control_panel, "btn_srtm_dl"):
                 self.control_panel.btn_srtm_dl.config(state=tk.NORMAL, text="⬇ Тайли SRTM у _srtm_ (за KML/полем)")
-            messagebox.showerror("Помилка", f"Не вдалося завантажити тайли:\n{err}")
+            silent_showerror(self.root, "Помилка", f"Не вдалося завантажити тайли:\n{err}")
 
         if hasattr(self.control_panel, "btn_srtm_dl"):
             self.control_panel.btn_srtm_dl.config(state=tk.DISABLED, text="⏳ Завантаження тайлів…")
@@ -337,14 +338,14 @@ class DripCADUI(DripCAD):
     def prepare_map_project_zone_pipeline(self):
         """З карти: завантажити тайли за рамкою зони (за потреби) і залити DEM з обраним кроком (5–90 м)."""
         if getattr(self, "project_zone_bounds_local", None) is None:
-            messagebox.showwarning(
+            silent_showwarning(self.root, 
                 "Зона проєкту",
                 "На вкладці «Карта»: інструмент «Зона проєкту (рамка)» — потягніть прямокутник ЛКМ.\n"
                 "Далі натисніть «Тайли + висоти (зона)» на карті або підготуйте зону тут.",
             )
             return
         if getattr(self, "geo_ref", None) is None:
-            messagebox.showwarning("Увага", "Потрібна геоприв'язка (задається при першій рамці або з KML).")
+            silent_showwarning(self.root, "Увага", "Потрібна геоприв'язка (задається при першій рамці або з KML).")
             return
         try:
             res = float(self.var_srtm_res.get().replace(",", "."))
@@ -382,10 +383,10 @@ class DripCADUI(DripCAD):
             if hasattr(self, "sync_srtm_model_status"):
                 self.sync_srtm_model_status()
             if err is not None:
-                messagebox.showerror("Помилка", err)
+                silent_showerror(self.root, "Помилка", err)
                 return
             if not pts:
-                messagebox.showwarning(
+                silent_showwarning(self.root, 
                     "SRTM",
                     "Точок висоти не отримано. Перевірте тайли в _srtm_ і крок сітки на вкладці «Рельєф».",
                 )
@@ -398,7 +399,7 @@ class DripCADUI(DripCAD):
             self.redraw()
             if hasattr(self, "_schedule_embedded_map_overlay_refresh"):
                 self._schedule_embedded_map_overlay_refresh()
-            messagebox.showinfo(
+            silent_showinfo(self.root, 
                 "Зона проєкту",
                 f"Готово.\nТочок висоти: {len(pts)} / {total} (крок {res:g} м).\n"
                 "Перейдіть на основне полотно — малюйте блоки та виконуйте розрахунок.",
@@ -410,13 +411,13 @@ class DripCADUI(DripCAD):
         """Завантажити висоти в проєкт із локальних тайлів, простим bbox-перетином."""
         bb = self.field_download_bounds_xy()
         if bb is None:
-            messagebox.showwarning(
+            silent_showwarning(self.root, 
                 "Увага",
                 "Потрібна рамка зони на карті, контур поля або зона SRTM (KML).",
             )
             return
         if getattr(self, "geo_ref", None) is None:
-            messagebox.showwarning("Увага", "Потрібна гео-прив'язка (KML з координатами).")
+            silent_showwarning(self.root, "Увага", "Потрібна гео-прив'язка (KML з координатами).")
             return
         try:
             res = float(self.var_srtm_res.get().replace(",", "."))
@@ -439,7 +440,7 @@ class DripCADUI(DripCAD):
                     text="📥 Лише висоти з _srtm_ (рамка)",
                 )
             if not pts:
-                messagebox.showwarning(
+                silent_showwarning(self.root, 
                     "SRTM",
                     "У вибраній рамці не знайдено локальних висот у _srtm_.",
                 )
@@ -452,7 +453,7 @@ class DripCADUI(DripCAD):
             self.redraw()
             if hasattr(self, "sync_srtm_model_status"):
                 self.sync_srtm_model_status()
-            messagebox.showinfo(
+            silent_showinfo(self.root, 
                 "SRTM",
                 f"Додано точок висоти: {len(pts)} / {total}\n"
                 "Джерело: тільки локальні тайли _srtm_ (без API).",
@@ -464,7 +465,7 @@ class DripCADUI(DripCAD):
                     state=tk.NORMAL,
                     text="📥 Лише висоти з _srtm_ (рамка)",
                 )
-            messagebox.showerror("Помилка", f"Не вдалося завантажити локальні висоти:\n{err}")
+            silent_showerror(self.root, "Помилка", f"Не вдалося завантажити локальні висоти:\n{err}")
 
         if hasattr(self.control_panel, "btn_srtm_local_bbox"):
             self.control_panel.btn_srtm_local_bbox.config(
@@ -563,18 +564,18 @@ class DripCADUI(DripCAD):
     def run_calculation(self):
         abi = self._safe_active_block_idx()
         if abi is None or not self.field_blocks:
-            messagebox.showwarning("Увага", "Немає блоку поля для розрахунку.")
+            silent_showwarning(self.root, "Увага", "Немає блоку поля для розрахунку.")
             return
         blk = self.field_blocks[abi]
         if not any(len(sm) > 1 for sm in (blk.get("submain_lines") or [])):
-            messagebox.showwarning(
+            silent_showwarning(self.root, 
                 "Увага",
                 "У активному блоці немає магістралі (полілінія ≥2 точок).",
             )
             return
         if not self._active_block_submains_have_connected_laterals():
             dmax = self._submain_lateral_snap_m()
-            messagebox.showwarning(
+            silent_showwarning(self.root, 
                 "Увага",
                 f"Кожен сабмейн активного блоку має перетинати латераль або бути поруч з нею (≤{dmax:.2f} м — "
                 "див. «Керування»). Замкніть ручну dripline ПКМ біля сабмейну або збільшіть допуск.",
@@ -587,7 +588,7 @@ class DripCADUI(DripCAD):
         try:
             data = self._collect_hydro_dto(active_block_only=use_active_block)
         except Exception as err:
-            messagebox.showerror("Помилка", f"Некоректні дані: {err}")
+            silent_showerror(self.root, "Помилка", f"Некоректні дані: {err}")
             return
 
         prog_win = tk.Toplevel(self.root)
@@ -660,7 +661,7 @@ class DripCADUI(DripCAD):
                     prog_win.destroy()
                 except tk.TclError:
                     pass
-                messagebox.showerror("Помилка", f"Некоректні дані: {err}")
+                silent_showerror(self.root, "Помилка", f"Некоректні дані: {err}")
                 return
 
             partial = hydro_result["results"]
@@ -694,7 +695,7 @@ class DripCADUI(DripCAD):
                     prog_win.destroy()
                 except tk.TclError:
                     pass
-                messagebox.showerror("Помилка", f"BOM: {e2}")
+                silent_showerror(self.root, "Помилка", f"BOM: {e2}")
                 return
 
             _finish_ok()
@@ -725,18 +726,18 @@ class DripCADUI(DripCAD):
 
     def run_stress_calculation(self):
         if not self._all_submain_lines():
-            messagebox.showwarning("Увага", "Намалюйте хоча б один сабмейн!")
+            silent_showwarning(self.root, "Увага", "Намалюйте хоча б один сабмейн!")
             return
         if not self._all_submains_have_connected_laterals():
             dmax = self._submain_lateral_snap_m()
-            messagebox.showwarning(
+            silent_showwarning(self.root, 
                 "Увага",
                 f"Кожен сабмейн має перетинати латераль або бути поруч з нею (≤{dmax:.2f} м — "
                 "див. «Керування»). Замкніть ручну dripline ПКМ біля сабмейну або збільшіть допуск.",
             )
             return
         if not self.orchestrator.last_hydraulic.get("results", {}).get("sections"):
-            messagebox.showwarning(
+            silent_showwarning(self.root, 
                 "Увага",
                 "Спочатку виконайте основний розрахунок кнопкою «▶ РОЗРАХУНОК».",
             )
@@ -744,7 +745,7 @@ class DripCADUI(DripCAD):
         try:
             base = self._collect_hydro_dto(active_block_only=False)
         except Exception as err:
-            messagebox.showerror("Помилка", f"Некоректні дані: {err}")
+            silent_showerror(self.root, "Помилка", f"Некоректні дані: {err}")
             return
 
         sw = tk.Toplevel(self.root)
@@ -818,7 +819,7 @@ class DripCADUI(DripCAD):
             except tk.TclError:
                 pass
             if ex is not None:
-                messagebox.showerror("Stress-тест", str(ex))
+                silent_showerror(self.root, "Stress-тест", str(ex))
                 return
             self._show_stress_report_window(self.orchestrator.last_stress.get("report", ""))
 

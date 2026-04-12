@@ -13,7 +13,9 @@ from __future__ import annotations
 import sys
 import tkinter as tk
 from pathlib import Path
-from tkinter import ttk, messagebox, scrolledtext
+from tkinter import ttk, scrolledtext
+
+from main_app.ui.silent_messagebox import silent_showerror
 
 ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
@@ -148,12 +150,12 @@ class SubmainTelescopeCalculator(tk.Tk):
             v_max = float(self.var_vmax.get().replace(",", "."))
             c_hw = float(self.var_c_hw.get().replace(",", "."))
         except ValueError:
-            messagebox.showerror("Помилка", "Перевірте числові поля зверху.")
+            silent_showerror(self, "Помилка", "Перевірте числові поля зверху.")
             return
         try:
             segs = self._parse_segments()
         except ValueError as e:
-            messagebox.showerror("Помилка", str(e))
+            silent_showerror(self, "Помилка", str(e))
             return
 
         try:
@@ -166,7 +168,7 @@ class SubmainTelescopeCalculator(tk.Tk):
                 v_max_m_s=v_max,
             )
         except Exception as e:
-            messagebox.showerror("Помилка", str(e))
+            silent_showerror(self, "Помилка", str(e))
             return
 
         self.out.delete("1.0", tk.END)

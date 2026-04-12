@@ -3,6 +3,7 @@ from tkinter import ttk, scrolledtext
 
 from shapely.geometry import Polygon
 
+from main_app.ui.silent_messagebox import silent_askyesno, silent_showinfo, silent_showwarning
 from main_app.ui.tooltips import attach_tooltip
 
 
@@ -76,8 +77,10 @@ class ControlPanel:
         self.build_block_tab()
         self.build_geo_tab()
         self.build_hydro_tab()
+        self.build_schedule_tab()
         self.build_results_tab()
         self.build_topo_tab()
+        self.notebook.bind("<<NotebookTabChanged>>", self._on_notebook_tab_changed)
 
         self.stats_label = tk.Label(self.content_frame, text="", bg="#111", fg="#00FFCC", font=("Consolas", 9), justify=tk.LEFT, padx=5, pady=5)
         self.stats_label.pack(fill=tk.X, side=tk.BOTTOM)
@@ -1103,6 +1106,797 @@ class ControlPanel:
         )
 
         self.app.sync_hydro_pipe_summary()
+
+    def _on_notebook_tab_changed(self, event=None):
+        try:
+            if self.notebook.select() == str(getattr(self, "tab_schedule", "")):
+                self._sync_schedule_editor()
+                self._render_consumer_schedule_text()
+        except tk.TclError:
+            pass
+
+    def _sync_schedule_editor(self):
+        if not hasattr(self.app, "normalize_consumer_schedule"):
+            return
+        self.app.normalize_consumer_schedule()
+        lb = getattr(self, "lb_sched_consumers", None)
+        if lb is not None:
+            lb.delete(0, tk.END)
+            row_ids = []
+            for i, node in enumerate(getattr(self.app, "trunk_map_nodes", []) or []):
+                if str(node.get("kind", "")).lower() not in ("consumption", "valve"):
+                    continue
+                main, sub = self.app.trunk_consumer_caption_lines(node, i)
+                line = f"{main}  ·  {sub}" if sub else main
+                lb.insert(tk.END, line)
+                row_ids.append(i)
+            self._schedule_consumer_row_ids = row_ids
+        self._sync_irrigation_overview_listbox()
+
+    def _sync_irrigation_overview_listbox(self):
+        lb = getattr(self, "lb_irrigation_slots", None)
+        if lb is None:
+            return
+        self.app.normalize_consumer_schedule()
+        slots = self.app.consumer_schedule.get("irrigation_slots") or [[] for _ in range(48)]
+        lb.delete(0, tk.END)
+        slot_for_row: list = []
+        for i in range(48):
+            ids = slots[i] if i < len(slots) else []
+            if not ids:
+                continue
+            ncons = len(ids)
+            qsum = ncons * 60
+            lb.insert(
+                tk.END,
+                f"{i + 1:02d}: {', '.join(ids)}   │ ΣQ≈{qsum} м³/год · H≈40 м (тест)",
+            )
+            slot_for_row.append(i)
+        self._irrigation_lb_slot_indices = slot_for_row
+        try:
+            cur = int(str(self.var_irrigation_slot.get()).strip())
+        except ValueError:
+            cur = 1
+        cur = max(1, min(48, cur))
+        lb.selection_clear(0, tk.END)
+        if slot_for_row:
+            try:
+                row_idx = slot_for_row.index(cur - 1)
+            except ValueError:
+                row_idx = 0
+            lb.selection_set(row_idx)
+            lb.activate(row_idx)
+            lb.see(row_idx)
+
+    def _schedule_on_irrigation_combo(self, event=None):
+        lb = getattr(self, "lb_irrigation_slots", None)
+        if lb is None:
+            return
+        try:
+            n = int(str(self.var_irrigation_slot.get()).strip())
+        except ValueError:
+            return
+        i = max(0, min(47, n - 1))
+        slot_for_row = getattr(self, "_irrigation_lb_slot_indices", []) or []
+        lb.selection_clear(0, tk.END)
+        if not slot_for_row:
+            return
+        try:
+            row_idx = slot_for_row.index(i)
+        except ValueError:
+            return
+        lb.selection_set(row_idx)
+        lb.activate(row_idx)
+        lb.see(row_idx)
+
+    def _schedule_on_slot_list_select(self, event=None):
+        lb = getattr(self, "lb_irrigation_slots", None)
+        if lb is None:
+            return
+        sel = lb.curselection()
+        if not sel:
+            return
+        row = int(sel[0])
+        slot_for_row = getattr(self, "_irrigation_lb_slot_indices", []) or []
+        if row < 0 or row >= len(slot_for_row):
+            return
+        self.var_irrigation_slot.set(str(int(slot_for_row[row]) + 1))
+
+    def _schedule_clear_staging(self):
+        self.app._rozklad_staging_ids = []
+        self.app.redraw()
+        try:
+            self.app._schedule_embedded_map_overlay_refresh()
+        except Exception:
+            pass
+
+    def _schedule_clear_current_irrigation_slot(self):
+        try:
+            n = int(str(self.var_irrigation_slot.get()).strip())
+        except ValueError:
+            silent_showwarning(self.app.root, "Розклад", "Оберіть номер поливу (1–48).")
+            return
+        if hasattr(self.app, "clear_irrigation_slot"):
+            self.app.clear_irrigation_slot(n)
+
+    def _schedule_clear_all_irrigation_slots(self):
+        if not silent_askyesno(self.app.root, 
+            "Розклад",
+            "Очистити всі 48 слотів поливу? Список споживачів у кожному слоті буде видалено.",
+        ):
+            return
+        if hasattr(self.app, "clear_all_irrigation_slots"):
+            self.app.clear_all_irrigation_slots()
+
+    def _schedule_run_trunk_hydro(self):
+        if hasattr(self.app, "run_trunk_irrigation_schedule_hydro"):
+            self.app.run_trunk_irrigation_schedule_hydro()
+
+    def _schedule_apply_max_pump_head_from_entry(self) -> bool:
+        """Зчитує поле «макс. напір насоса» у consumer_schedule. False — некоректне число."""
+        self.app.normalize_consumer_schedule()
+        try:
+            v = float(str(self.var_schedule_max_pump_head_m.get()).replace(",", "."))
+        except (TypeError, ValueError, tk.TclError):
+            silent_showwarning(self.app.root, 
+                "Розклад",
+                "Напір насоса (задано): введіть додатне число (метри водяного стовпа).",
+            )
+            return False
+        if v <= 0.0 or v > 400.0:
+            silent_showwarning(self.app.root, 
+                "Розклад",
+                "Напір насоса поза діапазоном: дозволено від 1 до 400 м вод. ст.",
+            )
+            return False
+        v = max(1.0, min(400.0, float(v)))
+        if abs(v - round(v)) < 1e-6:
+            disp = str(int(round(v)))
+        else:
+            disp = f"{v:.2f}".rstrip("0").rstrip(".")
+        self.var_schedule_max_pump_head_m.set(disp)
+        self.app.consumer_schedule["max_pump_head_m"] = float(v)
+        return True
+
+    def _sync_schedule_max_pump_head_ui(self) -> None:
+        if not hasattr(self, "var_schedule_max_pump_head_m"):
+            return
+        self.app.normalize_consumer_schedule()
+        mph = self.app.consumer_schedule.get("max_pump_head_m", 50.0)
+        try:
+            mph = float(mph)
+        except (TypeError, ValueError):
+            mph = 100.0
+        mph = max(1.0, min(400.0, mph))
+        if abs(mph - round(mph)) < 1e-6:
+            self.var_schedule_max_pump_head_m.set(str(int(round(mph))))
+        else:
+            self.var_schedule_max_pump_head_m.set(f"{mph:.2f}".rstrip("0").rstrip("."))
+
+    def _flush_schedule_max_pump_head_to_app(self) -> None:
+        """Перед збереженням проєкту: перенести напір з поля в consumer_schedule (без діалогів)."""
+        if not hasattr(self, "var_schedule_max_pump_head_m"):
+            return
+        self.app.normalize_consumer_schedule()
+        try:
+            v = float(str(self.var_schedule_max_pump_head_m.get()).replace(",", "."))
+        except (TypeError, ValueError, tk.TclError):
+            self._sync_schedule_max_pump_head_ui()
+            return
+        v = max(1.0, min(400.0, float(v)))
+        self.app.consumer_schedule["max_pump_head_m"] = float(v)
+        if abs(v - round(v)) < 1e-6:
+            self.var_schedule_max_pump_head_m.set(str(int(round(v))))
+        else:
+            self.var_schedule_max_pump_head_m.set(f"{v:.2f}".rstrip("0").rstrip("."))
+
+    def _schedule_apply_trunk_v_max_from_entry(self) -> bool:
+        """Макс. швидкість у магістралі (м/с) для розкладу та автопідбору d. False — некоректне число."""
+        self.app.normalize_consumer_schedule()
+        try:
+            v = float(str(self.var_schedule_trunk_v_max_mps.get()).replace(",", "."))
+        except (TypeError, ValueError, tk.TclError):
+            silent_showwarning(self.app.root, 
+                "Розклад",
+                "v max у магістралі: введіть додатне число (м/с), наприклад 2.0.",
+            )
+            return False
+        if v < 0.2 or v > 8.0:
+            silent_showwarning(self.app.root, 
+                "Розклад",
+                "v max поза діапазоном: дозволено від 0.2 до 8.0 м/с.",
+            )
+            return False
+        v = max(0.2, min(8.0, float(v)))
+        if abs(v - round(v)) < 1e-6:
+            disp = str(int(round(v)))
+        else:
+            disp = f"{v:.2f}".rstrip("0").rstrip(".")
+        self.var_schedule_trunk_v_max_mps.set(disp)
+        self.app.consumer_schedule["trunk_schedule_v_max_mps"] = float(v)
+        return True
+
+    def _sync_schedule_trunk_v_max_ui(self) -> None:
+        if not hasattr(self, "var_schedule_trunk_v_max_mps"):
+            return
+        self.app.normalize_consumer_schedule()
+        vx = self.app.consumer_schedule.get("trunk_schedule_v_max_mps", 2.0)
+        try:
+            vx = float(vx)
+        except (TypeError, ValueError):
+            vx = 2.0
+        vx = max(0.2, min(8.0, vx))
+        if abs(vx - round(vx)) < 1e-6:
+            self.var_schedule_trunk_v_max_mps.set(str(int(round(vx))))
+        else:
+            self.var_schedule_trunk_v_max_mps.set(f"{vx:.2f}".rstrip("0").rstrip("."))
+
+    def _flush_schedule_trunk_v_max_to_app(self) -> None:
+        """Перед збереженням: перенести v max з поля в consumer_schedule (без діалогів)."""
+        if not hasattr(self, "var_schedule_trunk_v_max_mps"):
+            return
+        self.app.normalize_consumer_schedule()
+        try:
+            v = float(str(self.var_schedule_trunk_v_max_mps.get()).replace(",", "."))
+        except (TypeError, ValueError, tk.TclError):
+            self._sync_schedule_trunk_v_max_ui()
+            return
+        v = max(0.2, min(8.0, float(v)))
+        self.app.consumer_schedule["trunk_schedule_v_max_mps"] = float(v)
+        if abs(v - round(v)) < 1e-6:
+            self.var_schedule_trunk_v_max_mps.set(str(int(round(v))))
+        else:
+            self.var_schedule_trunk_v_max_mps.set(f"{v:.2f}".rstrip("0").rstrip("."))
+
+    def _schedule_on_consumer_select(self, event=None):
+        lb = getattr(self, "lb_sched_consumers", None)
+        if lb is None:
+            return
+        sel = lb.curselection()
+        if not sel:
+            return
+        ix = int(sel[0])
+        ids = getattr(self, "_schedule_consumer_row_ids", [])
+        if ix >= len(ids):
+            return
+        idx = ids[ix]
+        node = self.app.trunk_map_nodes[idx]
+        self.var_schedule_caption.set(str(node.get("schedule_label", "")))
+
+    def _schedule_apply_caption(self):
+        lb = getattr(self, "lb_sched_consumers", None)
+        if lb is None:
+            return
+        sel = lb.curselection()
+        if not sel:
+            silent_showinfo(self.app.root, "Розклад", "Оберіть споживача у списку.")
+            return
+        ix = int(sel[0])
+        ids = getattr(self, "_schedule_consumer_row_ids", [])
+        if ix >= len(ids):
+            return
+        idx = ids[ix]
+        node = self.app.trunk_map_nodes[idx]
+        nid = str(node.get("id", "")).strip()
+        if not nid:
+            return
+        self.app.apply_trunk_consumer_schedule_label(nid, self.var_schedule_caption.get())
+        self._sync_schedule_editor()
+        self._render_consumer_schedule_text()
+
+    def _schedule_autonumber_consumers(self):
+        if hasattr(self.app, "autonumber_trunk_consumer_labels"):
+            self.app.autonumber_trunk_consumer_labels()
+        self._sync_schedule_editor()
+        self._render_consumer_schedule_text()
+
+    def _render_consumer_schedule_text(self):
+        txt = getattr(self, "txt_consumer_schedule", None)
+        if txt is None:
+            return
+        txt.config(state=tk.NORMAL)
+        txt.delete("1.0", tk.END)
+        app = self.app
+        nodes = list(getattr(app, "trunk_map_nodes", []) or [])
+        segs = list(getattr(app, "trunk_map_segments", []) or [])
+        if not nodes:
+            txt.insert(
+                tk.END,
+                "Вузлів магістралі немає. На полотні «Без карти» або на вкладці «Карта» задайте "
+                "насос, трасу та вузли споживання (інструменти магістралі).\n",
+            )
+            txt.config(state=tk.DISABLED)
+            return
+
+        consumers = [
+            (i, n)
+            for i, n in enumerate(nodes)
+            if str(n.get("kind", "")).lower() in ("consumption", "valve")
+        ]
+        topo = app._trunk_topology_oriented()
+        if topo is None:
+            from modules.hydraulic_module.trunk_map_graph import validate_trunk_map_graph
+
+            txt.insert(tk.END, "Топологія магістралі не є коректним деревом від насоса — схему включень не зібрано.\n\n")
+            errs = validate_trunk_map_graph(nodes, segs, complete_only=False)
+            if errs:
+                txt.insert(tk.END, "\n".join(errs[:14]))
+                if len(errs) > 14:
+                    txt.insert(tk.END, f"\n… ще {len(errs) - 14} повідомлень.")
+            else:
+                txt.insert(tk.END, "Перевірте: один витік, з’єднані сегменти, споживачі — лише листя.")
+            txt.config(state=tk.DISABLED)
+            return
+
+        if not consumers:
+            txt.insert(
+                tk.END,
+                "Вузлів «Споживач» (consumption) на магістралі ще немає.\n\n"
+                "Після додавання споживачів тут з’явиться шлях від насоса до кожного з них "
+                "(схема включень / розклад гілок).\n",
+            )
+            txt.config(state=tk.DISABLED)
+            return
+
+        if hasattr(app, "normalize_consumer_schedule"):
+            app.normalize_consumer_schedule()
+            slots = app.consumer_schedule.get("irrigation_slots") or [[] for _ in range(48)]
+            txt.insert(tk.END, "— Розклад поливів (1…48), тест: 60 м³/год і 40 м на споживача —\n")
+            any_slot = any(bool(slots[i]) for i in range(min(48, len(slots))))
+            if not any_slot:
+                txt.insert(
+                    tk.END,
+                    "Слоти порожні. Вкладка «Розклад»: оберіть № поливу, ЛКМ по споживачах на полотні "
+                    "(VIEW/PAN), ПКМ — записати у слот.\n\n",
+                )
+            else:
+                for si in range(min(48, len(slots))):
+                    ids = slots[si] or []
+                    if not ids:
+                        continue
+                    n = len(ids)
+                    txt.insert(
+                        tk.END,
+                        f"Полив {si + 1:02d}: {', '.join(ids)}  "
+                        f"(ΣQ≈{n * 60} м³/год, тест)\n",
+                    )
+                txt.insert(tk.END, "\n")
+
+        txt.insert(tk.END, "— Шлях від насоса до кожного споживача —\n\n")
+        for ci, (idx, node) in enumerate(consumers, start=1):
+            path = app._trunk_path_indices_to_source(topo, idx)
+            cap = app.trunk_consumer_display_caption(node, idx)
+            q_note = ""
+            try:
+                qm = node.get("q_demand_m3s")
+                if qm is not None:
+                    qf = float(qm)
+                    if abs(qf) > 1e-12:
+                        q_note = f"  Q ≈ {qf * 3600.0:.2f} м³/год\n"
+            except (TypeError, ValueError):
+                pass
+            txt.insert(tk.END, f"{ci}. {cap}\n{q_note}")
+            if not path:
+                txt.insert(tk.END, "   (немає шляху до насоса — перевірте топологію)\n\n")
+                continue
+            labels = []
+            for j in reversed(path):
+                if 0 <= j < len(nodes):
+                    labels.append(app.trunk_consumer_display_caption(nodes[j], j))
+            txt.insert(tk.END, "   " + " → ".join(labels) + "\n\n")
+        txt.config(state=tk.DISABLED)
+
+    def build_schedule_tab(self):
+        tab = tk.Frame(self.notebook, bg="#1e1e1e")
+        self.notebook.add(tab, text="Розклад")
+        self.tab_schedule = tab
+
+        tk.Label(
+            tab,
+            text="Схема включень споживачів",
+            bg="#1e1e1e",
+            fg="#FFD700",
+            font=("Arial", 10, "bold"),
+        ).pack(pady=(10, 4))
+        tk.Label(
+            tab,
+            text="Тест: кожен споживач 60 м³/год при H≈40 м. Полотно/карта: режим VIEW або PAN, без інструментів "
+            "магістралі. ЛКМ — у чернетку (повтор — зняти), ПКМ — записати у вибраний полив.",
+            bg="#1e1e1e",
+            fg="#aaaaaa",
+            font=("Arial", 8),
+            wraplength=300,
+            justify=tk.LEFT,
+        ).pack(padx=10, pady=(0, 6), anchor=tk.W)
+
+        lf_ir = tk.LabelFrame(
+            tab,
+            text="Формування поливів",
+            bg="#1e1e1e",
+            fg="#88DDFF",
+            font=("Arial", 9, "bold"),
+        )
+        lf_ir.pack(fill=tk.BOTH, expand=False, padx=8, pady=(0, 6))
+        ir_row = tk.Frame(lf_ir, bg="#1e1e1e")
+        ir_row.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+        left_ir = tk.Frame(ir_row, bg="#1e1e1e", width=72)
+        left_ir.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 6))
+        tk.Label(left_ir, text="№ поливу", bg="#1e1e1e", fg="#CCCCCC", font=("Arial", 8)).pack(anchor=tk.W)
+        self.var_irrigation_slot = tk.StringVar(value="1")
+        self.cb_irrigation = ttk.Combobox(
+            left_ir,
+            textvariable=self.var_irrigation_slot,
+            values=[str(i) for i in range(1, 49)],
+            state="readonly",
+            width=5,
+            font=("Consolas", 10, "bold"),
+        )
+        self.cb_irrigation.pack(anchor=tk.W, pady=(2, 4))
+        self.cb_irrigation.bind("<<ComboboxSelected>>", self._schedule_on_irrigation_combo)
+        tk.Button(
+            left_ir,
+            text="Скинути\nчернетку",
+            command=self._schedule_clear_staging,
+            bg="#444",
+            fg="white",
+            font=("Arial", 8),
+        ).pack(anchor=tk.W, pady=(4, 0))
+        btn_clr_one = tk.Button(
+            left_ir,
+            text="Очистити\nполив №",
+            command=self._schedule_clear_current_irrigation_slot,
+            bg="#5c4a2a",
+            fg="white",
+            font=("Arial", 8),
+        )
+        btn_clr_one.pack(anchor=tk.W, pady=(6, 0))
+        self._attach_tooltip(
+            btn_clr_one,
+            "Очистити лише обраний у дроплісті номер поливу (список споживачів у цьому слоті).",
+        )
+        btn_clr_all = tk.Button(
+            left_ir,
+            text="Очистити\nвсі поливи",
+            command=self._schedule_clear_all_irrigation_slots,
+            bg="#662222",
+            fg="white",
+            font=("Arial", 8),
+        )
+        btn_clr_all.pack(anchor=tk.W, pady=(4, 0))
+        self._attach_tooltip(
+            btn_clr_all,
+            "Видалити споживачів з усіх слотів 1…48 (підтвердження). Кольорові кільця на схемі зникнуть.",
+        )
+        btn_tr_hydro = tk.Button(
+            left_ir,
+            text="Розрахунок\nмагістралі",
+            command=self._schedule_run_trunk_hydro,
+            bg="#1565C0",
+            fg="white",
+            font=("Arial", 8, "bold"),
+        )
+        btn_tr_hydro.pack(anchor=tk.W, pady=(8, 0))
+        self._attach_tooltip(
+            btn_tr_hydro,
+            "HW по поливах: 60 м³/год і H≥40 м у споживача; напір на насосі — той, що ви задаєте "
+            "в полі нижче (реальна робоча точка, без автоматичного «завищення» до 100 м). "
+            "Фарбування відрізків — домінантний полив; підпис біля насоса.",
+        )
+        fr_pump_h = tk.Frame(left_ir, bg="#1e1e1e")
+        fr_pump_h.pack(anchor=tk.W, pady=(10, 0), fill=tk.X)
+        tk.Label(
+            fr_pump_h,
+            text="Напір насоса\n(задано, м вод. ст.)",
+            bg="#1e1e1e",
+            fg="#CCCCCC",
+            font=("Arial", 8),
+            justify=tk.LEFT,
+        ).pack(anchor=tk.W)
+        self.var_schedule_max_pump_head_m = tk.StringVar(value="50")
+        ent_max_pump = tk.Entry(
+            fr_pump_h,
+            textvariable=self.var_schedule_max_pump_head_m,
+            width=8,
+            bg="#333333",
+            fg="#ECEFF1",
+            font=("Consolas", 10, "bold"),
+            insertbackground="white",
+        )
+        ent_max_pump.pack(anchor=tk.W, pady=(2, 0))
+        self._attach_tooltip(
+            ent_max_pump,
+            "Робочий напір насоса (м вод. ст.), під який перевіряється магістраль. "
+            "Менше значення — менший тиск у трубах (м’якші вимоги до класу PN). "
+            "Якщо при цьому H у споживачів < 40 м — у звіті буде підказка мінімально потрібного H. "
+            "Зберігається в проєкті.",
+        )
+        fr_vmax = tk.Frame(left_ir, bg="#1e1e1e")
+        fr_vmax.pack(anchor=tk.W, pady=(8, 0), fill=tk.X)
+        tk.Label(
+            fr_vmax,
+            text="v max у магістралі\n(м/с, для перевірки та автопідбору d)",
+            bg="#1e1e1e",
+            fg="#CCCCCC",
+            font=("Arial", 8),
+            justify=tk.LEFT,
+        ).pack(anchor=tk.W)
+        self.var_schedule_trunk_v_max_mps = tk.StringVar(value="2")
+        ent_vmax = tk.Entry(
+            fr_vmax,
+            textvariable=self.var_schedule_trunk_v_max_mps,
+            width=8,
+            bg="#333333",
+            fg="#ECEFF1",
+            font=("Consolas", 10, "bold"),
+            insertbackground="white",
+        )
+        ent_vmax.pack(anchor=tk.W, pady=(2, 0))
+        self._attach_tooltip(
+            ent_vmax,
+            "Верхня межа швидкості потоку в трубах магістралі. Після першого розрахунку за поливами "
+            "діаметри на ребрах дерева підбираються автоматично з дозволених труб (trunk → allowed_pipes) "
+            "так, щоб при максимальній витраті по поливах було v ≤ цього значення. Зберігається в проєкті.",
+        )
+        self._attach_tooltip(
+            self.cb_irrigation,
+            "Номер поливу (1–48), у який запишуться споживачі з чернетки після ПКМ на полотні.",
+        )
+
+        right_ir = tk.Frame(ir_row, bg="#1e1e1e")
+        right_ir.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        tk.Label(
+            right_ir,
+            text="Заповнені поливи (порожні слоти тут не показуються; номер — у дроплісті зліва)",
+            bg="#1e1e1e",
+            fg="#888888",
+            font=("Arial", 8),
+            wraplength=210,
+            justify=tk.LEFT,
+        ).pack(anchor=tk.W)
+        ir_lb_fr = tk.Frame(right_ir, bg="#1e1e1e")
+        ir_lb_fr.pack(fill=tk.BOTH, expand=True, pady=(2, 0))
+        ir_sc = tk.Scrollbar(ir_lb_fr)
+        ir_sc.pack(side=tk.RIGHT, fill=tk.Y)
+        self.lb_irrigation_slots = tk.Listbox(
+            ir_lb_fr,
+            height=12,
+            bg="#222",
+            fg="#ECEFF1",
+            selectmode=tk.BROWSE,
+            exportselection=0,
+            font=("Consolas", 8),
+            highlightthickness=0,
+            yscrollcommand=ir_sc.set,
+        )
+        self.lb_irrigation_slots.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        ir_sc.config(command=self.lb_irrigation_slots.yview)
+        self.lb_irrigation_slots.bind("<<ListboxSelect>>", self._schedule_on_slot_list_select)
+
+        lf_leg = tk.LabelFrame(
+            tab,
+            text="Легенда: колір лінії магістралі = домінантний полив",
+            bg="#1e1e1e",
+            fg="#88DDFF",
+            font=("Arial", 9, "bold"),
+        )
+        lf_leg.pack(fill=tk.X, padx=8, pady=(0, 6))
+        tk.Label(
+            lf_leg,
+            text="Лише заповнені поливи: кожен номер — свій колір (як кільця біля споживачів). d і Q при наведенні "
+            "на відрізок після «Розрахунок магістралі».",
+            bg="#1e1e1e",
+            fg="#999999",
+            font=("Arial", 8),
+            wraplength=300,
+            justify=tk.LEFT,
+        ).pack(anchor=tk.W, padx=6, pady=(4, 2))
+        self.canvas_irrigation_legend = tk.Canvas(
+            lf_leg,
+            width=268,
+            height=120,
+            bg="#222222",
+            highlightthickness=1,
+            highlightbackground="#444444",
+        )
+        self.canvas_irrigation_legend.pack(padx=6, pady=(0, 4))
+        self.lbl_trunk_pipe_legend = tk.Label(
+            lf_leg,
+            text="",
+            bg="#1e1e1e",
+            fg="#9DCBFA",
+            font=("Consolas", 8),
+            justify=tk.LEFT,
+            wraplength=300,
+        )
+        self.lbl_trunk_pipe_legend.pack(anchor=tk.W, padx=6, pady=(0, 6))
+
+        lf_cap = tk.LabelFrame(
+            tab,
+            text="Підпис на схемі",
+            bg="#1e1e1e",
+            fg="#88DDFF",
+            font=("Arial", 9, "bold"),
+        )
+        lf_cap.pack(fill=tk.X, padx=8, pady=(0, 6))
+        self.lb_sched_consumers = tk.Listbox(
+            lf_cap,
+            height=4,
+            bg="#222",
+            fg="#ECEFF1",
+            selectmode=tk.EXTENDED,
+            exportselection=0,
+            font=("Consolas", 9),
+            highlightthickness=0,
+        )
+        self.lb_sched_consumers.pack(fill=tk.X, padx=6, pady=4)
+        self.lb_sched_consumers.bind("<<ListboxSelect>>", self._schedule_on_consumer_select)
+        self.var_schedule_caption = tk.StringVar(value="")
+        tk.Entry(
+            lf_cap,
+            textvariable=self.var_schedule_caption,
+            bg="#333",
+            fg="white",
+            font=("Consolas", 10),
+            insertbackground="white",
+        ).pack(fill=tk.X, padx=6, pady=(0, 4))
+        row_cap = tk.Frame(lf_cap, bg="#1e1e1e")
+        row_cap.pack(fill=tk.X, padx=6, pady=(0, 6))
+        tk.Button(
+            row_cap,
+            text="Застосувати підпис",
+            command=self._schedule_apply_caption,
+            bg="#2e4d46",
+            fg="white",
+            font=("Arial", 8, "bold"),
+        ).pack(side=tk.LEFT, padx=(0, 4))
+        btn_autonum = tk.Button(
+            row_cap,
+            text="С1…Сn (порожні)",
+            command=self._schedule_autonumber_consumers,
+            bg="#3d4f5c",
+            fg="white",
+            font=("Arial", 8, "bold"),
+        )
+        btn_autonum.pack(side=tk.LEFT)
+        self._attach_tooltip(
+            btn_autonum,
+            "Для споживачів без власного підпису задати С1, С2, … по порядку на магістралі.",
+        )
+
+        tk.Label(tab, text="Текст схеми (шляхи)", bg="#1e1e1e", fg="#666", font=("Arial", 8)).pack(
+            anchor=tk.W, padx=10
+        )
+        row_rf = tk.Frame(tab, bg="#1e1e1e")
+        row_rf.pack(fill=tk.X, padx=10, pady=(0, 4))
+        btn_sched_txt = tk.Button(
+            row_rf,
+            text="Оновити текст",
+            command=self._render_consumer_schedule_text,
+            bg="#2e4d46",
+            fg="white",
+            font=("Arial", 8, "bold"),
+        )
+        btn_sched_txt.pack(side=tk.LEFT)
+        self._attach_tooltip(
+            btn_sched_txt,
+            "Оновити нижній звіт (групи та шляхи від насоса) без зміни списків вище.",
+        )
+
+        report_box = tk.Frame(tab, bg="#1e1e1e")
+        report_box.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
+        sc = tk.Scrollbar(report_box)
+        sc.pack(side=tk.RIGHT, fill=tk.Y)
+        self.txt_consumer_schedule = tk.Text(
+            report_box,
+            bg="#222",
+            fg="#00FFCC",
+            font=("Consolas", 9),
+            wrap=tk.WORD,
+            yscrollcommand=sc.set,
+        )
+        self.txt_consumer_schedule.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        sc.config(command=self.txt_consumer_schedule.yview)
+
+        self._schedule_consumer_row_ids = []
+        self._sync_schedule_editor()
+        self._schedule_on_irrigation_combo()
+        self._render_consumer_schedule_text()
+        self._sync_irrigation_legend()
+        self._sync_schedule_max_pump_head_ui()
+        self._sync_schedule_trunk_v_max_ui()
+
+    def _draw_irrigation_slot_legend(self) -> None:
+        c = getattr(self, "canvas_irrigation_legend", None)
+        if c is None:
+            return
+        c.delete("all")
+        app = self.app
+        if not hasattr(app, "irrigation_slot_color_hex"):
+            return
+        app.normalize_consumer_schedule()
+        slots = app.consumer_schedule.get("irrigation_slots") or []
+        used = [i for i in range(min(48, len(slots))) if slots[i]]
+        if not used:
+            c.create_text(
+                134,
+                55,
+                text="Немає заповнених поливів",
+                fill="#888888",
+                font=("Segoe UI", 9),
+            )
+            try:
+                c.config(height=96)
+            except tk.TclError:
+                pass
+            return
+        ncol = 8
+        nrows = (len(used) + ncol - 1) // ncol
+        try:
+            c.config(height=min(220, max(72, 8 + nrows * 22)))
+        except tk.TclError:
+            pass
+        for k, si in enumerate(used):
+            row, col = divmod(k, ncol)
+            x0 = col * 32 + 6
+            y0 = row * 22 + 6
+            colh = app.irrigation_slot_color_hex(si)
+            c.create_rectangle(x0, y0, x0 + 24, y0 + 10, fill=colh, outline="#555555", width=1)
+            c.create_text(
+                x0 + 12,
+                y0 + 21,
+                text=str(si + 1),
+                fill="#b0b0b0",
+                font=("Consolas", 7),
+            )
+
+    def _sync_irrigation_legend(self) -> None:
+        self._draw_irrigation_slot_legend()
+        lbl = getattr(self, "lbl_trunk_pipe_legend", None)
+        if lbl is None:
+            return
+        app = self.app
+        h = getattr(app, "trunk_irrigation_hydro_cache", None)
+        if not isinstance(h, dict):
+            lbl.config(
+                text="Труби на магістралі (позначення з каталогу: матеріал PN Ø): після «Розрахунок магістралі за поливами»."
+            )
+            return
+        sh = h.get("segment_hover")
+        if not isinstance(sh, dict) or not sh:
+            lbl.config(text="")
+            return
+        labels: dict = {}
+        for row in sh.values():
+            if not isinstance(row, dict):
+                continue
+            try:
+                d = float(row.get("d_inner_mm", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if hasattr(app, "trunk_pipe_label_for_inner_mm"):
+                lab = app.trunk_pipe_label_for_inner_mm(d)
+            else:
+                lab = f"d={int(round(d))} мм"
+            labels[lab] = labels.get(lab, 0) + 1
+        if not labels:
+            lbl.config(text="")
+            return
+        parts = [f"{lab} — {n} відр." for lab, n in sorted(labels.items(), key=lambda t: t[0])]
+        text = "Труби на схемі: " + "; ".join(parts)
+        lim = h.get("limits") if isinstance(h.get("limits"), dict) else {}
+        try:
+            vmax = float(lim.get("max_pipe_velocity_mps", 0.0) or 0.0)
+            hp = float(lim.get("pump_operating_head_m", lim.get("max_pump_head_m", 0.0)) or 0.0)
+        except (TypeError, ValueError):
+            vmax, hp = 0.0, 0.0
+        lim_bits = []
+        if vmax > 1e-9:
+            lim_bits.append(f"v ≤ {vmax:.2f} м/с у трубах")
+        if hp > 1e-9:
+            lim_bits.append(f"H насоса (задано) = {hp:.1f} м")
+        if lim_bits:
+            text += "\nПеревірки: " + "; ".join(lim_bits) + "."
+        lbl.config(text=text)
 
     def build_topo_tab(self):
         tab = tk.Frame(self.notebook, bg="#1e1e1e")

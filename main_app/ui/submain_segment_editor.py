@@ -5,8 +5,9 @@ import copy
 import math
 import tkinter as tk
 import tkinter.font as tkfont
-from tkinter import ttk, messagebox
+from tkinter import ttk
 
+from main_app.ui.silent_messagebox import silent_showerror, silent_showwarning
 from main_app.ui.tooltips import attach_tooltip
 
 # Ширина полів вводу в символах (узгоджено з рядком «Необхідна довжина…», компактно).
@@ -166,13 +167,13 @@ def diameter_label_for_section(app, block_idx: int, sm_idx: int, sec_idx: int, n
 def open_submain_segment_editor(app):
     bi = app._safe_active_block_idx()
     if bi is None:
-        messagebox.showwarning("Увага", "Немає блоків поля.")
+        silent_showwarning(app.root, "Увага", "Немає блоків поля.")
         return
     block = app.field_blocks[bi]
     lines = block.get("submain_lines") or []
     valid_ix = [i for i, sm in enumerate(lines) if sm and len(sm) >= 2]
     if not valid_ix:
-        messagebox.showwarning(
+        silent_showwarning(app.root, 
             "Увага",
             "У активному блоці немає магістралі з двома точками. Намалюйте сабмейн у режимі SUBMAIN.",
         )
@@ -727,7 +728,7 @@ class SubmainSegmentEditorDialog:
         s_geom = sum(self._geom_lengths_for_sm(sm_idx))
         s_mod = sum(_model_len_m(s) for s in self.segments if isinstance(s, dict))
         if abs(s_mod - s_geom) > self.EPS:
-            messagebox.showwarning(
+            silent_showwarning(self.app.root,
                 "Увага",
                 "Контроль виконується по редагованій гілці.\n"
                 f"Гілка {sm_idx + 1}: потрібно {s_geom:.3f} м, задано {s_mod:.3f} м, різниця {s_geom - s_mod:.3f} м.",
@@ -740,6 +741,6 @@ class SubmainSegmentEditorDialog:
             self.app.run_calculation()
         except Exception as ex:
             try:
-                messagebox.showerror("Помилка", f"Не вдалося оновити розрахунок:\n{ex}")
+                silent_showerror(self.app.root, "Помилка", f"Не вдалося оновити розрахунок:\n{ex}")
             except Exception:
                 pass
