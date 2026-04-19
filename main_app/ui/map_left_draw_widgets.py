@@ -1,5 +1,6 @@
 """
 Спільна панель «Малювання» + «Магістраль» для лівої колонки (карта та режим «Без карти»).
+Розрахунок HW за поливами — вкладка «Магістраль (HW)» на панелі керування праворуч.
 """
 
 from __future__ import annotations
@@ -89,18 +90,58 @@ def build_trunk_tools_tab(
         relief=tk.FLAT,
     )
     _btn_map_pick_info.pack(side=tk.LEFT, padx=(5, 0))
-    tk.Label(
-        _row_info_tool,
-        text=" Вибір / Інфо — ЛКМ по об'єкту",
-        bg="#181818",
-        fg="#9E9E9E",
-        font=("Segoe UI", 8),
-    ).pack(side=tk.LEFT, padx=(6, 0))
     attach_tt(
         _btn_map_pick_info,
         "Інфо (рука): те саме, що «Вибір», інший курсор на карті.",
         above=True,
     )
+
+    def _on_trunk_hover_pipe_mode(_event=None) -> None:
+        if app is None:
+            return
+        try:
+            app.redraw()
+        except Exception:
+            pass
+        if hasattr(app, "_schedule_embedded_map_overlay_refresh"):
+            app._schedule_embedded_map_overlay_refresh()
+
+    if app is not None and hasattr(app, "var_trunk_map_hover_pipes_mode"):
+        _gp_btn = tk.Button(
+            _row_info_tool,
+            text="G",
+            bg="#2E3D32",
+            fg="#E8F5E9",
+            activebackground="#3E4D42",
+            activeforeground="#FFFFFF",
+            font=("Segoe UI", 9, "bold"),
+            width=3,
+            relief=tk.FLAT,
+            bd=0,
+            highlightthickness=0,
+        )
+
+        def _sync_gp_caption() -> None:
+            try:
+                _gp_btn.config(text="P" if app.var_trunk_map_hover_pipes_mode.get() else "G")
+            except tk.TclError:
+                pass
+
+        def _toggle_graph_pipes(_event=None) -> None:
+            v = app.var_trunk_map_hover_pipes_mode
+            v.set(not bool(v.get()))
+            _sync_gp_caption()
+            _on_trunk_hover_pipe_mode()
+
+        _gp_btn.config(command=_toggle_graph_pipes)
+        _sync_gp_caption()
+        _gp_btn.pack(side=tk.LEFT, padx=(6, 0))
+        attach_tt(
+            _gp_btn,
+            "Граф / труби (ЛКМ): G — топологія ребра (A→B, L); P — результат розрахунку: підсвітка окремої секції телескопа; "
+            "у підказці — довжина L і знак Ø з числом (число — зовнішній діаметр, мм). Оновлює полотно й карту.",
+            above=True,
+        )
     _emb_btn_trunk = tk.Button(
         tab_trunk,
         text="🟩 Траса магістралі",
@@ -112,7 +153,10 @@ def build_trunk_tools_tab(
     _emb_btn_trunk.pack(fill=tk.X, padx=8, pady=3)
     attach_tt(
         _emb_btn_trunk,
-        "На карті: ЛКМ по вузлах, ПКМ — кінець відрізка. Без вузлів — вільна траса в сабмейн активного блоку.",
+        "Труба магістралі: ЛКМ+ПКМ на вузлі — кінець ребра; далі ЛКМ — початок і трасувальні точки "
+        "(вільне поле на карті — автопікет bend); ПКМ — з’єднати останню точку з кінцем. "
+        "Чернетка зберігається при перемиканні на насос/пікет/розгалуження/споживача. "
+        "Топологія — «Зберегти граф магістралі». Без вузлів на карті — вільна траса в сабмейн блоку.",
     )
     _btn_trunk_pump = tk.Button(
         tab_trunk,
@@ -180,22 +224,6 @@ def build_trunk_tools_tab(
             _btn_trunk_save,
             "Завершити редагування (вимкнути інструменти), перевірити топологію дерева та оновити trunk_tree з вузлів і відрізків.",
         )
-    if app is not None and hasattr(app, "open_pipe_selector"):
-        _btn_trunk_pipes = tk.Button(
-            tab_trunk,
-            text="✅ Труби для магістралі…",
-            command=lambda: app.open_pipe_selector("trunk"),
-            bg="#1b3d2f",
-            fg="#B9F6CA",
-            relief=tk.FLAT,
-        )
-        _btn_trunk_pipes.pack(fill=tk.X, padx=8, pady=(10, 3))
-        attach_tt(
-            _btn_trunk_pipes,
-            "Окремий набір дозволених труб для магістралі. Зберігається в JSON у trunk → allowed_pipes.",
-        )
-
-
 def build_draw_modes_tab(tab_draw: tk.Misc, app, attach_tt=_attach_dark_tooltip) -> None:
     """Режими V/D/SM/… синхронізовані з app.mode та app.action."""
     if app is not None and hasattr(app, "mode") and hasattr(app, "action"):
@@ -209,7 +237,7 @@ def build_draw_modes_tab(tab_draw: tk.Misc, app, attach_tt=_attach_dark_tooltip)
             "INFO": "Після розрахунку: графіки по латералі / сабмейну.",
             "CUT_LATS": "Різання латералів.",
             "RULER": "Лінійка вимірювання відстані.",
-            "SUB_LABEL": "Підписи секцій сабмейну.",
+            "SUB_LABEL": "Підписи секцій сабмейну та телескопа магістралі: ЛКМ — взяти, рух миші, ЛКМ — відпустити на місці.",
             "LAT_TIP": "Оцінка тиску на тупиках латераля.",
         }
         _map_mode_buttons = {}
@@ -233,6 +261,8 @@ def build_draw_modes_tab(tab_draw: tk.Misc, app, attach_tt=_attach_dark_tooltip)
 
         def _map_set_mode(code: str) -> None:
             app.mode.set(code)
+            if hasattr(app, "_clear_select_tool_if_blocking_draw_mode"):
+                app._clear_select_tool_if_blocking_draw_mode(code)
             if hasattr(app, "reset_temp"):
                 app.reset_temp()
             _map_refresh_draw_toolbar_leds()
@@ -241,7 +271,7 @@ def build_draw_modes_tab(tab_draw: tk.Misc, app, attach_tt=_attach_dark_tooltip)
             app.action.set(code)
             _map_refresh_draw_toolbar_leds()
 
-        tk.Label(tab_draw, text="Режими", bg="#181818", fg="#FFD700", font=("Segoe UI", 8, "bold")).pack(
+        tk.Label(tab_draw, text="Дія", bg="#181818", fg="#FFD700", font=("Segoe UI", 8, "bold")).pack(
             fill=tk.X, padx=6, pady=(8, 2)
         )
         _mode_rows = (
@@ -272,7 +302,7 @@ def build_draw_modes_tab(tab_draw: tk.Misc, app, attach_tt=_attach_dark_tooltip)
                 attach_tt(btn_mode, _map_mode_tips.get(code, code), above=True)
                 _map_mode_buttons[code] = btn_mode
 
-        tk.Label(tab_draw, text="Дія", bg="#181818", fg="#FFD700", font=("Segoe UI", 8, "bold")).pack(
+        tk.Label(tab_draw, text="Режим", bg="#181818", fg="#FFD700", font=("Segoe UI", 8, "bold")).pack(
             fill=tk.X, padx=6, pady=(10, 2)
         )
         ra = tk.Frame(tab_draw, bg="#181818")
@@ -299,6 +329,33 @@ def build_draw_modes_tab(tab_draw: tk.Misc, app, attach_tt=_attach_dark_tooltip)
         btn_del.pack(side=tk.LEFT, padx=2, fill=tk.X, expand=True)
         attach_tt(btn_del, "Режим видалення вузлів по кліку.", above=True)
         _map_action_buttons["DEL"] = btn_del
+
+        rs = tk.Frame(tab_draw, bg="#181818")
+        rs.pack(fill=tk.X, padx=6, pady=(0, 6))
+        btn_lines = tk.Button(
+            rs,
+            text="Лінії",
+            command=lambda: app.set_canvas_special_tool("scene_lines") if hasattr(app, "set_canvas_special_tool") else None,
+            bg="#2b2b2b",
+            fg="#E8E8E8",
+            relief=tk.FLAT,
+        )
+        btn_lines.pack(side=tk.LEFT, padx=2, fill=tk.X, expand=True)
+        attach_tt(
+            btn_lines,
+            "Декоративні лінії (ескіз): ЛКМ — вершини, ПКМ — завершити. Працює на карті й у режимі «Без карти».",
+            above=True,
+        )
+        btn_lines_cancel = tk.Button(
+            rs,
+            text="Скас.",
+            command=lambda: app.set_canvas_special_tool(None) if hasattr(app, "set_canvas_special_tool") else None,
+            bg="#3a2424",
+            fg="#FFD0D0",
+            relief=tk.FLAT,
+        )
+        btn_lines_cancel.pack(side=tk.LEFT, padx=2, fill=tk.X, expand=True)
+        attach_tt(btn_lines_cancel, "Вимкнути інструмент «Лінії».", above=True)
 
         tk.Label(
             tab_draw,
@@ -334,7 +391,7 @@ def build_off_canvas_draw_notebook(
 ) -> ttk.Notebook:
     """
     Ліва колонка «Без карти»: зверху інструментальна плейсхолдер-панель,
-    знизу — лише вкладки «Панель малювання» (як на карті).
+    знизу — вкладки «Малювання» / «Магістраль».
     """
     _nb_style = ttk.Style(parent.winfo_toplevel())
     try:

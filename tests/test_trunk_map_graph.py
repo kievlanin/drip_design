@@ -16,6 +16,17 @@ class TestTrunkMapGraph(unittest.TestCase):
         self.assertEqual(nodes[0]["id"], "T0")
         self.assertEqual(nodes[1]["id"], "T9")
 
+    def test_duplicate_trunk_node_ids_renumbered(self):
+        nodes = [
+            {"kind": "source", "id": "T0"},
+            {"kind": "bend", "id": "T9"},
+            {"kind": "bend", "id": "T9"},
+        ]
+        tg.ensure_trunk_node_ids(nodes)
+        self.assertEqual(nodes[0]["id"], "T0")
+        self.assertEqual(nodes[1]["id"], "T9")
+        self.assertEqual(nodes[2]["id"], "T10")
+
     def test_line_pump_to_consumer_ok(self):
         nodes = [_n("source"), _n("consumption")]
         segs = [{"node_indices": [0, 1], "path_local": [(0, 0), (1, 0)]}]
@@ -70,14 +81,13 @@ class TestTrunkMapGraph(unittest.TestCase):
         self.assertTrue(err)
         self.assertTrue(any("корінь" in e or "насос" in e for e in err))
 
-    def test_consumer_with_child_fails(self):
-        nodes = [_n("source"), _n("consumption"), _n("bend")]
+    def test_consumer_with_child_chain_ok(self):
+        nodes = [_n("source"), _n("consumption"), _n("consumption")]
         segs = [
             {"node_indices": [0, 1], "path_local": [(0, 0), (1, 0)]},
             {"node_indices": [1, 2], "path_local": [(1, 0), (2, 0)]},
         ]
-        err = tg.validate_trunk_map_graph(nodes, segs)
-        self.assertTrue(any("Споживач" in e or "сток" in e for e in err))
+        self.assertEqual(tg.validate_trunk_map_graph(nodes, segs), [])
 
     def test_build_oriented_edges(self):
         nodes = [_n("source"), _n("consumption")]
@@ -139,6 +149,31 @@ class TestTrunkMapGraph(unittest.TestCase):
         ]
         tg.normalize_legacy_trunk_valve_kinds(nodes2, segs2)
         self.assertEqual(nodes2[1]["kind"], "junction")
+
+    def test_expand_single_edge_preserves_telescope_sections(self):
+        """Після завантаження JSON телескоп не губиться при expand_trunk_segments_to_pair_edges."""
+        nodes = [_n("source"), _n("consumption")]
+        secs = [
+            {"length_m": 50.0, "d_inner_mm": 103.6, "c_hw": 140.0, "d_nom_mm": 110.0, "material": "PVC", "pn": "6"},
+            {"length_m": 100.0, "d_inner_mm": 84.6, "c_hw": 140.0, "d_nom_mm": 90.0, "material": "PVC", "pn": "6"},
+        ]
+        segs = [
+            {
+                "node_indices": [0, 1],
+                "path_local": [(0, 0), (1, 0)],
+                "d_inner_mm": 84.6,
+                "c_hw": 140.0,
+                "pipe_material": "PVC",
+                "pipe_pn": "6",
+                "pipe_od": "90",
+                "sections": secs,
+            }
+        ]
+        exp = tg.expand_trunk_segments_to_pair_edges(segs, nodes)
+        self.assertEqual(len(exp), 1)
+        self.assertIn("sections", exp[0])
+        self.assertEqual(len(exp[0]["sections"]), 2)
+        self.assertEqual(exp[0]["sections"][0]["d_nom_mm"], 110.0)
 
 
 if __name__ == "__main__":

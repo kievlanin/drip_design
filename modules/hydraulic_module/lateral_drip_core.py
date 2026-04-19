@@ -30,7 +30,9 @@ def emitter_flow_lph(
     kd_coeff: Optional[float] = 1.0,
 ) -> float:
     """
-    compensated=False: турбулентна крапельниця, q ∝ √(H/H_ref).
+    compensated=False: розрахунок за степеневим законом q = k * H^x (з kd-множником).
+    Якщо k/x не задані явно, використовується сумісний fallback:
+    x=0.5, k таке, щоб при H=10 м отримати e_flow_nom_lph.
     compensated=True: компенсована — номінальний л/год при H ≥ H_мін; нижче — лінійне зниження до 0.
     """
     if h_head_m <= 0:
@@ -47,12 +49,22 @@ def emitter_flow_lph(
             return float(e_flow_nom_lph) * kd
         return float(e_flow_nom_lph) * kd * (float(h_head_m) / hm)
     h_pos = max(1e-9, h_head_m)
+    # Основний шлях: завжди через k та x.
+    k_eff = None
+    x_eff = None
     if k_coeff is not None and x_exp is not None:
         try:
-            return max(0.0, float(k_coeff) * kd * (h_pos ** float(x_exp)))
+            k_eff = float(k_coeff)
+            x_eff = float(x_exp)
         except (TypeError, ValueError):
-            pass
-    return float(e_flow_nom_lph) * kd * math.sqrt(h_pos / h_ref_m)
+            k_eff = None
+            x_eff = None
+    if k_eff is None or x_eff is None:
+        # Сумісний fallback для старих даних без k/x:
+        # прив'язка номіналу до канонічних 10 м без використання змінного H_ref.
+        x_eff = 0.5
+        k_eff = float(e_flow_nom_lph) / math.sqrt(10.0)
+    return max(0.0, float(k_eff) * kd * (h_pos ** float(x_eff)))
 
 
 def lph_to_m3s(q_lph: float) -> float:

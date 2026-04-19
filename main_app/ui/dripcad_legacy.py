@@ -12,7 +12,8 @@ import subprocess
 import sys
 import threading
 import time
-from typing import Dict, List, Optional, Set, Tuple
+from collections import OrderedDict
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 from shapely.geometry import (
     MultiLineString,
     MultiPoint,
@@ -40,6 +41,7 @@ from modules.hydraulic_module.trunk_tree_compute import (
     compute_trunk_tree_steady,
 )
 from modules.hydraulic_module import lateral_solver as lat_sol
+from modules.hydraulic_module.lateral_drip_core import hazen_williams_hloss_m
 from main_app.ui.silent_messagebox import (
     silent_showerror,
     silent_showinfo,
@@ -68,8 +70,25 @@ from modules.hydraulic_module.trunk_map_graph import (
 _CANVAS_TRUNK_POINT_TOOLS = frozenset(
     {"trunk_pump", "trunk_picket", "trunk_junction", "trunk_consumer"}
 )
+# Траса + вузли магістралі: чернетку ламаної не скидати при перемиканні між ними; ПКМ — пауза.
+_CANVAS_TRUNK_CHAIN_TOOLS = _CANVAS_TRUNK_POINT_TOOLS | frozenset({"trunk_route"})
 # Підбір об'єкта: «Інфо» (рука) і «Вибір» (стрілка) — одна логіка, різний курсор.
 _CANVAS_PASSIVE_PICK_TOOLS = frozenset({"map_pick_info", "select"})
+# Режими, де ЛКМ має йти в креслення мережі, а не в рамку «Вибір».
+_MODES_AUTO_EXIT_SELECT_TOOL = frozenset(
+    {
+        "DRAW",
+        "SET_DIR",
+        "SUBMAIN",
+        "DRAW_LAT",
+        "CUT_LATS",
+        "TOPO",
+        "RULER",
+        "SUB_LABEL",
+        "LAT_TIP",
+        "INFO",
+    }
+)
 _TRUNK_NODE_SNAP_CANVAS_M = 16.0
 _TRUNK_CANVAS_PATH_COLOR = "#8E24AA"
 # Інфо: шлях до насоса / шлях до споживачів від розгалуження
@@ -81,6 +100,19 @@ _PICK_TRUNK_LINE_R_M = 16.0
 _PICK_SUBMAIN_R_M = 14.0
 _PICK_FIELD_VALVE_R_M = 22.0
 _PICK_LAT_SCENE_R_M = 12.0
+# Магістраль на полотні: кореневий тег + шари для BOM / косметики (підписи).
+_TRUNK_MAP_TAG_ROOT = "trunk_map_canvas"
+_TRUNK_MAP_TAG_BOM = "trunk_map_BOM"
+_TRUNK_MAP_TAG_COSMETIC = "trunk_map_Cosmetic"
+_TRUNK_MAP_TAGS_BOM = (_TRUNK_MAP_TAG_ROOT, _TRUNK_MAP_TAG_BOM)
+_TRUNK_MAP_TAGS_COSMETIC = (_TRUNK_MAP_TAG_ROOT, _TRUNK_MAP_TAG_COSMETIC)
+# Товщина кольорової лінії відрізка магістралі на полотні (create_line width).
+_TRUNK_MAP_SEGMENT_LINE_WIDTH_PX = 6
+
+
+def _copy_allowed_pipes_shallow(allowed: dict) -> dict:
+    """Копія дерева дозволених діаметрів без copy.deepcopy (лише dict/list/str)."""
+    return {m: {pn: list(sizes) for pn, sizes in pns.items()} for m, pns in (allowed or {}).items()}
 
 
 def _canvas_trunk_rubber_color(tool: str) -> str:
@@ -111,7 +143,7 @@ class DripCAD:
             self.allowed_pipes[mat] = {}
             for pn, ods in pns.items():
                 self.allowed_pipes[mat][pn] = list(ods.keys())
-        self.trunk_allowed_pipes = copy.deepcopy(self.allowed_pipes)
+        self.trunk_allowed_pipes = _copy_allowed_pipes_shallow(self.allowed_pipes)
 
         self.MAX_FIELD_BLOCKS = 100
         self.points, self.dir_points = [], []
@@ -135,8 +167,11 @@ class DripCAD:
         self._moving_section_label_sub_idx = None
         self._moving_section_label_sm_idx = None
         self._moving_section_label_preview = None
-        self._emit_isolines_cache = {"sig": None, "contours_by_cls": {}}
-        self._pressure_zone_geom_cache = {}
+        self._moving_trunk_tel_seg_idx: Optional[int] = None
+        self._moving_trunk_tel_chunk_idx: Optional[int] = None
+        self._moving_trunk_tel_preview: Optional[Tuple[float, float]] = None
+        self._emit_isolines_cache = {"sig": None, "contours": [], "contours_by_cls": {}}
+        self._pressure_zone_geom_cache = OrderedDict()
         self._zoom_box_start = None
         self._zoom_box_end = None
         self.ruler_start = None
@@ -149,20 +184,43 @@ class DripCAD:
         # Відрізки магістралі: один запис = одне ребро (два вузли); path_local дзеркалить кінці вузлів (пряма труба).
         self.trunk_map_segments = []
         self._trunk_route_last_node_idx = None
+        self._trunk_panel_active_offcanvas = False
+        self._trunk_panel_active_map = False
         # Розклад включень: groups (legacy) + irrigation_slots[0..47] — списки id споживачів на полив.
         self.consumer_schedule = {
             "groups": [],
             "irrigation_slots": [[] for _ in range(48)],
             "max_pump_head_m": 50.0,
-            "trunk_schedule_v_max_mps": 2.0,
+            "trunk_schedule_v_max_mps": 0.0,
+            "trunk_schedule_min_seg_m": 0.0,
+            "trunk_schedule_max_sections_per_edge": 2,
+            "trunk_schedule_opt_goal": "weight",
+            "trunk_schedule_test_q_m3h": 60.0,
+            "trunk_schedule_test_h_m": 40.0,
+            "trunk_display_velocity_warn_mps": 0.0,
+            "trunk_pipes_selected": False,
+            "trunk_telescope_label_pos": {},
         }
         self._rozklad_staging_ids: List[str] = []
         self.trunk_irrigation_hydro_cache: Optional[dict] = None
+        self._project_json_filepath: Optional[str] = None
+        self._trunk_deficit_focus_node_id: Optional[str] = None
+        self._trunk_last_inserted_node_id: Optional[str] = None
+        self._trunk_profile_probe_world: Optional[Tuple[float, float]] = None
+        self._trunk_profile_probe_segment_idx: Optional[int] = None
+        self._trunk_profile_vscale: float = 0.1
         # Спецінструменти магістралі / ліній на полотні «Без карти» (не плутати з mode=DRAW…).
-        self._canvas_special_tool = None
+        # За замовчуванням — «Вибір», щоб одразу було зрозуміло, що курсор активний.
+        self._canvas_special_tool = "select"
         self._canvas_trunk_draft_world = None
         self._canvas_polyline_draft = []
         self._canvas_trunk_route_draft_indices = []
+        # Траса труби (ребра): ЛКМ+ПКМ на вузлі — кінець; далі ЛКМ — початок і ламана; ПКМ — з’єднати з кінцем.
+        self._trunk_route_endpoint_pending_idx: Optional[int] = None
+        self._trunk_route_edge_end_idx: Optional[int] = None
+        # Перетягування вузла магістралі в режимі VIEW (без спецінструмента): node_indices сегментів не змінюються.
+        self._trunk_node_drag_idx: Optional[int] = None
+        self._trunk_node_drag_moved: bool = False
         # Вибір (стрілка): збережені об'єкти (category, payload, label); рамка ЛКМ.
         self._canvas_selection_keys: List[Tuple[str, object, str]] = []
         self._select_marquee_active = False
@@ -171,8 +229,14 @@ class DripCAD:
         self._select_marquee_curr_screen: Optional[Tuple[int, int]] = None
         self._select_marquee_start_world: Optional[Tuple[float, float]] = None
         self._select_marquee_curr_world: Optional[Tuple[float, float]] = None
+        # Режим «Вибір»: після паузи ~1 с без руху — список усіх об'єктів під курсором (перекриття).
+        self._select_hover_menu_after_id: Optional[str] = None
+        self._select_hover_menu_popup: Optional[tk.Menu] = None
+        self._select_hover_pick_canvas_xy: Optional[Tuple[int, int]] = None
+        self._select_hover_pick_screen_xy: Optional[Tuple[int, int]] = None
         # Рамка зони майбутнього проєкту (локальні м, XY) — задається на карті; пріоритет для тайлів/DEM/ізоліній.
         self.project_zone_bounds_local = None
+        self.project_zone_ring_local: Optional[List[Tuple[float, float]]] = None
         self.is_georeferenced = False
         self.last_report = None
         self.trunk_tree_data = self._default_trunk_tree_payload()
@@ -208,6 +272,9 @@ class DripCAD:
         self.var_hydro_clear_block = tk.StringVar(value="1")
         self.var_v_min = tk.StringVar(value="0.5")
         self.var_v_max = tk.StringVar(value="1.5")
+        self.var_trunk_display_velocity_warn_mps = tk.StringVar(value="0")
+        # Підказка на магістралі (карта / полотно): False — топологія (граф), True — розрахунок/труби.
+        self.var_trunk_map_hover_pipes_mode = tk.BooleanVar(value=False)
         self.var_submain_lateral_snap_m = tk.StringVar(value="2.0")
         self.var_valve_h_max_m = tk.StringVar(value="0")
         self.var_valve_h_max_optimize = tk.BooleanVar(value=True)
@@ -241,13 +308,12 @@ class DripCAD:
         self.var_lat_disp_use_end = tk.BooleanVar(value=False)
 
         self.var_lat_step.trace_add("write", lambda *a: [self.reset_calc(), self.regenerate_grid()])
-        self.var_emit_step.trace_add("write", lambda *a: [self.reset_calc(), self.redraw()])
-        self.var_emit_flow.trace_add("write", lambda *a: [self.reset_calc(), self.redraw()])
+        self.var_emit_step.trace_add("write", self._on_heavy_emitter_param_changed)
+        self.var_emit_flow.trace_add("write", self._on_heavy_emitter_param_changed)
         self.var_emit_k_coeff.trace_add("write", lambda *a: self.reset_calc())
-        self.var_emit_x_exp.trace_add("write", lambda *a: [self.reset_calc(), self.redraw()])
+        self.var_emit_x_exp.trace_add("write", self._on_heavy_emitter_param_changed)
         self.var_emit_kd_coeff.trace_add("write", lambda *a: self.reset_calc())
-        self.var_emit_h_min.trace_add("write", lambda *a: [self.reset_calc(), self.redraw()])
-        self.var_emit_h_ref.trace_add("write", lambda *a: [self.reset_calc(), self.redraw()])
+        self.var_emit_h_min.trace_add("write", self._on_heavy_emitter_param_changed)
         self.var_lat_inner_d_mm.trace_add("write", lambda *a: self.reset_calc())
         self.var_emit_h_press_min.trace_add("write", lambda *a: self.reset_calc())
         self.var_emit_h_press_max.trace_add("write", lambda *a: self.reset_calc())
@@ -268,15 +334,15 @@ class DripCAD:
         self.var_valve_h_max_optimize.trace_add(
             "write", lambda *a: self._invalidate_hydro_ui_active_block_or_all()
         )
-        self.var_show_emitter_flow.trace_add("write", lambda *a: self.redraw())
-        self.var_show_press_zone_outlines_on_map.trace_add("write", lambda *a: self.redraw())
+        self.var_show_emitter_flow.trace_add("write", self._on_heavy_canvas_toggle_changed)
+        self.var_show_press_zone_outlines_on_map.trace_add("write", self._on_heavy_canvas_toggle_changed)
         self.var_emit_iso_method.trace_add(
             "write",
-            lambda *a: (
+                lambda *a: (
                 setattr(
                     self,
                     "_emit_isolines_cache",
-                    {"sig": None, "contours_by_cls": {}},
+                    {"sig": None, "contours": [], "contours_by_cls": {}},
                 ),
                 self.redraw(),
             ),
@@ -396,7 +462,18 @@ class DripCAD:
         def _route_map_tool(n):
             self.route_embedded_map_tool(n)
 
-        build_off_canvas_draw_notebook(self._draw_left_sidebar, self, map_tool_router=_route_map_tool)
+        self._draw_tools_notebook = build_off_canvas_draw_notebook(
+            self._draw_left_sidebar, self, map_tool_router=_route_map_tool
+        )
+        try:
+            self._draw_tools_notebook.bind(
+                "<<NotebookTabChanged>>",
+                lambda _e: self._update_trunk_panel_state_offcanvas_from_notebook(),
+                add="+",
+            )
+            self._update_trunk_panel_state_offcanvas_from_notebook()
+        except Exception:
+            pass
         self._embedded_map_ready = False
         self.view_notebook.bind("<<NotebookTabChanged>>", self._on_view_panel_changed)
         self._refresh_active_block_combo()
@@ -510,10 +587,14 @@ class DripCAD:
         _MAP_ONLY_TOOLS = frozenset({"project_zone_rect", "capture_tiles", "block_contour"})
 
         def _clear_canvas_tool_state() -> None:
-            self._canvas_special_tool = None
+            self._destroy_select_hover_pick_ui()
+            self._canvas_special_tool = "select"
             self._canvas_trunk_draft_world = None
             self._canvas_polyline_draft = []
             self._canvas_trunk_route_draft_indices = []
+            self._trunk_route_endpoint_pending_idx = None
+            self._trunk_route_edge_end_idx = None
+            self._cancel_trunk_node_drag()
             self._canvas_selection_keys = []
             self._select_marquee_active = False
             self._select_marquee_dragged = False
@@ -547,6 +628,7 @@ class DripCAD:
                 return False
             _clear_embedded_map_tool_only()
             if name != "select":
+                self._destroy_select_hover_pick_ui()
                 self._select_marquee_active = False
                 self._select_marquee_dragged = False
                 self._select_marquee_start_screen = None
@@ -555,10 +637,26 @@ class DripCAD:
                 self._select_marquee_curr_world = None
             if name not in ("select", "map_pick_info"):
                 self._canvas_selection_keys = []
+            prev_tool = getattr(self, "_canvas_special_tool", None)
+            draft_before = list(getattr(self, "_canvas_trunk_route_draft_indices", []) or [])
+            preserve_trunk_chain_draft = (
+                name is not None
+                and (
+                    (
+                        prev_tool in _CANVAS_TRUNK_CHAIN_TOOLS
+                        and name in _CANVAS_TRUNK_CHAIN_TOOLS
+                    )
+                    or (name == "trunk_route" and len(draft_before) > 0)
+                )
+            )
+            self._cancel_trunk_node_drag()
             self._canvas_special_tool = name
             self._canvas_trunk_draft_world = None
             self._canvas_polyline_draft = []
-            self._canvas_trunk_route_draft_indices = []
+            if not preserve_trunk_chain_draft:
+                self._canvas_trunk_route_draft_indices = []
+                self._trunk_route_endpoint_pending_idx = None
+                self._trunk_route_edge_end_idx = None
             self.redraw()
             self._refresh_canvas_cursor_for_special_tool()
             return True
@@ -581,10 +679,13 @@ class DripCAD:
 
     def reset_trunk_map_editing_state(self) -> None:
         """Вимкнути спецінструменти магістралі, чернетки та вибір на полотні й на вкладці «Карта»."""
-        self._canvas_special_tool = None
+        self._destroy_select_hover_pick_ui()
+        self._canvas_special_tool = "select"
         self._canvas_trunk_draft_world = None
         self._canvas_polyline_draft = []
         self._canvas_trunk_route_draft_indices = []
+        self._trunk_route_endpoint_pending_idx = None
+        self._trunk_route_edge_end_idx = None
         self._canvas_selection_keys = []
         self._select_marquee_active = False
         self._select_marquee_dragged = False
@@ -592,6 +693,7 @@ class DripCAD:
         self._select_marquee_curr_screen = None
         self._select_marquee_start_world = None
         self._select_marquee_curr_world = None
+        self._cancel_trunk_node_drag()
         if getattr(self, "_embedded_map_ready", False):
             host = getattr(self, "_embedded_map_host", None)
             fn = getattr(host, "_set_map_tool", None) if host is not None else None
@@ -678,6 +780,117 @@ class DripCAD:
         )
         return True
 
+    def _cancel_trunk_node_drag(self) -> None:
+        self._trunk_node_drag_idx = None
+        self._trunk_node_drag_moved = False
+
+    def _exit_ruler_for_trunk_interaction(self) -> None:
+        """Режим лінійки з панелі малювання лишався активним і блокував перетягування вузлів — скидаємо у VIEW."""
+        if self.mode.get() == "RULER":
+            self.ruler_start = None
+            self.mode.set("VIEW")
+
+    def _draw_trunk_drag_edge_length_hints(self) -> None:
+        """Під час перетягування вузла — довжина (м) над пов'язаними ребрами (екран: трохи вище середини полілінії)."""
+        di = getattr(self, "_trunk_node_drag_idx", None)
+        if di is None:
+            return
+        try:
+            di_i = int(di)
+        except (TypeError, ValueError):
+            return
+        for seg in getattr(self, "trunk_map_segments", []) or []:
+            if not isinstance(seg, dict):
+                continue
+            ni = seg.get("node_indices")
+            if not isinstance(ni, list):
+                continue
+            idxs: List[int] = []
+            for x in ni:
+                try:
+                    idxs.append(int(x))
+                except (TypeError, ValueError):
+                    idxs = []
+                    break
+            if di_i not in idxs:
+                continue
+            pl = self._trunk_segment_world_path(seg)
+            if len(pl) < 2:
+                continue
+            lm = self._polyline_length_m(pl)
+            if lm <= 1e-6:
+                continue
+            try:
+                mx, my = self._polyline_point_at_dist(pl, lm * 0.5)
+            except ValueError:
+                continue
+            try:
+                sx, sy = self.to_screen(float(mx), float(my))
+            except Exception:
+                continue
+            txt = f"{lm:.1f} м"
+            self.canvas.create_text(
+                sx,
+                sy - 18,
+                text=txt,
+                fill="#FFF59D",
+                font=("Segoe UI", 9, "bold"),
+                anchor=tk.S,
+                tags=_TRUNK_MAP_TAGS_COSMETIC,
+            )
+
+    def _trunk_node_drag_apply_world(self, node_index: int, wx: float, wy: float) -> None:
+        """Перемістити вузол у світових XY (м) і оновити lat/lon; path_local сегментів — за node_indices."""
+        from modules.geo_module import srtm_tiles
+
+        nodes = list(getattr(self, "trunk_map_nodes", []) or [])
+        if not (0 <= int(node_index) < len(nodes)):
+            return
+        node = nodes[int(node_index)]
+        fx, fy = float(wx), float(wy)
+        # Під час перетягування не прив’язувати до крана — інакше вузол «липне», поки курсор у радіусі снапу.
+        node["x"] = fx
+        node["y"] = fy
+        gr = getattr(self, "geo_ref", None)
+        if gr and len(gr) >= 2:
+            ref_lon, ref_lat = float(gr[0]), float(gr[1])
+            lat, lon = srtm_tiles.local_xy_to_lat_lon(float(fx), float(fy), ref_lon, ref_lat)
+            node["lat"] = float(lat)
+            node["lon"] = float(lon)
+        self.sync_trunk_segment_paths_from_nodes()
+
+    def _finalize_trunk_node_drag(self) -> None:
+        """Кінець ЛКМ після перетягування вузла (полотно або карта)."""
+        if getattr(self, "_trunk_node_drag_idx", None) is None:
+            return
+        moved = bool(getattr(self, "_trunk_node_drag_moved", False))
+        drag_idx = int(self._trunk_node_drag_idx)
+        self._cancel_trunk_node_drag()
+        if moved:
+            nodes = list(getattr(self, "trunk_map_nodes", []) or [])
+            if 0 <= drag_idx < len(nodes):
+                node = nodes[drag_idx]
+                if str(node.get("kind", "")).lower() == "consumption":
+                    from modules.geo_module import srtm_tiles
+
+                    fx, fy = float(node["x"]), float(node["y"])
+                    sx, sy = self._snap_world_xy_to_nearest_field_valve(fx, fy)
+                    node["x"] = float(sx)
+                    node["y"] = float(sy)
+                    gr = getattr(self, "geo_ref", None)
+                    if gr and len(gr) >= 2:
+                        ref_lon, ref_lat = float(gr[0]), float(gr[1])
+                        lat, lon = srtm_tiles.local_xy_to_lat_lon(float(sx), float(sy), ref_lon, ref_lat)
+                        node["lat"] = float(lat)
+                        node["lon"] = float(lon)
+                    self.sync_trunk_segment_paths_from_nodes()
+            self.trunk_irrigation_hydro_cache = None
+            try:
+                self._schedule_embedded_map_overlay_refresh()
+            except Exception:
+                pass
+        self.redraw()
+
     def sync_trunk_segment_paths_from_nodes(self) -> None:
         """Оновлює path_local: для ребра з двома вузлами — лише прямий відрізок між ними (топологія = граф)."""
         nodes = list(getattr(self, "trunk_map_nodes", []) or [])
@@ -731,7 +944,8 @@ class DripCAD:
 
     def _delete_selected_trunk_map_elements(self) -> int:
         """
-        Видаляє з вибору відрізки магістралі (trunk_seg) та/або вузли (trunk_node: насос, пікет, розгалуження, споживач).
+        Видаляє з вибору відрізки магістралі (trunk_seg), вузли магістралі (trunk_node)
+        та декоративні лінії сцени (scene_line).
         Сегменти, інцидентні видаленим вузлам, прибираються автоматично; індекси вузлів у сегментах перераховуються.
         """
         keys = list(getattr(self, "_canvas_selection_keys", []) or [])
@@ -756,6 +970,15 @@ class DripCAD:
             if 0 <= si < len(segs):
                 seg_del_explicit.add(si)
 
+        scene = list(getattr(self, "scene_lines", []) or [])
+        scene_del: Set[int] = set()
+        for cat, payload, _ in keys:
+            if cat != "scene_line" or not isinstance(payload, int):
+                continue
+            si = int(payload)
+            if 0 <= si < len(scene):
+                scene_del.add(si)
+
         seg_remove: Set[int] = set(seg_del_explicit)
         for si, seg in enumerate(segs):
             if not isinstance(seg, dict):
@@ -776,6 +999,12 @@ class DripCAD:
                 seg_remove.add(si)
 
         if not node_del and not seg_remove:
+            if scene_del:
+                self.scene_lines = [seg for si, seg in enumerate(scene) if si not in scene_del]
+                self._canvas_selection_keys = [
+                    (c, p, lab) for c, p, lab in keys if c != "scene_line"
+                ]
+                return len(scene_del)
             return 0
 
         kept_segs = [seg for si, seg in enumerate(segs) if si not in seg_remove]
@@ -850,9 +1079,30 @@ class DripCAD:
             self._purge_removed_trunk_node_ids_from_schedule(removed_node_ids)
 
         self._canvas_selection_keys = [
-            (c, p, lab) for c, p, lab in keys if c not in ("trunk_node", "trunk_seg")
+            (c, p, lab) for c, p, lab in keys if c not in ("trunk_node", "trunk_seg", "scene_line")
         ]
-        return removed_seg_n + max(removed_node_n, 0)
+        removed_scene_n = 0
+        if scene_del:
+            self.scene_lines = [seg for si, seg in enumerate(scene) if si not in scene_del]
+            removed_scene_n = len(scene_del)
+        return removed_seg_n + max(removed_node_n, 0) + removed_scene_n
+
+    def _delete_trunk_graph_item_from_menu(self, cat: str, payload: object, label: str = "") -> None:
+        """Видалити один вузол або відрізок магістралі з контекстного меню (без клавіші Delete)."""
+        if cat not in ("trunk_node", "trunk_seg"):
+            return
+        prev = list(getattr(self, "_canvas_selection_keys", []) or [])
+        self._canvas_selection_keys = [(cat, payload, str(label))]
+        n = self._delete_selected_trunk_map_elements()
+        if n <= 0:
+            self._canvas_selection_keys = prev
+            return
+        self.notify_irrigation_schedule_ui()
+        self.redraw()
+        try:
+            self._schedule_embedded_map_overlay_refresh()
+        except Exception:
+            pass
 
     def _purge_removed_trunk_node_ids_from_schedule(self, removed_ids: Set[str]) -> None:
         """Прибирає id вузлів магістралі з розкладу поливів і чернетки розкладу."""
@@ -949,11 +1199,508 @@ class DripCAD:
     def trunk_pipe_label_for_segment(self, seg: dict) -> str:
         if not isinstance(seg, dict):
             return "труба —"
+        m = str(seg.get("pipe_material", "")).strip()
+        p = str(seg.get("pipe_pn", "")).strip()
+        secs = seg.get("sections")
+        if not isinstance(secs, list):
+            secs = seg.get("telescoped_sections")
+        dns: List[str] = []
+        if isinstance(secs, list):
+            for row in secs:
+                if not isinstance(row, dict):
+                    continue
+                dn = row.get("d_nom_mm")
+                if dn is not None:
+                    try:
+                        dns.append(str(int(float(dn))))
+                    except (TypeError, ValueError):
+                        try:
+                            dns.append(str(int(float(str(dn).replace(",", ".")))))
+                        except (TypeError, ValueError):
+                            pass
+        if m and p and len(dns) >= 2:
+            return f"{m} PN{p} Ø{'→'.join(dns)}"
+        o = str(seg.get("pipe_od", "")).strip()
+        if m and p and o:
+            try:
+                o_show = str(int(float(str(o).replace(",", "."))))
+            except (TypeError, ValueError):
+                o_show = o
+            return f"{m} PN{p} Ø{o_show}"
         try:
             dmm = float(seg.get("d_inner_mm", 90.0) or 90.0)
         except (TypeError, ValueError):
             dmm = 90.0
         return self.trunk_pipe_label_for_inner_mm(dmm)
+
+    def _trunk_map_hover_show_pipes_detail(self) -> bool:
+        """True — підказка з розрахунку/оптимізації (труби, Q); False — топологія (граф)."""
+        v = getattr(self, "var_trunk_map_hover_pipes_mode", None)
+        try:
+            return bool(v is not None and v.get())
+        except tk.TclError:
+            return False
+
+    def _trunk_node_id_for_map_index(self, idx: int) -> str:
+        nodes = list(getattr(self, "trunk_map_nodes", []) or [])
+        if idx < 0 or idx >= len(nodes):
+            return "?"
+        return str(nodes[idx].get("id", "")).strip() or f"T{idx}"
+
+    def trunk_map_pick_label_for_segment(self, si: int) -> str:
+        """Підпис для ЛКМ «Інфо»/pick на карті: залежить від перемикача граф/труби."""
+        if self._trunk_map_hover_show_pipes_detail():
+            segs = list(getattr(self, "trunk_map_segments", []) or [])
+            if si < 0 or si >= len(segs) or not isinstance(segs[si], dict):
+                return f"Магістраль, відрізок {si + 1}"
+            seg = segs[si]
+            pl = self._trunk_segment_world_path(seg)
+            lm = float(self._polyline_length_m(pl)) if len(pl) >= 2 else 0.0
+            row: dict = {}
+            h = getattr(self, "trunk_irrigation_hydro_cache", None)
+            if isinstance(h, dict):
+                sh = h.get("segment_hover")
+                if isinstance(sh, dict):
+                    r0 = sh.get(str(si))
+                    row = r0 if isinstance(r0, dict) else {}
+                    if not row:
+                        r1 = sh.get(int(si))  # type: ignore[arg-type]
+                        row = r1 if isinstance(r1, dict) else {}
+            try:
+                d_h = float(row.get("d_inner_mm", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                d_h = 0.0
+            if d_h <= 1e-9:
+                try:
+                    d_h = float(seg.get("d_inner_mm", 0.0) or 0.0)
+                except (TypeError, ValueError):
+                    d_h = 0.0
+            od = self._trunk_pipe_row_outer_d_mm_str(None, seg, d_h)
+            return f"L ≈ {lm:.1f} м\nØ {od} мм (зовнішній діаметр)"
+        from modules.hydraulic_module.trunk_irrigation_schedule_hydro import _segment_length_m
+
+        segs = list(getattr(self, "trunk_map_segments", []) or [])
+        nodes = list(getattr(self, "trunk_map_nodes", []) or [])
+        if si < 0 or si >= len(segs) or not isinstance(segs[si], dict):
+            return f"Магістраль, відрізок {si + 1}"
+        seg = segs[si]
+        ni = seg.get("node_indices")
+        try:
+            lm = float(_segment_length_m(nodes, seg))
+        except Exception:
+            lm = 0.0
+        if isinstance(ni, list) and len(ni) >= 2:
+            try:
+                a, b = int(ni[0]), int(ni[1])
+                pa, pb = self._trunk_node_id_for_map_index(a), self._trunk_node_id_for_map_index(b)
+                return f"Ребро {pa}→{pb}\nL ≈ {lm:.1f} м (геом.)"
+            except (TypeError, ValueError, IndexError):
+                pass
+        return f"Відрізок {si + 1}\nL ≈ {lm:.1f} м (геом.)"
+
+    def trunk_segment_display_caption(self, seg_index: int) -> str:
+        segs = list(getattr(self, "trunk_map_segments", []) or [])
+        if seg_index < 0 or seg_index >= len(segs):
+            return f"Магістраль, відрізок {seg_index + 1}"
+        seg = segs[seg_index] if isinstance(segs[seg_index], dict) else {}
+        base = f"Магістраль, відрізок {seg_index + 1} · {self.trunk_pipe_label_for_segment(seg)}"
+        secs = seg.get("sections")
+        if not isinstance(secs, list):
+            secs = seg.get("telescoped_sections")
+        if not isinstance(secs, list) or not secs:
+            return base
+        sec_parts = []
+        for row in secs:
+            if not isinstance(row, dict):
+                continue
+            try:
+                sl = float(row.get("length_m", 0.0) or 0.0)
+                sd = float(row.get("d_inner_mm", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if sl <= 1e-9 or sd <= 1e-9:
+                continue
+            oc = row.get("objective_cost", None)
+            if oc is not None:
+                try:
+                    sec_parts.append(f"{sl:.1f}м/Ø{sd:.0f}/C{float(oc):.1f}")
+                except (TypeError, ValueError):
+                    sec_parts.append(f"{sl:.1f}м/Ø{sd:.0f}")
+            else:
+                sec_parts.append(f"{sl:.1f}м/Ø{sd:.0f}")
+        if not sec_parts:
+            return base
+        return f"{base} · секції: " + ", ".join(sec_parts[:4])
+
+    def _catalog_outer_mm_str_for_inner(self, d_inner_mm: float) -> Optional[str]:
+        """Зовнішній номінал (мм) з каталогу дозволених труб за d_inner, якщо збіг достатній."""
+        try:
+            d_tgt = float(d_inner_mm)
+        except (TypeError, ValueError):
+            return None
+        if d_tgt <= 1e-6:
+            return None
+        eff = normalize_allowed_pipes_map(
+            getattr(self, "trunk_allowed_pipes", None) or getattr(self, "allowed_pipes", {}) or {}
+        )
+        db = getattr(self, "pipe_db", None) or {}
+        cands = allowed_pipe_candidates_sorted(eff, db)
+        best_d = 1e18
+        best_od: Optional[int] = None
+        for c in cands:
+            diff = abs(float(c["inner"]) - d_tgt)
+            if diff < best_d:
+                best_d = diff
+                best_od = int(c["d"])
+        if best_od is None or best_d > 2.6:
+            return None
+        return str(best_od)
+
+    def _trunk_pipe_row_outer_d_mm_str(
+        self, sec: Optional[dict], seg: dict, hydro_d_inner: float
+    ) -> str:
+        """Зовнішній Ø (мм) для підказки: секція телескопа → сегмент → кеш d_inner → каталог."""
+
+        def _from_pipe_fields(d: dict) -> Optional[str]:
+            o = str(d.get("pipe_od", "")).strip()
+            if o:
+                try:
+                    return str(int(float(str(o).replace(",", "."))))
+                except (TypeError, ValueError):
+                    return o
+            dn = d.get("d_nom_mm")
+            if dn is not None:
+                try:
+                    return str(int(float(str(dn).replace(",", "."))))
+                except (TypeError, ValueError):
+                    pass
+            return None
+
+        if isinstance(sec, dict):
+            t = _from_pipe_fields(sec)
+            if t:
+                return t
+            try:
+                din = float(sec.get("d_inner_mm", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                din = 0.0
+            if din > 1e-6:
+                c = self._catalog_outer_mm_str_for_inner(din)
+                if c:
+                    return c
+        if isinstance(seg, dict):
+            t = _from_pipe_fields(seg)
+            if t:
+                return t
+        try:
+            dh = float(hydro_d_inner or 0.0)
+        except (TypeError, ValueError):
+            dh = 0.0
+        if dh > 1e-6:
+            c = self._catalog_outer_mm_str_for_inner(dh)
+            if c:
+                return c
+        return "—"
+
+    def _trunk_hover_telescope_chunk_at_world(
+        self, si: int, wx: float, wy: float
+    ) -> Tuple[List[Tuple[float, float]], Optional[dict]]:
+        """Підфрагмент полілінії ребра (телескоп-секція) найближчий до (wx,wy); інакше все ребро."""
+        segs = list(getattr(self, "trunk_map_segments", []) or [])
+        if not (0 <= si < len(segs)):
+            return [], None
+        seg = segs[si] if isinstance(segs[si], dict) else {}
+        pl = self._trunk_segment_world_path(seg)
+        if len(pl) < 2:
+            return [], None
+        chunks = self._trunk_segment_telescope_path_chunks(seg, pl)
+        if not chunks:
+            return pl, None
+        best_pl = pl
+        best_sec: Optional[dict] = None
+        best_d = 1e18
+        for sub_pl, sec in chunks:
+            if len(sub_pl) < 2:
+                continue
+            d = self._distance_point_to_polyline_m(wx, wy, sub_pl)
+            if d < best_d:
+                best_d = d
+                best_pl = sub_pl
+                best_sec = sec
+        return best_pl, best_sec
+
+    def _trunk_pipes_hover_geom_caption(
+        self, si: int, wx: float, wy: float, hydro_row: dict
+    ) -> Optional[Tuple[List[Tuple[float, float]], List[str], Optional[dict]]]:
+        """Режим «труби»: для підсвіченого фрагмента — L і Ø з числом (зовнішній діаметр)."""
+        segs = list(getattr(self, "trunk_map_segments", []) or [])
+        if not (0 <= si < len(segs)):
+            return None
+        base_seg = segs[si] if isinstance(segs[si], dict) else {}
+        chunk_pl, sec = self._trunk_hover_telescope_chunk_at_world(si, wx, wy)
+        if len(chunk_pl) < 2:
+            return None
+        try:
+            d_h = float(hydro_row.get("d_inner_mm", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            d_h = 0.0
+        lm = float(self._polyline_length_m(chunk_pl))
+        od = self._trunk_pipe_row_outer_d_mm_str(sec, base_seg, d_h)
+        lines = [f"L ≈ {lm:.1f} м", f"Ø {od} мм (зовнішній діаметр)"]
+        return chunk_pl, lines, sec
+
+    def _trunk_telescope_short_label(self, seg: dict) -> str:
+        """Один рядок для підказки: кілька секцій на ребрі (довжина × d_inner)."""
+        if not isinstance(seg, dict):
+            return ""
+        secs = seg.get("sections")
+        if not isinstance(secs, list):
+            secs = seg.get("telescoped_sections")
+        if not isinstance(secs, list) or len(secs) < 2:
+            return ""
+        parts: List[str] = []
+        for row in secs[:5]:
+            if not isinstance(row, dict):
+                continue
+            try:
+                sl = float(row.get("length_m", 0.0) or 0.0)
+                sd = float(row.get("d_inner_mm", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if sl <= 1e-9 or sd <= 1e-9:
+                continue
+            parts.append(f"{sl:.0f}м×Ø{sd:.0f}")
+        if len(parts) < 2:
+            return ""
+        return "Телескоп: " + " + ".join(parts)
+
+    def _trunk_telescope_section_label_text(self, sec: dict) -> str:
+        """Один рядок підпису телескоп-секції на карті (формат як у секцій сабмейну)."""
+        if not isinstance(sec, dict):
+            return ""
+        try:
+            lm = float(sec.get("length_m", 0.0) or 0.0)
+            dnom = float(sec.get("d_nom_mm", 0.0) or 0.0)
+            din = float(sec.get("d_inner_mm", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return ""
+        if lm <= 1e-9:
+            return ""
+        mat = str(sec.get("material", "") or "").strip() or "PE"
+        pn = str(sec.get("pn", "") or "").strip() or "?"
+        d_use = dnom if dnom > 1e-6 else din
+        if d_use <= 1e-6:
+            return ""
+        # Не використовувати .rstrip("0") на цілих мм: "110".rstrip("0") → "11".
+        if abs(d_use - round(d_use)) < 0.01:
+            d_txt = str(int(round(d_use)))
+        else:
+            d_txt = f"{d_use:.2f}".rstrip("0").rstrip(".")
+        return f"{mat} Ø{d_txt}/{pn} L={lm:.1f}m"
+
+    @staticmethod
+    def _trunk_telescope_label_pos_key(seg_idx: int, chunk_idx: int) -> str:
+        return f"{int(seg_idx)}:{int(chunk_idx)}"
+
+    def _trunk_telescope_label_anchor_world(
+        self, seg_idx: int, chunk_idx: int, chunk_pl: List[Tuple[float, float]], sec: dict
+    ) -> Optional[Tuple[float, float]]:
+        if len(chunk_pl) < 2:
+            return None
+        if (
+            self._moving_trunk_tel_seg_idx is not None
+            and int(self._moving_trunk_tel_seg_idx) == int(seg_idx)
+            and int(self._moving_trunk_tel_chunk_idx or -1) == int(chunk_idx)
+            and self._moving_trunk_tel_preview is not None
+        ):
+            return (
+                float(self._moving_trunk_tel_preview[0]),
+                float(self._moving_trunk_tel_preview[1]),
+            )
+        stored = self._trunk_telescope_stored_label_world(seg_idx, chunk_idx)
+        if stored is not None:
+            return stored
+        coords = [(float(x), float(y)) for x, y in chunk_pl]
+        try:
+            geom = LineString(coords)
+            midpt = geom.interpolate(0.5, normalized=True)
+            return (float(midpt.x), float(midpt.y))
+        except Exception:
+            return None
+
+    def _trunk_telescope_stored_label_world(
+        self, seg_idx: int, chunk_idx: int
+    ) -> Optional[Tuple[float, float]]:
+        raw = (getattr(self, "consumer_schedule", None) or {}).get("trunk_telescope_label_pos")
+        if not isinstance(raw, dict):
+            return None
+        v = raw.get(self._trunk_telescope_label_pos_key(seg_idx, chunk_idx))
+        if isinstance(v, (list, tuple)) and len(v) >= 2:
+            try:
+                return (float(v[0]), float(v[1]))
+            except (TypeError, ValueError):
+                return None
+        return None
+
+    def _pick_trunk_telescope_label_for_move(
+        self, wx: float, wy: float
+    ) -> Optional[Tuple[int, int]]:
+        hcache = getattr(self, "trunk_irrigation_hydro_cache", None)
+        if not DripCAD._trunk_irrigation_hydro_dict_has_results(hcache):
+            return None
+        max_pick_anchor_m = max(16.0 / max(self.zoom, 1e-9), 0.35)
+        max_pick_line_m = max(14.0 / max(self.zoom, 1e-9), 0.35)
+        best_d: Optional[float] = None
+        best: Optional[Tuple[int, int]] = None
+        p = Point(wx, wy)
+        for si, seg in enumerate(getattr(self, "trunk_map_segments", []) or []):
+            if not isinstance(seg, dict):
+                continue
+            pl = self._trunk_segment_world_path(seg)
+            if len(pl) < 2:
+                continue
+            chunks = self._trunk_segment_telescope_path_chunks(seg, pl)
+            for ci, (chunk_pl, sec) in enumerate(chunks):
+                if not isinstance(sec, dict):
+                    continue
+                anchor = self._trunk_telescope_label_anchor_world(si, ci, list(chunk_pl), sec)
+                if anchor is None:
+                    continue
+                d = math.hypot(anchor[0] - wx, anchor[1] - wy)
+                if best_d is None or d < best_d:
+                    best_d = d
+                    best = (int(si), int(ci))
+        if best is None or best_d is None:
+            return None
+        if best_d <= max_pick_anchor_m:
+            return best
+        best_line_d: Optional[float] = None
+        best_line: Optional[Tuple[int, int]] = None
+        for si, seg in enumerate(getattr(self, "trunk_map_segments", []) or []):
+            if not isinstance(seg, dict):
+                continue
+            pl = self._trunk_segment_world_path(seg)
+            if len(pl) < 2:
+                continue
+            chunks = self._trunk_segment_telescope_path_chunks(seg, pl)
+            for ci, (chunk_pl, sec) in enumerate(chunks):
+                if not isinstance(sec, dict):
+                    continue
+                try:
+                    d_line = LineString([(float(x), float(y)) for x, y in chunk_pl]).distance(p)
+                except Exception:
+                    continue
+                if best_line_d is None or d_line < best_line_d:
+                    best_line_d = d_line
+                    best_line = (int(si), int(ci))
+        if best_line_d is None or best_line is None or best_line_d > max_pick_line_m:
+            return None
+        return best_line
+
+    def _anchor_world_for_submain_section_pick(
+        self, picked: Tuple[int, int, int]
+    ) -> Optional[Tuple[float, float]]:
+        lk, si, sm = int(picked[0]), int(picked[1]), int(picked[2])
+        label_pts = self.calc_results.get("section_label_pos") or {}
+        for pr in self._sections_for_canvas_draw():
+            if (
+                int(pr.get("label_key", -1)) == lk
+                and int(pr.get("sub_idx", -1)) == si
+                and int(pr.get("sm_idx", -1)) == sm
+            ):
+                return self._label_anchor_world(pr, label_pts)
+        return None
+
+    def _draw_trunk_telescope_chunk_label(
+        self,
+        seg_idx: int,
+        chunk_idx: int,
+        chunk_pl: List[Tuple[float, float]],
+        sec: dict,
+    ) -> None:
+        txt = self._trunk_telescope_section_label_text(sec)
+        if not txt or len(chunk_pl) < 2:
+            return
+        coords = [(float(x), float(y)) for x, y in chunk_pl]
+        try:
+            geom = LineString(coords)
+        except Exception:
+            return
+        anchor = self._trunk_telescope_label_anchor_world(seg_idx, chunk_idx, chunk_pl, sec)
+        if anchor is None:
+            return
+        ax, ay = float(anchor[0]), float(anchor[1])
+        pt_a = Point(ax, ay)
+        try:
+            if geom.length > 1e-9:
+                s_along = geom.project(pt_a)
+                t0 = max(0.0, min(geom.length, s_along - max(0.15, 0.002 * geom.length)))
+                t1 = max(0.0, min(geom.length, s_along + max(0.15, 0.002 * geom.length)))
+                if t1 <= t0 + 1e-9:
+                    t1 = min(geom.length, t0 + 0.05)
+                p0 = geom.interpolate(t0)
+                p1 = geom.interpolate(t1)
+                dx, dy = float(p1.x - p0.x), float(p1.y - p0.y)
+            else:
+                raise ValueError("short")
+        except Exception:
+            lc = len(coords)
+            mi = min(max(0, lc // 2 - 1), lc - 2)
+            dx = coords[mi + 1][0] - coords[mi][0]
+            dy = coords[mi + 1][1] - coords[mi][1]
+            if abs(dx) + abs(dy) < 1e-9:
+                dx = coords[-1][0] - coords[0][0]
+                dy = coords[-1][1] - coords[0][1]
+        angle_rad = math.atan2(dy, dx)
+        tk_angle = -math.degrees(angle_rad)
+        if tk_angle < -90 or tk_angle > 90:
+            tk_angle += 180
+            angle_rad += math.pi
+        off_x = 10 * math.cos(angle_rad + math.pi / 2)
+        off_y = -10 * math.sin(angle_rad + math.pi / 2)
+        sx, sy = self.to_screen(ax, ay)
+        fs = max(7, min(12, int(9 * self.zoom)))
+        fnt = ("Segoe UI", fs, "bold")
+        is_sel = (
+            self._moving_trunk_tel_seg_idx is not None
+            and int(self._moving_trunk_tel_seg_idx) == int(seg_idx)
+            and int(self._moving_trunk_tel_chunk_idx or -1) == int(chunk_idx)
+        )
+        fill_main = "#FFFF00" if is_sel else "#000000"
+        fill_shadow = "#000000" if is_sel else "#FFFFFF"
+        self.canvas.create_text(
+            sx + off_x,
+            sy + off_y,
+            text=txt,
+            fill=fill_main,
+            font=fnt,
+            angle=tk_angle,
+            anchor=tk.S,
+            tags=_TRUNK_MAP_TAGS_COSMETIC,
+        )
+        self.canvas.create_text(
+            sx + off_x - 1,
+            sy + off_y - 1,
+            text=txt,
+            fill=fill_shadow,
+            font=fnt,
+            angle=tk_angle,
+            anchor=tk.S,
+            tags=_TRUNK_MAP_TAGS_COSMETIC,
+        )
+
+    def _trunk_telescope_summary_for_ui(self) -> str:
+        """Короткий текст для діалогу після розрахунку (лише ребра з ≥2 секціями)."""
+        lines: List[str] = []
+        for si, seg in enumerate(getattr(self, "trunk_map_segments", []) or []):
+            if not isinstance(seg, dict):
+                continue
+            s = self._trunk_telescope_short_label(seg)
+            if s:
+                lines.append(f"Відрізок {si + 1}: {s}")
+        if not lines:
+            return ""
+        return "Телескоп по ребрах:\n- " + "\n- ".join(lines[:8])
 
     def _trunk_material_keys_ordered(self) -> List[str]:
         """Матеріали з дозволених для магістралі (trunk_allowed_pipes), що є в каталозі."""
@@ -986,8 +1733,18 @@ class DripCAD:
         best = min(cands, key=lambda c: abs(float(c["inner"]) - d_tgt))
         return (str(best["mat"]), str(best["pn"]), str(int(best["d"])))
 
+    def _distance_m_to_trunk_segment_index(self, seg_index: int, wx: float, wy: float) -> Optional[float]:
+        """Відстань від точки до полілінії сегмента магістралі (м); None якщо сегмент без геометрії."""
+        segs = list(getattr(self, "trunk_map_segments", []) or [])
+        if not (0 <= int(seg_index) < len(segs)):
+            return None
+        pl = self._trunk_segment_world_path(segs[int(seg_index)])
+        if len(pl) < 2:
+            return None
+        return float(self._distance_point_to_polyline_m(wx, wy, pl))
+
     def _pick_trunk_segment_index_for_pipe_edit(self, wx: float, wy: float) -> Optional[int]:
-        """Найближчий відрізок магістралі (лише ребро з двома вузлами) у межах толерансу."""
+        """Найближчий відрізок магістралі (полілінія path_local / ланцюг вузлів) у межах толерансу."""
         segs = list(getattr(self, "trunk_map_segments", []) or [])
         if not segs:
             return None
@@ -996,9 +1753,6 @@ class DripCAD:
         best_d = 1e18
         for si, seg in enumerate(segs):
             if not isinstance(seg, dict):
-                continue
-            ni = seg.get("node_indices")
-            if not isinstance(ni, list) or len(ni) != 2:
                 continue
             pl = self._trunk_segment_world_path(seg)
             if len(pl) < 2:
@@ -1165,7 +1919,7 @@ class DripCAD:
         cb_pn = ttk.Combobox(frm, state="readonly", width=22)
         cb_pn.grid(row=1, column=1, sticky=tk.W, pady=4)
 
-        tk.Label(frm, text="Діаметр Ø (зовн.)", bg="#1e1e1e", fg="#e0e0e0").grid(
+        tk.Label(frm, text="Ø, мм (зовнішній діаметр)", bg="#1e1e1e", fg="#e0e0e0").grid(
             row=2, column=0, sticky=tk.W, pady=4
         )
         cb_od = ttk.Combobox(frm, state="readonly", width=22)
@@ -1180,6 +1934,21 @@ class DripCAD:
             justify=tk.LEFT,
         )
         hint.grid(row=3, column=0, columnspan=2, sticky=tk.W, pady=(8, 4))
+        var_len_zero = tk.BooleanVar(value=bool(seg.get("bom_length_zero", False)))
+        chk_len_zero = tk.Checkbutton(
+            frm,
+            text="Довжина = 0 (не враховувати цей відрізок у BOM труб)",
+            variable=var_len_zero,
+            onvalue=True,
+            offvalue=False,
+            bg="#1e1e1e",
+            fg="#E0E0E0",
+            selectcolor="#2A2A2A",
+            activebackground="#1e1e1e",
+            activeforeground="#E0E0E0",
+            highlightthickness=0,
+        )
+        chk_len_zero.grid(row=4, column=0, columnspan=2, sticky=tk.W, pady=(2, 0))
 
         def refresh_pn(*_a) -> None:
             m = str(cb_mat.get() or "").strip()
@@ -1221,7 +1990,7 @@ class DripCAD:
             cb_od.set(init_o)
 
         btn_row = tk.Frame(frm, bg="#1e1e1e")
-        btn_row.grid(row=4, column=0, columnspan=2, sticky=tk.E, pady=(12, 0))
+        btn_row.grid(row=5, column=0, columnspan=2, sticky=tk.E, pady=(12, 0))
 
         def apply_choice() -> None:
             m = str(cb_mat.get() or "").strip()
@@ -1241,6 +2010,9 @@ class DripCAD:
             seg["pipe_material"] = m
             seg["pipe_pn"] = p
             seg["pipe_od"] = o
+            seg["bom_length_zero"] = bool(var_len_zero.get())
+            self.normalize_consumer_schedule()
+            self.consumer_schedule["trunk_pipes_selected"] = True
             self.sync_trunk_tree_data_from_trunk_map()
             self.trunk_irrigation_hydro_cache = None
             try:
@@ -1280,18 +2052,28 @@ class DripCAD:
         def _fmt_q() -> str:
             raw = node.get("trunk_schedule_q_m3h")
             if raw is None:
-                return "60"
+                dq = self.trunk_schedule_test_q_m3h_effective()
+            else:
+                try:
+                    dq = float(raw)
+                except (TypeError, ValueError):
+                    dq = self.trunk_schedule_test_q_m3h_effective()
             try:
-                return str(float(raw)).rstrip("0").rstrip(".")
+                return str(float(dq)).rstrip("0").rstrip(".")
             except (TypeError, ValueError):
                 return "60"
 
         def _fmt_h() -> str:
             raw = node.get("trunk_schedule_h_m")
             if raw is None:
-                return "40"
+                dh = self.trunk_schedule_test_h_m_effective()
+            else:
+                try:
+                    dh = float(raw)
+                except (TypeError, ValueError):
+                    dh = self.trunk_schedule_test_h_m_effective()
             try:
-                return str(float(raw)).rstrip("0").rstrip(".")
+                return str(float(dh)).rstrip("0").rstrip(".")
             except (TypeError, ValueError):
                 return "40"
 
@@ -1331,7 +2113,10 @@ class DripCAD:
 
         tk.Label(
             frm,
-            text="Ці значення підставляються в гідравліку замість типових 60 м³/год і 40 м лише для цього споживача.",
+            text=(
+                "Для цього споживача; інші беруть типові Q/H з розкладу (проєкт), якщо для них не задано окремо. "
+                "Одночасність визначається тільки включенням вузлів у слотах розкладу."
+            ),
             bg="#1e1e1e",
             fg="#888888",
             wraplength=380,
@@ -1352,7 +2137,12 @@ class DripCAD:
                     "Введіть числа: витрата (м³/год) і напір (м вод. ст.).",
                 )
                 return
-            if qv < 0.0 or qv > 10000.0 or hv < 0.0 or hv > 400.0:
+            if (
+                qv < 0.0
+                or qv > 10000.0
+                or hv < 0.0
+                or hv > 400.0
+            ):
                 silent_showwarning(
                     self.root,
                     "Споживач",
@@ -1443,6 +2233,1431 @@ class DripCAD:
         pl2 = _parse_pl(seg.get("path_local") or [])
         return pl2 if len(pl2) >= 2 else []
 
+    @staticmethod
+    def _polyline_length_m(path: List[Tuple[float, float]]) -> float:
+        if len(path) < 2:
+            return 0.0
+        s = 0.0
+        for i in range(len(path) - 1):
+            s += math.hypot(path[i + 1][0] - path[i][0], path[i + 1][1] - path[i][1])
+        return float(s)
+
+    @staticmethod
+    def _polyline_point_at_dist(path: List[Tuple[float, float]], dist_m: float) -> Tuple[float, float]:
+        if len(path) < 2:
+            raise ValueError("Polyline too short")
+        total = DripCAD._polyline_length_m(path)
+        d = max(0.0, min(float(dist_m), total))
+        if d <= 1e-9:
+            return (float(path[0][0]), float(path[0][1]))
+        acc = 0.0
+        for i in range(len(path) - 1):
+            x0, y0 = float(path[i][0]), float(path[i][1])
+            x1, y1 = float(path[i + 1][0]), float(path[i + 1][1])
+            seg = math.hypot(x1 - x0, y1 - y0)
+            if seg <= 1e-12:
+                continue
+            if acc + seg >= d - 1e-12:
+                t = (d - acc) / seg
+                return (x0 + (x1 - x0) * t, y0 + (y1 - y0) * t)
+            acc += seg
+        return (float(path[-1][0]), float(path[-1][1]))
+
+    @staticmethod
+    def _trunk_polyline_vertex_cumulative_lengths(
+        path: List[Tuple[float, float]],
+    ) -> List[float]:
+        if len(path) < 2:
+            return [0.0] * max(1, len(path))
+        cum: List[float] = [0.0]
+        for i in range(len(path) - 1):
+            x0, y0 = float(path[i][0]), float(path[i][1])
+            x1, y1 = float(path[i + 1][0]), float(path[i + 1][1])
+            cum.append(cum[-1] + math.hypot(x1 - x0, y1 - y0))
+        return cum
+
+    @staticmethod
+    def _trunk_polyline_subpath_arclength(
+        path: List[Tuple[float, float]], d0: float, d1: float
+    ) -> List[Tuple[float, float]]:
+        """Фрагмент полілінії між довжинами по дузі [d0, d1] від початку path (м)."""
+        if len(path) < 2:
+            return []
+        total = DripCAD._polyline_length_m(path)
+        if total <= 1e-9:
+            return []
+        d0c = max(0.0, min(float(d0), total))
+        d1c = max(d0c, min(float(d1), total))
+        if d1c - d0c <= 1e-9:
+            return []
+        p0 = DripCAD._polyline_point_at_dist(path, d0c)
+        p1 = DripCAD._polyline_point_at_dist(path, d1c)
+        cum = DripCAD._trunk_polyline_vertex_cumulative_lengths(path)
+        out: List[Tuple[float, float]] = [p0]
+        for k in range(1, len(path) - 1):
+            try:
+                ak = float(cum[k])
+            except (TypeError, ValueError, IndexError):
+                continue
+            if d0c + 1e-9 < ak < d1c - 1e-9:
+                out.append((float(path[k][0]), float(path[k][1])))
+        drool = 1e-4 * max(1.0, total)
+        if not out or abs(out[-1][0] - p1[0]) > drool or abs(out[-1][1] - p1[1]) > drool:
+            out.append(p1)
+        else:
+            out[-1] = p1
+        thin: List[Tuple[float, float]] = []
+        for p in out:
+            if (
+                not thin
+                or abs(thin[-1][0] - p[0]) > drool
+                or abs(thin[-1][1] - p[1]) > drool
+            ):
+                thin.append(p)
+        if len(thin) < 2:
+            return [p0, p1] if (abs(p0[0] - p1[0]) > drool or abs(p0[1] - p1[1]) > drool) else []
+        return thin
+
+    def _trunk_segment_telescope_path_chunks(
+        self, seg: dict, pl: List[Tuple[float, float]]
+    ) -> List[Tuple[List[Tuple[float, float]], Optional[dict]]]:
+        """
+        Розбиває world-полілінію сегмента на частини за sections/telescoped_sections (телескоп).
+        Якщо секцій < 2 або геометрія коротка — одна пара (pl, None).
+        """
+        if len(pl) < 2:
+            return []
+        if not isinstance(seg, dict):
+            return [(pl, None)]
+        secs = seg.get("sections")
+        if not isinstance(secs, list):
+            secs = seg.get("telescoped_sections")
+        rows: List[dict] = []
+        if isinstance(secs, list):
+            for row in secs:
+                if not isinstance(row, dict):
+                    continue
+                try:
+                    lm = float(row.get("length_m", 0.0) or 0.0)
+                    sd = float(row.get("d_inner_mm", 0.0) or 0.0)
+                except (TypeError, ValueError):
+                    continue
+                if lm > 1e-9 and sd > 1e-9:
+                    rows.append(dict(row))
+        if len(rows) < 2:
+            return [(pl, None)]
+        path_len = float(self._polyline_length_m(pl))
+        sum_l = sum(float(r.get("length_m", 0.0) or 0.0) for r in rows)
+        if sum_l > 1e-9 and path_len > 1e-9 and abs(sum_l - path_len) > max(0.05, 0.01 * path_len):
+            sc = path_len / sum_l
+            for r in rows:
+                r["length_m"] = float(r.get("length_m", 0.0) or 0.0) * sc
+        out: List[Tuple[List[Tuple[float, float]], Optional[dict]]] = []
+        d0 = 0.0
+        for j, r in enumerate(rows):
+            if j == len(rows) - 1:
+                d1 = path_len
+            else:
+                try:
+                    lm = float(r.get("length_m", 0.0) or 0.0)
+                except (TypeError, ValueError):
+                    lm = 0.0
+                d1 = min(path_len, d0 + max(0.0, lm))
+            if d1 > d0 + 1e-9:
+                sub = DripCAD._trunk_polyline_subpath_arclength(pl, d0, d1)
+                if len(sub) >= 2:
+                    out.append((sub, r))
+            d0 = d1
+        return out if out else [(pl, None)]
+
+    def _trunk_telescope_chunk_line_color(self, seg_index: int, sec: Optional[dict]) -> str:
+        """Колір лінії для фрагмента телескопа: за d_inner секції з каталогу; інакше колір ребра."""
+        base = self.trunk_hydro_segment_line_color(seg_index) or _TRUNK_CANVAS_PATH_COLOR
+        if isinstance(sec, dict):
+            try:
+                dmm = float(sec.get("d_inner_mm", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                dmm = 0.0
+            if dmm > 1e-6:
+                c = self._trunk_segment_pipe_color_from_catalog_inner(dmm)
+                if c:
+                    return c
+        return str(base)
+
+    @staticmethod
+    def _trunk_section_diameter_mm_for_transition(sec: dict) -> float:
+        if not isinstance(sec, dict):
+            return 0.0
+        try:
+            dnom = float(sec.get("d_nom_mm", 0.0) or 0.0)
+            din = float(sec.get("d_inner_mm", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+        return dnom if dnom > 1e-6 else din
+
+    def _draw_trunk_telescope_diameter_transition_marker(
+        self,
+        curr_chunk_pl: List[Tuple[float, float]],
+        prev_sec: dict,
+        curr_sec: dict,
+        *,
+        pipe_line_width_px: int = _TRUNK_MAP_SEGMENT_LINE_WIDTH_PX,
+    ) -> None:
+        """Трикутник на стику секцій: вершина 45° у бік зменшення діаметра вздовж потоку."""
+        if len(curr_chunk_pl) < 2:
+            return
+        d0 = float(self._trunk_section_diameter_mm_for_transition(prev_sec))
+        d1 = float(self._trunk_section_diameter_mm_for_transition(curr_sec))
+        if d0 <= 1e-6 or d1 <= 1e-6 or abs(d0 - d1) < 0.5:
+            return
+        jx, jy = float(curr_chunk_pl[0][0]), float(curr_chunk_pl[0][1])
+        p1x, p1y = float(curr_chunk_pl[1][0]), float(curr_chunk_pl[1][1])
+        try:
+            sx0, sy0 = self.to_screen(jx, jy)
+            sx1, sy1 = self.to_screen(p1x, p1y)
+        except (TypeError, ValueError):
+            return
+        fx, fy = sx1 - sx0, sy1 - sy0
+        nrm = math.hypot(fx, fy)
+        if nrm < 1e-6:
+            return
+        fx, fy = fx / nrm, fy / nrm
+        if d1 > d0 - 1e-6:
+            fx, fy = -fx, -fy
+        nu_x, nu_y = -fy, fx
+        try:
+            pw = max(2.0, float(int(pipe_line_width_px)))
+        except (TypeError, ValueError):
+            pw = float(_TRUNK_MAP_SEGMENT_LINE_WIDTH_PX)
+        # ~2.5× товщини лінії труби; легкий масштаб від zoom (було замало — ~×2 загалом).
+        try:
+            z = float(getattr(self, "zoom", 1.0) or 1.0)
+        except (TypeError, ValueError):
+            z = 1.0
+        zf = max(1.0, min(1.65, 0.88 + 0.055 * z))
+        leg_px = max(18.0, 2.5 * pw * zf)
+        half = math.pi / 8.0
+        cb, sb = math.cos(half), math.sin(half)
+        tip = 0.09 * leg_px
+        ax = sx0 + tip * fx
+        ay = sy0 + tip * fy
+        bx = ax + leg_px * (-cb * fx + sb * nu_x)
+        by = ay + leg_px * (-cb * fy + sb * nu_y)
+        cx = ax + leg_px * (-cb * fx - sb * nu_x)
+        cy = ay + leg_px * (-cb * fy - sb * nu_y)
+        self.canvas.create_polygon(
+            ax,
+            ay,
+            bx,
+            by,
+            cx,
+            cy,
+            fill="#FFFDE7",
+            outline="#212121",
+            width=2,
+            tags=_TRUNK_MAP_TAGS_BOM,
+        )
+
+    @staticmethod
+    def _split_polyline_at_dist(
+        path: List[Tuple[float, float]], dist_m: float
+    ) -> Tuple[List[Tuple[float, float]], List[Tuple[float, float]], Tuple[float, float]]:
+        if len(path) < 2:
+            raise ValueError("Polyline too short")
+        total = DripCAD._polyline_length_m(path)
+        if total <= 1e-9:
+            raise ValueError("Polyline length is zero")
+        d = max(0.0, min(float(dist_m), total))
+        if d <= 1e-9 or d >= total - 1e-9:
+            raise ValueError("Split point too close to segment endpoint")
+        split_pt = DripCAD._polyline_point_at_dist(path, d)
+        left: List[Tuple[float, float]] = []
+        right: List[Tuple[float, float]] = []
+        acc = 0.0
+        inserted = False
+        for i in range(len(path) - 1):
+            p0 = (float(path[i][0]), float(path[i][1]))
+            p1 = (float(path[i + 1][0]), float(path[i + 1][1]))
+            seg = math.hypot(p1[0] - p0[0], p1[1] - p0[1])
+            if not left:
+                left.append(p0)
+            if seg <= 1e-12:
+                continue
+            if not inserted and acc + seg >= d - 1e-12:
+                if left[-1] != split_pt:
+                    left.append(split_pt)
+                right.append(split_pt)
+                if p1 != split_pt:
+                    right.append(p1)
+                inserted = True
+            elif not inserted:
+                left.append(p1)
+            else:
+                if right[-1] != p1:
+                    right.append(p1)
+            acc += seg
+        if not inserted or len(left) < 2 or len(right) < 2:
+            raise ValueError("Failed to split polyline")
+        return left, right, split_pt
+
+    def add_trunk_picket_at_head_drop(self, target_head_m: float = 60.0) -> bool:
+        """
+        Додати пікет (bend), розірвавши одне ребро у точці, де за розрахунком поливів H перетинає target_head_m.
+        Використовується слот із найбільшим сумарним Q (peak load).
+        """
+        cache = getattr(self, "trunk_irrigation_hydro_cache", None)
+        if not isinstance(cache, dict):
+            try:
+                self.run_trunk_irrigation_schedule_hydro()
+            except Exception:
+                pass
+            cache = getattr(self, "trunk_irrigation_hydro_cache", None)
+            if not isinstance(cache, dict):
+                silent_showwarning(
+                    self.root,
+                    "Магістраль",
+                    "Спочатку виконайте «Магістраль за поливами», щоб визначити точку H.",
+                )
+                return False
+        per_slot = cache.get("per_slot")
+        if not isinstance(per_slot, dict):
+            silent_showwarning(self.root, "Магістраль", "У кеші поливів немає даних по слотах.")
+            return False
+        nodes = list(getattr(self, "trunk_map_nodes", []) or [])
+        segs = list(getattr(self, "trunk_map_segments", []) or [])
+        if not nodes or not segs:
+            silent_showwarning(self.root, "Магістраль", "Немає вузлів або відрізків магістралі.")
+            return False
+        directed, errs = build_oriented_edges(nodes, segs)
+        if directed is None or errs:
+            silent_showwarning(self.root, "Магістраль", "Топологія магістралі некоректна для вставки пікета.")
+            return False
+        id_to_idx: Dict[str, int] = {}
+        for i, n in enumerate(nodes):
+            nid = str(n.get("id", "")).strip()
+            if nid:
+                id_to_idx[nid] = i
+        best_slot_key: Optional[str] = None
+        best_q = -1.0
+        for k, row in per_slot.items():
+            if not isinstance(row, dict):
+                continue
+            try:
+                tq = float(row.get("total_q_m3s", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                tq = 0.0
+            if tq > best_q + 1e-12 and isinstance(row.get("edge_h"), dict):
+                best_q = tq
+                best_slot_key = str(k)
+        if best_slot_key is None:
+            silent_showwarning(self.root, "Магістраль", "Не знайдено валідного слота поливу з даними напорів.")
+            return False
+        row = per_slot.get(best_slot_key) or {}
+        edge_h = row.get("edge_h")
+        if not isinstance(edge_h, dict):
+            silent_showwarning(self.root, "Магістраль", "Для обраного слота немає даних напору по ребрах.")
+            return False
+        # parent map для оцінки «найближче до насоса».
+        parent: Dict[int, int] = {}
+        for u, v in directed:
+            parent[int(v)] = int(u)
+        dist_to_src: Dict[int, float] = {}
+        src = None
+        for i, n in enumerate(nodes):
+            if is_trunk_root_kind(str(n.get("kind", ""))):
+                src = i
+                break
+        if src is None:
+            silent_showwarning(self.root, "Магістраль", "Не знайдено насос (source).")
+            return False
+        dist_to_src[src] = 0.0
+        changed = True
+        while changed:
+            changed = False
+            for u, v in directed:
+                if u not in dist_to_src:
+                    continue
+                d_uv = math.hypot(float(nodes[v]["x"]) - float(nodes[u]["x"]), float(nodes[v]["y"]) - float(nodes[u]["y"]))
+                cand = float(dist_to_src[u]) + float(d_uv)
+                if v not in dist_to_src or cand < dist_to_src[v] - 1e-9:
+                    dist_to_src[v] = cand
+                    changed = True
+        target = float(target_head_m)
+        best_candidate = None  # (abs_dist_from_source, seg_idx, frac_from_seg_start, split_dist_on_seg)
+        for si, seg in enumerate(segs):
+            if not isinstance(seg, dict):
+                continue
+            ni = seg.get("node_indices")
+            if not isinstance(ni, list) or len(ni) != 2:
+                continue
+            try:
+                a, b = int(ni[0]), int(ni[1])
+            except (TypeError, ValueError):
+                continue
+            if not (0 <= a < len(nodes) and 0 <= b < len(nodes)):
+                continue
+            aid = str(nodes[a].get("id", "")).strip()
+            bid = str(nodes[b].get("id", "")).strip()
+            if not aid or not bid:
+                continue
+            hup_hdn = None
+            if (aid, bid) in edge_h:
+                hup_hdn = edge_h[(aid, bid)]
+                oriented_a, oriented_b = a, b
+            elif (bid, aid) in edge_h:
+                hup_hdn = edge_h[(bid, aid)]
+                oriented_a, oriented_b = b, a
+            if hup_hdn is None:
+                continue
+            try:
+                h_up = float(hup_hdn[0])
+                h_dn = float(hup_hdn[1])
+            except (TypeError, ValueError, IndexError):
+                continue
+            if not ((h_up >= target >= h_dn) or (h_up <= target <= h_dn)):
+                continue
+            if abs(h_up - h_dn) <= 1e-9:
+                continue
+            frac_oriented = (target - h_up) / (h_dn - h_up)
+            frac_oriented = max(0.0, min(1.0, frac_oriented))
+            if frac_oriented <= 1e-6 or frac_oriented >= 1.0 - 1e-6:
+                continue
+            path = self._trunk_segment_world_path(seg)
+            if len(path) < 2:
+                continue
+            plen = self._polyline_length_m(path)
+            if plen <= 1e-9:
+                continue
+            # path іде від ni[0] до ni[1]; якщо орієнтація ребра навпаки — інвертуємо частку.
+            if oriented_a == a and oriented_b == b:
+                frac_from_start = frac_oriented
+            else:
+                frac_from_start = 1.0 - frac_oriented
+            split_dist = plen * frac_from_start
+            if split_dist <= 1e-6 or split_dist >= plen - 1e-6:
+                continue
+            # Абсолютна відстань від насоса до точки перетину — для вибору першого падіння.
+            dist_up = dist_to_src.get(oriented_a)
+            if dist_up is None:
+                continue
+            abs_dist = float(dist_up) + plen * frac_oriented
+            cand = (abs_dist, si, frac_from_start, split_dist)
+            if best_candidate is None or cand[0] < best_candidate[0] - 1e-6:
+                best_candidate = cand
+        if best_candidate is None:
+            silent_showinfo(
+                self.root,
+                "Магістраль",
+                f"На жодному ребрі peak-слота не знайдено перетин H={target_head_m:.1f} м.",
+            )
+            return False
+        _abs_dist, si, _frac_from_start, split_dist = best_candidate
+        seg = segs[si]
+        path = self._trunk_segment_world_path(seg)
+        try:
+            left_path, right_path, split_pt = self._split_polyline_at_dist(path, split_dist)
+        except ValueError as ex:
+            silent_showwarning(self.root, "Магістраль", f"Не вдалося розірвати ребро в точці H={target_head_m:.1f} м: {ex}")
+            return False
+        ni = seg.get("node_indices")
+        a, b = int(ni[0]), int(ni[1])
+        new_node = {
+            "kind": "bend",
+            "x": float(split_pt[0]),
+            "y": float(split_pt[1]),
+        }
+        try:
+            from modules.geo_module import srtm_tiles
+
+            gr = getattr(self, "geo_ref", None)
+            if gr and len(gr) >= 2:
+                ref_lon, ref_lat = float(gr[0]), float(gr[1])
+                lat, lon = srtm_tiles.local_xy_to_lat_lon(
+                    float(split_pt[0]), float(split_pt[1]), ref_lon, ref_lat
+                )
+                new_node["lat"] = float(lat)
+                new_node["lon"] = float(lon)
+        except Exception:
+            pass
+        if "lat" not in new_node or "lon" not in new_node:
+            try:
+                n0 = nodes[a]
+                n1 = nodes[b]
+                la0, lo0 = float(n0.get("lat")), float(n0.get("lon"))
+                la1, lo1 = float(n1.get("lat")), float(n1.get("lon"))
+                full = self._polyline_length_m(path)
+                frac = 0.5 if full <= 1e-9 else max(0.0, min(1.0, split_dist / full))
+                new_node["lat"] = la0 + (la1 - la0) * frac
+                new_node["lon"] = lo0 + (lo1 - lo0) * frac
+            except Exception:
+                pass
+        new_idx = len(nodes)
+        nodes.append(new_node)
+        pipe_keys = ("d_inner_mm", "c_hw", "pipe_material", "pipe_pn", "pipe_od", "bom_length_zero")
+        attrs = {k: seg[k] for k in pipe_keys if k in seg}
+        seg_left = {"node_indices": [a, new_idx], "path_local": left_path, **attrs}
+        seg_right = {"node_indices": [new_idx, b], "path_local": right_path, **attrs}
+        new_segs = [s for i, s in enumerate(segs) if i != si]
+        new_segs.extend([seg_left, seg_right])
+        self.trunk_map_nodes = nodes
+        self.trunk_map_segments = new_segs
+        ensure_trunk_node_ids(self.trunk_map_nodes)
+        new_id = str(self.trunk_map_nodes[new_idx].get("id", "")).strip()
+        self._trunk_last_inserted_node_id = new_id if new_id else None
+        self.sync_trunk_segment_paths_from_nodes()
+        self.trunk_irrigation_hydro_cache = None
+        try:
+            self.sync_trunk_tree_data_from_trunk_map()
+        except Exception:
+            pass
+        self.redraw()
+        try:
+            self._schedule_embedded_map_overlay_refresh()
+        except Exception:
+            pass
+        try:
+            if self._trunk_last_inserted_node_id:
+                self._focus_trunk_node_after_insert(self._trunk_last_inserted_node_id)
+        except Exception:
+            pass
+        silent_showinfo(
+            self.root,
+            "Магістраль",
+            f"Додано пікет у точці H≈{target_head_m:.1f} м (slot #{int(best_slot_key) + 1}).",
+        )
+        return True
+
+    def _selected_trunk_segment_index(self) -> Optional[int]:
+        keys = list(getattr(self, "_canvas_selection_keys", []) or [])
+        for cat, payload, _lab in keys:
+            if cat == "trunk_seg":
+                try:
+                    return int(payload)
+                except (TypeError, ValueError):
+                    continue
+        return None
+
+    def _trunk_context_target_from_selection_or_pick(
+        self, wx: float, wy: float
+    ) -> Optional[Tuple[str, object, str]]:
+        keys = list(getattr(self, "_canvas_selection_keys", []) or [])
+        for cat, payload, label in keys:
+            if cat in ("trunk_seg", "trunk_node"):
+                return (cat, payload, label)
+        hits = self._collect_world_pick_hits(float(wx), float(wy))
+        if not hits:
+            return None
+        _pri, _d, cat, payload, label = hits[0]
+        if cat in ("trunk_seg", "trunk_node"):
+            return (cat, payload, label)
+        return None
+
+    def _open_trunk_graph_context_menu(
+        self, wx: float, wy: float, *, menu_anchor: Optional[Tuple[int, int]] = None
+    ) -> bool:
+        """ПКМ по вузлу або ребру магістралі: дії + видалення (режими VIEW/PAN або «Вибір»)."""
+        target = self._trunk_context_target_from_selection_or_pick(wx, wy)
+        if target is None:
+            return False
+        cat, payload, label = target
+        m = tk.Menu(self.root, tearoff=0)
+        if cat == "trunk_seg":
+            try:
+                si = int(payload)
+            except (TypeError, ValueError):
+                si = None
+            if si is not None:
+                m.add_command(
+                    label="Вибір труби…",
+                    command=lambda s=si: self._open_trunk_segment_pipe_dialog(int(s)),
+                )
+                m.add_command(
+                    label="Профіль прокладки",
+                    command=lambda s=si: self.open_trunk_segment_ground_profile(s),
+                )
+                m.add_command(
+                    label="Графік тиску вздовж ребра",
+                    command=lambda s=si: self.open_trunk_segment_pressure_profile(s),
+                )
+                m.add_separator()
+                m.add_command(
+                    label="Видалити відрізок",
+                    command=lambda c=cat, p=payload, lab=label: self._delete_trunk_graph_item_from_menu(
+                        str(c), p, str(lab)
+                    ),
+                )
+                keys_now = list(getattr(self, "_canvas_selection_keys", []) or [])
+                if not keys_now:
+                    self._canvas_selection_keys = [("trunk_seg", si, str(label))]
+                    self.redraw()
+        elif cat == "trunk_node":
+            try:
+                ni = int(payload)
+            except (TypeError, ValueError):
+                ni = None
+            nodes = list(getattr(self, "trunk_map_nodes", []) or [])
+            if ni is not None and 0 <= ni < len(nodes):
+                node = nodes[ni]
+                kind = str(node.get("kind", "")).strip().lower()
+                if kind in ("consumption", "valve"):
+                    m.add_command(
+                        label="Q/P споживача…",
+                        command=lambda idx=ni: self._open_trunk_consumer_schedule_dialog(idx),
+                    )
+                    m.add_separator()
+                m.add_command(
+                    label="Видалити вузол",
+                    command=lambda c=cat, p=payload, lab=label: self._delete_trunk_graph_item_from_menu(
+                        str(c), p, str(lab)
+                    ),
+                )
+                keys_now = list(getattr(self, "_canvas_selection_keys", []) or [])
+                if not keys_now:
+                    self._canvas_selection_keys = [("trunk_node", ni, str(label))]
+                    self.redraw()
+            else:
+                m.add_command(label="Немає доступних дій", state=tk.DISABLED)
+        else:
+            m.add_command(label="Немає доступних дій", state=tk.DISABLED)
+        try:
+            if menu_anchor and len(menu_anchor) >= 2:
+                px, py = int(menu_anchor[0]), int(menu_anchor[1])
+            else:
+                px = int(self.root.winfo_pointerx())
+                py = int(self.root.winfo_pointery())
+            m.tk_popup(px, py)
+        finally:
+            try:
+                m.grab_release()
+            except Exception:
+                pass
+        return True
+
+    def open_trunk_segment_ground_profile(self, segment_index: Optional[int] = None) -> None:
+        """Профіль земної поверхні під вибраним сегментом магістралі."""
+        if segment_index is None:
+            si = self._selected_trunk_segment_index()
+        else:
+            try:
+                si = int(segment_index)
+            except (TypeError, ValueError):
+                si = None
+        if si is None:
+            silent_showwarning(
+                self.root,
+                "Профіль прокладки",
+                "Спочатку виділіть сегмент магістралі інструментом «Вибір», потім натисніть «Профіль прокладки».",
+            )
+            return
+        segs = list(getattr(self, "trunk_map_segments", []) or [])
+        if not (0 <= si < len(segs)):
+            silent_showwarning(self.root, "Профіль прокладки", "Вибраний сегмент не знайдено.")
+            return
+        path = self._trunk_segment_world_path(segs[si])
+        if len(path) < 2:
+            silent_showwarning(self.root, "Профіль прокладки", "Сегмент має некоректну геометрію.")
+            return
+        total_len = self._polyline_length_m(path)
+        if total_len <= 1e-6:
+            silent_showwarning(self.root, "Профіль прокладки", "Довжина сегмента ≈ 0 м.")
+            return
+        if not getattr(self.topo, "elevation_points", None):
+            silent_showwarning(
+                self.root,
+                "Профіль прокладки",
+                "Немає точок рельєфу. Завантажте/додайте висоти на вкладці «Рельєф».",
+            )
+            return
+
+        step_m = 6.0
+        sample_n = max(2, int(math.ceil(total_len / step_m)))
+        d_vals: List[float] = []
+        z_vals: List[float] = []
+        for i in range(sample_n + 1):
+            d = total_len * (float(i) / float(sample_n))
+            x, y = self._polyline_point_at_dist(path, d)
+            z = float(self.topo.get_z(x, y))
+            d_vals.append(float(d))
+            z_vals.append(float(z))
+        z_min = min(z_vals)
+        z_max = max(z_vals)
+        if abs(z_max - z_min) < 1e-6:
+            z_max = z_min + 1.0
+        z_mid = 0.5 * (z_min + z_max)
+        z_span = max(1e-6, z_max - z_min)
+
+        win = tk.Toplevel(self.root)
+        win.title(f"Профіль прокладки · сегмент #{si + 1}")
+        win.transient(self.root)
+        win.configure(bg="#1e1e1e")
+        win.geometry("900x500")
+
+        top = tk.Frame(win, bg="#1e1e1e")
+        top.pack(fill=tk.X, padx=8, pady=(8, 0))
+        tk.Label(top, text="Вертикальний масштаб", bg="#1e1e1e", fg="#CFD8DC").pack(side=tk.LEFT)
+        v_default = getattr(self, "_trunk_profile_vscale", 0.1)
+        try:
+            v_default_f = float(v_default)
+        except (TypeError, ValueError):
+            v_default_f = 0.1
+        v_default_f = max(0.01, min(10.0, v_default_f))
+        var_vscale = tk.StringVar(value=str(v_default_f).rstrip("0").rstrip("."))
+        ent_vscale = ttk.Entry(top, textvariable=var_vscale, width=8)
+        ent_vscale.pack(side=tk.LEFT, padx=(8, 6))
+        tk.Label(top, text="(0.1 = у 10 разів пласкіше)", bg="#1e1e1e", fg="#90A4AE").pack(side=tk.LEFT)
+
+        cv = tk.Canvas(win, bg="#101216", highlightthickness=0)
+        cv.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        state = {"d": None}
+        geom = {"ml": 56.0, "pw": 1.0, "mt": 18.0, "ph": 1.0, "y0": 1.0}
+
+        def _current_vscale() -> float:
+            raw = str(var_vscale.get()).replace(",", ".").strip()
+            try:
+                v = float(raw)
+            except (TypeError, ValueError):
+                v = 0.1
+            v = max(0.01, min(10.0, v))
+            return v
+
+        def _draw_profile(_event=None) -> None:
+            try:
+                w = max(320, int(cv.winfo_width()))
+                h = max(220, int(cv.winfo_height()))
+            except tk.TclError:
+                return
+            try:
+                cv.delete("trunk_seg_profile")
+            except tk.TclError:
+                pass
+            _tsp = "trunk_seg_profile"
+            ml, mr, mt, mb = 56, 20, 18, 44
+            pw = max(10, w - ml - mr)
+            ph = max(10, h - mt - mb)
+            y0 = mt + ph
+            geom.update({"ml": float(ml), "pw": float(pw), "mt": float(mt), "ph": float(ph), "y0": float(y0)})
+            cv.create_line(ml, mt, ml, y0, fill="#8FA4B8", width=2, tags=_tsp)
+            cv.create_line(ml, y0, ml + pw, y0, fill="#8FA4B8", width=2, tags=_tsp)
+
+            vscale = _current_vscale()
+            self._trunk_profile_vscale = vscale
+            z_span_draw = z_span / max(1e-6, vscale)
+
+            def sx(d: float) -> float:
+                return ml + (float(d) / total_len) * pw
+
+            def sy(z: float) -> float:
+                top_z = z_mid + 0.5 * z_span_draw
+                return mt + (top_z - float(z)) / z_span_draw * ph
+
+            pts: List[float] = []
+            for d, z in zip(d_vals, z_vals):
+                pts.extend([sx(d), sy(z)])
+            if len(pts) >= 4:
+                cv.create_line(*pts, fill="#66D9EF", width=2, smooth=False, tags=_tsp)
+
+            for frac in (0.0, 0.5, 1.0):
+                d = total_len * frac
+                x = sx(d)
+                cv.create_line(x, y0, x, y0 + 4, fill="#8FA4B8", tags=_tsp)
+                cv.create_text(x, y0 + 8, text=f"{d:.0f} м", anchor=tk.N, fill="#B0BEC5", font=("Segoe UI", 8), tags=_tsp)
+            for frac in (0.0, 0.5, 1.0):
+                z = z_min + (z_max - z_min) * frac
+                y = sy(z)
+                cv.create_line(ml - 4, y, ml, y, fill="#8FA4B8", tags=_tsp)
+                cv.create_text(ml - 8, y, text=f"{z:.1f}", anchor=tk.E, fill="#B0BEC5", font=("Segoe UI", 8), tags=_tsp)
+
+            d_probe = state.get("d")
+            if d_probe is not None:
+                dp = max(0.0, min(float(d_probe), total_len))
+                zp = float(self.topo.get_z(*self._polyline_point_at_dist(path, dp)))
+                xp = sx(dp)
+                yp = sy(zp)
+                cv.create_line(xp, mt, xp, y0, fill="#26C6DA", dash=(4, 3), width=1, tags=_tsp)
+                cv.create_oval(xp - 4, yp - 4, xp + 4, yp + 4, fill="#00E5FF", outline="#E0F7FA", width=1, tags=_tsp)
+                cv.create_text(
+                    xp + 8,
+                    mt + 10,
+                    text=f"d={dp:.1f} м, Z={zp:.2f} м",
+                    anchor=tk.NW,
+                    fill="#B2EBF2",
+                    font=("Segoe UI", 8, "bold"),
+                    tags=_tsp,
+                )
+
+            cv.create_text(
+                ml + pw / 2,
+                h - 18,
+                text=(
+                    f"Довжина сегмента: {total_len:.1f} м   ·   крок: {step_m:.0f} м   ·   "
+                    f"верт. масштаб: ×{vscale:.3g}   ·   Zmin={z_min:.2f} м, Zmax={z_max:.2f} м"
+                ),
+                anchor=tk.CENTER,
+                fill="#CFD8DC",
+                font=("Segoe UI", 9, "bold"),
+                tags=_tsp,
+            )
+
+        def _on_motion(ev: tk.Event) -> None:
+            ml = float(geom["ml"])
+            pw = float(geom["pw"])
+            d = ((float(ev.x) - ml) / max(1e-6, pw)) * total_len
+            d = max(0.0, min(float(d), total_len))
+            state["d"] = d
+            try:
+                px, py = self._polyline_point_at_dist(path, d)
+                self._set_trunk_profile_probe(px, py, si)
+            except Exception:
+                pass
+            _draw_profile()
+
+        def _on_leave(_ev=None) -> None:
+            state["d"] = None
+            self._set_trunk_profile_probe(None, None, None)
+            _draw_profile()
+
+        def _apply_vscale(_ev=None) -> None:
+            v = _current_vscale()
+            var_vscale.set(str(v).rstrip("0").rstrip("."))
+            _draw_profile()
+
+        def _on_close() -> None:
+            self._set_trunk_profile_probe(None, None, None)
+            try:
+                win.destroy()
+            except tk.TclError:
+                pass
+
+        ent_vscale.bind("<Return>", _apply_vscale, add="+")
+        cv.bind("<Configure>", _draw_profile, add="+")
+        cv.bind("<Motion>", _on_motion, add="+")
+        cv.bind("<Leave>", _on_leave, add="+")
+        win.protocol("WM_DELETE_WINDOW", _on_close)
+        _draw_profile()
+
+    def _trunk_segment_pressure_heads_polyline_order_m(
+        self, seg: dict, slot_row: dict, nodes: Sequence[dict]
+    ) -> Optional[Tuple[float, float]]:
+        """
+        Напір (м вод. ст.) на початку та в кінці полілінії сегмента (вузол ni[0] → ni[-1]),
+        за рядком per_slot слота: edge_h (батько→дитина) або node_head_m.
+        """
+        if not isinstance(seg, dict) or not isinstance(slot_row, dict):
+            return None
+        ni = seg.get("node_indices")
+        if not isinstance(ni, list) or len(ni) < 2:
+            return None
+        try:
+            ia = int(ni[0])
+            ib = int(ni[-1])
+        except (TypeError, ValueError):
+            return None
+        if not (0 <= ia < len(nodes) and 0 <= ib < len(nodes)):
+            return None
+
+        def _nid(idx: int) -> str:
+            n = nodes[idx]
+            if not isinstance(n, dict):
+                return f"T{idx}"
+            return str(n.get("id", "")).strip() or f"T{idx}"
+
+        id_a = _nid(ia)
+        id_b = _nid(ib)
+        eh = slot_row.get("edge_h")
+        if isinstance(eh, dict):
+            k_fwd = f"{id_a}->{id_b}"
+            if k_fwd in eh:
+                t = eh[k_fwd]
+                if isinstance(t, (list, tuple)) and len(t) >= 2:
+                    try:
+                        return float(t[0]), float(t[1])
+                    except (TypeError, ValueError):
+                        pass
+            k_rev = f"{id_b}->{id_a}"
+            if k_rev in eh:
+                t = eh[k_rev]
+                if isinstance(t, (list, tuple)) and len(t) >= 2:
+                    try:
+                        # Ребро b→a: на кінці полілінії (id_b) — upstream, на початку (id_a) — downstream.
+                        return float(t[1]), float(t[0])
+                    except (TypeError, ValueError):
+                        pass
+        nh = slot_row.get("node_head_m")
+        if isinstance(nh, dict):
+
+            def _one(nid: str) -> Optional[float]:
+                for k in (nid, str(nid)):
+                    if k not in nh:
+                        continue
+                    try:
+                        v = float(nh[k])
+                    except (TypeError, ValueError):
+                        continue
+                    return v
+                return None
+
+            ha = _one(id_a)
+            hb = _one(id_b)
+            if ha is not None and hb is not None:
+                return ha, hb
+        return None
+
+    def _trunk_segment_dominant_slot_for_pressure(self, si: int, h: dict) -> Optional[int]:
+        sh = h.get("segment_hover")
+        if isinstance(sh, dict):
+            row = sh.get(str(si))
+            if not isinstance(row, dict):
+                row = sh.get(int(si))  # type: ignore[arg-type]
+            if isinstance(row, dict):
+                try:
+                    ds = row.get("dominant_slot")
+                    if ds is not None and int(ds) >= 0:
+                        return int(ds)
+                except (TypeError, ValueError):
+                    pass
+        dom_map = h.get("seg_dominant_slot")
+        if isinstance(dom_map, dict):
+            try:
+                if si in dom_map:
+                    return int(dom_map[si])
+            except (TypeError, ValueError):
+                pass
+            try:
+                if str(si) in dom_map:
+                    return int(dom_map[str(si)])
+            except (TypeError, ValueError):
+                pass
+        ps = h.get("per_slot")
+        if isinstance(ps, dict) and ps:
+            try:
+                return min(int(k) for k in ps.keys())
+            except (TypeError, ValueError):
+                pass
+        return None
+
+    @staticmethod
+    def _trunk_edge_h_heads_directed(
+        slot_row: dict, id_u: str, id_v: str
+    ) -> Optional[Tuple[str, str, float, float]]:
+        """(parent_id, child_id, h_upstream_m, h_downstream_m) для ребра {u,v}, якщо є в edge_h."""
+        if not isinstance(slot_row, dict):
+            return None
+        eh = slot_row.get("edge_h")
+        if not isinstance(eh, dict):
+            return None
+        id_u, id_v = str(id_u).strip(), str(id_v).strip()
+
+        def _try(pa: str, pb: str) -> Optional[Tuple[str, str, float, float]]:
+            key_s = f"{pa}->{pb}"
+            tup = eh.get(key_s)
+            if tup is None:
+                tup = eh.get((pa, pb))  # type: ignore[arg-type]
+            if isinstance(tup, (list, tuple)) and len(tup) >= 2:
+                try:
+                    return pa, pb, float(tup[0]), float(tup[1])
+                except (TypeError, ValueError):
+                    return None
+            return None
+
+        t = _try(id_u, id_v)
+        if t is not None:
+            return t
+        return _try(id_v, id_u)
+
+    @staticmethod
+    def _trunk_edge_q_m3s(slot_row: dict, parent_id: str, child_id: str) -> float:
+        if not isinstance(slot_row, dict):
+            return 0.0
+        eq = slot_row.get("edge_q")
+        if not isinstance(eq, dict):
+            return 0.0
+        p, c = str(parent_id).strip(), str(child_id).strip()
+        key = f"{p}->{c}"
+        if key in eq:
+            try:
+                return max(0.0, float(eq[key]))
+            except (TypeError, ValueError):
+                pass
+        if (p, c) in eq:
+            try:
+                return max(0.0, float(eq[(p, c)]))  # type: ignore[index]
+            except (TypeError, ValueError):
+                pass
+        return 0.0
+
+    def _trunk_tree_edge_row_by_pair(self, parent_id: str, child_id: str) -> Optional[dict]:
+        td = self._normalize_trunk_tree_payload(getattr(self, "trunk_tree_data", {}))
+        edges_in = td.get("edges")
+        if not isinstance(edges_in, list):
+            return None
+        p, c = str(parent_id).strip(), str(child_id).strip()
+        for row in edges_in:
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("parent_id", "")).strip() == p and str(row.get("child_id", "")).strip() == c:
+                return row
+        return None
+
+    @staticmethod
+    def _trunk_telescoped_section_tuples_from_edge_row(edge_row: dict) -> List[Tuple[float, float, float]]:
+        out: List[Tuple[float, float, float]] = []
+        if not isinstance(edge_row, dict):
+            return out
+        try:
+            d_fb = float(edge_row.get("d_inner_mm", 90.0) or 90.0)
+            c_fb = float(edge_row.get("c_hw", 140.0) or 140.0)
+        except (TypeError, ValueError):
+            d_fb, c_fb = 90.0, 140.0
+        for key in ("sections", "telescoped_sections"):
+            raw = edge_row.get(key)
+            if not isinstance(raw, list):
+                continue
+            for sec in raw:
+                if not isinstance(sec, dict):
+                    continue
+                try:
+                    sl = float(sec.get("length_m", 0.0) or 0.0)
+                    sd = float(sec.get("d_inner_mm", d_fb) or d_fb)
+                    sc = float(sec.get("c_hw", c_fb) or c_fb)
+                except (TypeError, ValueError):
+                    continue
+                if sl > 1e-9 and sd > 1e-9:
+                    out.append((sl, sd, sc))
+            if out:
+                break
+        if not out:
+            try:
+                lm0 = float(edge_row.get("length_m", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                lm0 = 0.0
+            if lm0 > 1e-9:
+                out.append((lm0, d_fb, c_fb))
+        return out
+
+    def _trunk_hw_pressure_pieces_along_polyline(
+        self,
+        seg: dict,
+        path: List[Tuple[float, float]],
+        slot_row: dict,
+        nodes: List[dict],
+    ) -> Optional[List[Tuple[float, float, float, float]]]:
+        """
+        Список ділянок (s0, s1, H0, H1) у метрах вздовж полілінії path[0]→path[-1], лінійний H у межах кожної
+        HW-секції телескопа (як у compute_trunk_tree_steady). None — якщо не вдалося зібрати ребра кешу.
+        """
+        if not isinstance(seg, dict) or len(path) < 2:
+            return None
+        ni = seg.get("node_indices")
+        if not isinstance(ni, list) or len(ni) < 2:
+            return None
+        try:
+            idxs = [int(x) for x in ni]
+        except (TypeError, ValueError):
+            return None
+        if len(idxs) >= 3 and len(path) != len(idxs):
+            return None
+        if len(idxs) == 2 and len(path) < 2:
+            return None
+
+        def _nid(idx: int) -> str:
+            if not (0 <= idx < len(nodes)):
+                return f"T{idx}"
+            n = nodes[idx]
+            if not isinstance(n, dict):
+                return f"T{idx}"
+            return str(n.get("id", "")).strip() or f"T{idx}"
+
+        pieces: List[Tuple[float, float, float, float]] = []
+        s_off = 0.0
+        h_prev_end: Optional[float] = None
+        for j in range(len(idxs) - 1):
+            u, v = idxs[j], idxs[j + 1]
+            id_u, id_v = _nid(u), _nid(v)
+            try:
+                leg_geom = math.hypot(
+                    float(path[j + 1][0]) - float(path[j][0]),
+                    float(path[j + 1][1]) - float(path[j][1]),
+                )
+            except (TypeError, ValueError):
+                return None
+            if leg_geom <= 1e-9:
+                continue
+            ed = DripCAD._trunk_edge_h_heads_directed(slot_row, id_u, id_v)
+            if ed is None:
+                return None
+            pid, cid, hu, hd = ed[0], ed[1], float(ed[2]), float(ed[3])
+            q = self._trunk_edge_q_m3s(slot_row, pid, cid)
+            trow = self._trunk_tree_edge_row_by_pair(pid, cid)
+            forward = id_u == pid and id_v == cid
+            reverse = id_u == cid and id_v == pid
+            if not forward and not reverse:
+                return None
+            if trow is None:
+                h_a, h_b = (hu, hd) if forward else (hd, hu)
+                if h_prev_end is not None and abs(h_prev_end - h_a) > 0.15:
+                    h_a = h_prev_end
+                pieces.append((s_off, s_off + leg_geom, h_a, h_b))
+                h_prev_end = h_b
+                s_off += leg_geom
+                continue
+            secs = self._trunk_telescoped_section_tuples_from_edge_row(trow)
+            sumL = sum(float(s[0]) for s in secs)
+            if sumL <= 1e-9:
+                secs = [(leg_geom, secs[0][1], secs[0][2])] if secs else [(leg_geom, 90.0, 140.0)]
+                sumL = float(secs[0][0])
+            scale_s = leg_geom / max(sumL, 1e-9)
+            s_loc = 0.0
+            if forward:
+                h_run = float(hu)
+                if h_prev_end is not None and abs(h_prev_end - h_run) > 0.15:
+                    h_run = float(h_prev_end)
+                for Lm, dmm, chw in secs:
+                    Lm = float(Lm)
+                    d_m = float(dmm) / 1000.0
+                    hf = hazen_williams_hloss_m(float(q), Lm, d_m, float(chw))
+                    g0 = s_off + s_loc
+                    g1 = s_off + s_loc + Lm * scale_s
+                    h1 = h_run - hf
+                    pieces.append((g0, g1, h_run, h1))
+                    h_run = h1
+                    s_loc += Lm * scale_s
+                if pieces:
+                    s0l, s1l, h0l, _h1l = pieces[-1]
+                    pieces[-1] = (s0l, s1l, h0l, float(hd))
+                h_prev_end = float(hd)
+            else:
+                h_run = float(hd)
+                if h_prev_end is not None and abs(h_prev_end - h_run) > 0.15:
+                    h_run = float(h_prev_end)
+                for Lm, dmm, chw in reversed(secs):
+                    Lm = float(Lm)
+                    d_m = float(dmm) / 1000.0
+                    hf = hazen_williams_hloss_m(float(q), Lm, d_m, float(chw))
+                    g0 = s_off + s_loc
+                    g1 = s_off + s_loc + Lm * scale_s
+                    h1 = h_run + hf
+                    pieces.append((g0, g1, h_run, h1))
+                    h_run = h1
+                    s_loc += Lm * scale_s
+                if pieces:
+                    s0l, s1l, h0l, _h1l = pieces[-1]
+                    pieces[-1] = (s0l, s1l, h0l, float(hu))
+                h_prev_end = float(hu)
+            s_off += leg_geom
+        if not pieces:
+            return None
+        return pieces
+
+    @staticmethod
+    def _trunk_head_at_s_on_pieces(
+        s: float, pieces: Sequence[Tuple[float, float, float, float]]
+    ) -> float:
+        s = max(0.0, float(s))
+        if not pieces:
+            return 0.0
+        ordered = sorted(pieces, key=lambda p: (min(p[0], p[1]), max(p[0], p[1])))
+        last = ordered[-1]
+        lo_l, hi_l = (last[0], last[1]) if last[0] <= last[1] else (last[1], last[0])
+        ha_l, hb_l = (last[2], last[3]) if last[0] <= last[1] else (last[3], last[2])
+        last_h = float(hb_l if s >= hi_l - 1e-9 else ha_l)
+        for s0, s1, h0, h1 in ordered:
+            lo, hi = (s0, s1) if s0 <= s1 else (s1, s0)
+            ha, hb = (h0, h1) if s0 <= s1 else (h1, h0)
+            if s <= hi + 1e-7:
+                span = max(hi - lo, 1e-9)
+                t = (s - lo) / span
+                t = max(0.0, min(1.0, t))
+                return float(ha + (hb - ha) * t)
+        return last_h
+
+    def open_trunk_segment_pressure_profile(self, segment_index: Optional[int] = None) -> None:
+        """Графік напору H(s) вздовж полілінії: HW по секціях телескопа з trunk_tree, s — відстань по трасі."""
+        if segment_index is None:
+            si = self._selected_trunk_segment_index()
+        else:
+            try:
+                si = int(segment_index)
+            except (TypeError, ValueError):
+                si = None
+        if si is None:
+            silent_showwarning(
+                self.root,
+                "Напір вздовж ребра",
+                "Спочатку виділіть відрізок магістралі (інструмент «Вибір») або відкрийте меню з ребра.",
+            )
+            return
+        segs = list(getattr(self, "trunk_map_segments", []) or [])
+        if not (0 <= si < len(segs)):
+            silent_showwarning(self.root, "Напір вздовж ребра", "Відрізок не знайдено.")
+            return
+        seg = segs[si] if isinstance(segs[si], dict) else {}
+        path = self._trunk_segment_world_path(seg)
+        if len(path) < 2:
+            silent_showwarning(self.root, "Напір вздовж ребра", "Некоректна геометрія відрізка.")
+            return
+        total_len = float(self._polyline_length_m(path))
+        if total_len <= 1e-6:
+            silent_showwarning(self.root, "Напір вздовж ребра", "Довжина відрізка ≈ 0 м.")
+            return
+        h = getattr(self, "trunk_irrigation_hydro_cache", None)
+        if not isinstance(h, dict) or not DripCAD._trunk_irrigation_hydro_dict_has_results(h):
+            silent_showwarning(
+                self.root,
+                "Напір вздовж ребра",
+                "Немає даних гідравліки магістралі. Виконайте «Магістраль за поливами» (розклад HW).",
+            )
+            return
+        dom_slot = self._trunk_segment_dominant_slot_for_pressure(si, h)
+        if dom_slot is None:
+            silent_showwarning(
+                self.root,
+                "Напір вздовж ребра",
+                "Не вдалося визначити слот поливу для цього відрізка.",
+            )
+            return
+        ps = h.get("per_slot")
+        if not isinstance(ps, dict):
+            silent_showwarning(self.root, "Напір вздовж ребра", "Кеш per_slot відсутній.")
+            return
+        slot_row = ps.get(str(dom_slot))
+        if not isinstance(slot_row, dict):
+            slot_row = ps.get(int(dom_slot))  # type: ignore[arg-type]
+        if not isinstance(slot_row, dict):
+            silent_showwarning(self.root, "Напір вздовж ребра", f"Немає даних для слота {dom_slot + 1}.")
+            return
+        nodes = list(getattr(self, "trunk_map_nodes", []) or [])
+        heads = self._trunk_segment_pressure_heads_polyline_order_m(seg, slot_row, nodes)
+        if heads is None:
+            silent_showwarning(
+                self.root,
+                "Напір вздовж ребра",
+                "У кеші немає edge_h / node_head_m для цього відрізка і слота.",
+            )
+            return
+        h0, h1 = float(heads[0]), float(heads[1])
+        profile_pieces = self._trunk_hw_pressure_pieces_along_polyline(seg, path, slot_row, nodes)
+        use_hw_telescope = profile_pieces is not None
+        if not use_hw_telescope:
+            profile_pieces = [(0.0, total_len, h0, h1)]
+        step_m = max(1.5, min(20.0, total_len / 100.0))
+        sample_n = max(32, int(math.ceil(total_len / step_m)))
+        cand: List[float] = [total_len * float(i) / float(sample_n) for i in range(sample_n + 1)]
+        for s0, s1, _, _ in profile_pieces:
+            cand.extend([float(s0), float(s1)])
+        d_vals = sorted({max(0.0, min(total_len, float(x))) for x in cand})
+        head_vals = [DripCAD._trunk_head_at_s_on_pieces(d, profile_pieces) for d in d_vals]
+        h_min = min(head_vals)
+        h_max = max(head_vals)
+        if abs(h_max - h_min) < 1e-4:
+            h_max = h_min + 1.0
+        h_mid = 0.5 * (h_min + h_max)
+        h_span = max(1e-6, h_max - h_min)
+
+        win = tk.Toplevel(self.root)
+        win.title(f"Напір вздовж ребра · відрізок #{si + 1} · полив #{int(dom_slot) + 1}")
+        win.transient(self.root)
+        win.configure(bg="#1e1e1e")
+        win.geometry("900x480")
+
+        top = tk.Frame(win, bg="#1e1e1e")
+        top.pack(fill=tk.X, padx=8, pady=(8, 0))
+        tk.Label(top, text="Вертикальний масштаб (H)", bg="#1e1e1e", fg="#CFD8DC").pack(side=tk.LEFT)
+        v_default = getattr(self, "_trunk_pressure_profile_vscale", 1.0)
+        try:
+            v_default_f = float(v_default)
+        except (TypeError, ValueError):
+            v_default_f = 1.0
+        v_default_f = max(0.05, min(20.0, v_default_f))
+        var_vscale = tk.StringVar(value=str(v_default_f).rstrip("0").rstrip("."))
+        ent_vscale = ttk.Entry(top, textvariable=var_vscale, width=8)
+        ent_vscale.pack(side=tk.LEFT, padx=(8, 6))
+        tk.Label(top, text="(1 = без стискання по H)", bg="#1e1e1e", fg="#90A4AE").pack(side=tk.LEFT)
+
+        cv = tk.Canvas(win, bg="#101216", highlightthickness=0)
+        cv.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+        state: Dict[str, Optional[float]] = {"d": None}
+        geom: Dict[str, float] = {"ml": 56.0, "pw": 1.0, "mt": 18.0, "ph": 1.0, "y0": 1.0}
+
+        def _current_vscale() -> float:
+            raw = str(var_vscale.get()).replace(",", ".").strip()
+            try:
+                v = float(raw)
+            except (TypeError, ValueError):
+                v = 1.0
+            return max(0.05, min(20.0, v))
+
+        def _draw_chart(_event=None) -> None:
+            try:
+                w = max(320, int(cv.winfo_width()))
+                hcv = max(220, int(cv.winfo_height()))
+            except tk.TclError:
+                return
+            try:
+                cv.delete("trunk_seg_pressure")
+            except tk.TclError:
+                pass
+            _tsp = "trunk_seg_pressure"
+            ml, mr, mt, mb = 56, 20, 18, 44
+            pw = max(10, w - ml - mr)
+            ph = max(10, hcv - mt - mb)
+            y0 = mt + ph
+            geom.update({"ml": float(ml), "pw": float(pw), "mt": float(mt), "ph": float(ph), "y0": float(y0)})
+            cv.create_line(ml, mt, ml, y0, fill="#8FA4B8", width=2, tags=_tsp)
+            cv.create_line(ml, y0, ml + pw, y0, fill="#8FA4B8", width=2, tags=_tsp)
+
+            vscale = _current_vscale()
+            self._trunk_pressure_profile_vscale = vscale
+            h_span_draw = h_span / max(1e-6, vscale)
+
+            def sx(d: float) -> float:
+                return ml + (float(d) / total_len) * pw
+
+            def sy_head(hv: float) -> float:
+                top_h = h_mid + 0.5 * h_span_draw
+                return mt + (top_h - float(hv)) / h_span_draw * ph
+
+            pts: List[float] = []
+            for d, hv in zip(d_vals, head_vals):
+                pts.extend([sx(d), sy_head(hv)])
+            if len(pts) >= 4:
+                cv.create_line(*pts, fill="#A5D6A7", width=2, smooth=False, tags=_tsp)
+
+            for frac in (0.0, 0.5, 1.0):
+                d = total_len * frac
+                x = sx(d)
+                cv.create_line(x, y0, x, y0 + 4, fill="#8FA4B8", tags=_tsp)
+                cv.create_text(x, y0 + 8, text=f"{d:.0f} м", anchor=tk.N, fill="#B0BEC5", font=("Segoe UI", 8), tags=_tsp)
+            for frac in (0.0, 0.5, 1.0):
+                hh = h_min + (h_max - h_min) * frac
+                y = sy_head(hh)
+                cv.create_line(ml - 4, y, ml, y, fill="#8FA4B8", tags=_tsp)
+                cv.create_text(ml - 8, y, text=f"{hh:.1f}", anchor=tk.E, fill="#B0BEC5", font=("Segoe UI", 8), tags=_tsp)
+
+            d_probe = state.get("d")
+            if d_probe is not None:
+                dp = max(0.0, min(float(d_probe), total_len))
+                hp = float(DripCAD._trunk_head_at_s_on_pieces(dp, profile_pieces))
+                xp = sx(dp)
+                yp = sy_head(hp)
+                ah = 7.0
+                aw = 10.0
+                y_top = float(mt) + ah
+                y_bot = float(y0) - ah
+                if y_bot > y_top + 4.0:
+                    cv.create_line(xp, y_top, xp, y_bot, fill="#FFEB3B", width=2, tags=_tsp)
+                cv.create_polygon(
+                    xp,
+                    mt,
+                    xp - aw * 0.5,
+                    mt + ah,
+                    xp + aw * 0.5,
+                    mt + ah,
+                    fill="#FFEB3B",
+                    outline="#F57F17",
+                    width=1,
+                    tags=_tsp,
+                )
+                cv.create_polygon(
+                    xp,
+                    y0,
+                    xp - aw * 0.5,
+                    y0 - ah,
+                    xp + aw * 0.5,
+                    y0 - ah,
+                    fill="#FFEB3B",
+                    outline="#F57F17",
+                    width=1,
+                    tags=_tsp,
+                )
+                cv.create_line(xp, yp, xp, y0, fill="#FFF59D", dash=(3, 3), width=1, tags=_tsp)
+                cv.create_polygon(
+                    xp,
+                    yp - 6,
+                    xp - 6,
+                    yp + 4,
+                    xp + 6,
+                    yp + 4,
+                    fill="#FFEE58",
+                    outline="#F9A825",
+                    width=2,
+                    tags=_tsp,
+                )
+                cv.create_text(
+                    min(xp + 10.0, ml + pw - 4.0),
+                    mt + 8,
+                    text=f"s={dp:.1f} м, H≈{hp:.2f} м вод. ст.",
+                    anchor=tk.NW,
+                    fill="#FFFDE7",
+                    font=("Segoe UI", 8, "bold"),
+                    tags=_tsp,
+                )
+
+            cv.create_text(
+                ml + pw / 2,
+                hcv - 18,
+                text=(
+                    f"L={total_len:.1f} м · H(поч. траси)={h0:.2f} · H(кін. траси)={h1:.2f} м вод. ст. · "
+                    f"масштаб H: ×{vscale:.3g} · ΔH по трасі={abs(h1 - h0):.3f} м"
+                ),
+                anchor=tk.CENTER,
+                fill="#CFD8DC",
+                font=("Segoe UI", 9, "bold"),
+                tags=_tsp,
+            )
+            sub = (
+                "s — відстань по полілінії від першого вузла відрізка; H — HW по секціях телескопа з trunk_tree "
+                "(узгоджено з compute_trunk_tree_steady), кути на стиках секцій."
+                if use_hw_telescope
+                else "s — відстань по трасі; H — лінійно між напорами кінцевих вузлів (немає секцій у trunk_tree для цього ребра)."
+            )
+            cv.create_text(
+                ml + pw / 2,
+                mt - 2,
+                text=sub,
+                anchor=tk.S,
+                fill="#A5D6A7",
+                font=("Segoe UI", 8),
+                tags=_tsp,
+            )
+
+        def _on_motion(ev: tk.Event) -> None:
+            ml = float(geom["ml"])
+            pw = float(geom["pw"])
+            xm = max(ml, min(ml + pw, float(ev.x)))
+            d = ((xm - ml) / max(1e-6, pw)) * total_len
+            state["d"] = max(0.0, min(float(d), total_len))
+            try:
+                px, py = self._polyline_point_at_dist(path, float(state["d"]))
+                self._set_trunk_profile_probe(px, py, int(si))
+            except Exception:
+                pass
+            _draw_chart()
+
+        def _on_leave(_ev=None) -> None:
+            state["d"] = None
+            self._set_trunk_profile_probe(None, None, None)
+            _draw_chart()
+
+        def _apply_vscale(_ev=None) -> None:
+            v = _current_vscale()
+            var_vscale.set(str(v).rstrip("0").rstrip("."))
+            _draw_chart()
+
+        def _on_close() -> None:
+            self._set_trunk_profile_probe(None, None, None)
+            try:
+                win.destroy()
+            except tk.TclError:
+                pass
+
+        ent_vscale.bind("<Return>", _apply_vscale, add="+")
+        cv.bind("<Configure>", _draw_chart, add="+")
+        cv.bind("<Motion>", _on_motion, add="+")
+        cv.bind("<Enter>", _on_motion, add="+")
+        cv.bind("<Leave>", _on_leave, add="+")
+        win.protocol("WM_DELETE_WINDOW", _on_close)
+        _draw_chart()
+
     def _distance_point_to_polyline_m(self, wx: float, wy: float, pts: list) -> float:
         if len(pts) < 2:
             return 1e18
@@ -1455,12 +3670,11 @@ class DripCAD:
     def _resolve_trunk_node_vs_segment_pick(
         node_hits: List[Tuple[int, float, str, object, str]],
         seg_hits: List[Tuple[int, float, str, object, str]],
-        ambiguous_radius_m: float,
+        _ambiguous_radius_m: float,
     ) -> Optional[Tuple[int, float, str, object, str]]:
         """
-        Одне попадання по магістралі: за замовчуванням — ближчий об'єкт (вузол або ребро).
-        Якщо одночасно «під курсором» (обидва в межах ambiguous_radius_m) — вузол
-        (для розкладу включень споживачів); інакше перемагає менша відстань.
+        Одне попадання по магістралі: завжди об'єкт із меншою відстанню до курсора (вузол або ребро).
+        Раніше в «сірій зоні» біля вузла завжди вигравав вузол — через це не можна було вибрати суміжне ребро.
         """
         best_n = min(node_hits, key=lambda h: h[1]) if node_hits else None
         best_s = min(seg_hits, key=lambda h: h[1]) if seg_hits else None
@@ -1469,9 +3683,6 @@ class DripCAD:
         if best_s is None:
             return best_n
         dn, ds = float(best_n[1]), float(best_s[1])
-        amb = max(1e-6, float(ambiguous_radius_m))
-        if dn <= amb and ds <= amb:
-            return best_n
         return best_n if dn <= ds else best_s
 
     def _collect_world_pick_hits(self, wx: float, wy: float) -> List[Tuple[int, float, str, object, str]]:
@@ -1499,12 +3710,17 @@ class DripCAD:
             nid = str(node.get("id", "")).strip() or f"T{i}"
             if kind == "source":
                 lab = f"Насос (витік), {nid}"
+                if hasattr(self, "trunk_irrigation_hydro_pump_qp_hover_lines"):
+                    qp = self.trunk_irrigation_hydro_pump_qp_hover_lines()
+                    if qp:
+                        lab = f"{lab}\n{qp[0]}\n{qp[1]}"
             elif kind == "bend":
                 lab = f"Пікет, {nid}"
             elif kind == "junction":
                 lab = f"Розгалуження (сумматор), {nid}"
             elif kind in ("consumption", "valve"):
-                lab = f"Споживач (сток), {nid}"
+                role = "кінцевий" if self._trunk_consumption_is_terminal(i) else "проміжний"
+                lab = f"Споживач ({role}), {nid}"
             else:
                 lab = f"Вузол магістралі, {nid}"
             d = math.hypot(wx - nx, wy - ny)
@@ -1515,7 +3731,9 @@ class DripCAD:
             for vx, vy in self.get_valves():
                 d = math.hypot(wx - float(vx), wy - float(vy))
                 if d <= tol_valve:
-                    hits.append((1, d, "field_valve", None, "Кран (початок відрізка сабмейну)"))
+                    hits.append(
+                        (1, d, "field_valve", (float(vx), float(vy)), "Кран (початок відрізка сабмейну)")
+                    )
         except Exception:
             pass
 
@@ -1558,18 +3776,28 @@ class DripCAD:
 
         lat_thresh = 15.0 / max(self.zoom, 0.01)
         for bi, b in enumerate(getattr(self, "field_blocks", []) or []):
-            for lat in b.get("auto_laterals") or []:
+            for li, lat in enumerate(b.get("auto_laterals") or []):
                 try:
                     d = lat.distance(p_mouse)
                     if d < lat_thresh:
-                        hits.append((5, d, "lateral", bi, f"Латераль (авто) · блок {bi + 1}"))
+                        hits.append(
+                            (5, d, "lateral", ("auto", bi, li), f"Латераль (авто) · блок {bi + 1} · #{li + 1}")
+                        )
                 except Exception:
                     pass
-            for lat in b.get("manual_laterals") or []:
+            for li, lat in enumerate(b.get("manual_laterals") or []):
                 try:
                     d = lat.distance(p_mouse)
                     if d < lat_thresh:
-                        hits.append((5, d, "lateral", bi, f"Латераль (ручний) · блок {bi + 1}"))
+                        hits.append(
+                            (
+                                5,
+                                d,
+                                "lateral",
+                                ("manual", bi, li),
+                                f"Латераль (ручний) · блок {bi + 1} · #{li + 1}",
+                            )
+                        )
                 except Exception:
                     pass
 
@@ -1590,6 +3818,11 @@ class DripCAD:
             seg_hits = [h for h in trunk_hits if h[2] == "trunk_seg"]
             amb_m = max(0.6, self._world_m_from_screen_px(14.0))
             best_trunk = self._resolve_trunk_node_vs_segment_pick(node_hits, seg_hits, amb_m)
+            if self._trunk_interaction_priority_active():
+                hits = ([best_trunk] if best_trunk is not None else []) + sorted(
+                    other_hits, key=lambda t: (t[1], t[0])
+                )
+                return hits
             hits = ([best_trunk] if best_trunk is not None else []) + other_hits
         hits.sort(key=lambda t: (t[1], t[0]))
         return hits
@@ -1617,6 +3850,105 @@ class DripCAD:
         if src is None:
             return None
         return {"parent": parent, "children": children, "source": src, "nodes": nodes}
+
+    def _trunk_segment_pipe_color_from_db(self, seg: dict) -> Optional[str]:
+        """Колір лінії з pipes_db за mat/PN/Ø на сегменті (як секції сабмейну)."""
+        if not isinstance(seg, dict):
+            return None
+        m = str(seg.get("pipe_material", "")).strip()
+        p = str(seg.get("pipe_pn", "")).strip()
+        o = str(seg.get("pipe_od", "")).strip()
+        if not (m and p and o):
+            return None
+        return self._pipe_color_from_db(m, p, o)
+
+    def _trunk_segment_pipe_color_from_catalog_inner(self, d_inner_mm: float) -> Optional[str]:
+        """Колір з каталогу за d_inner (дозволені труби магістралі), якщо mat/PN/Ø на ребрі не задані."""
+        try:
+            d_tgt = float(d_inner_mm)
+        except (TypeError, ValueError):
+            return None
+        if d_tgt <= 1e-6:
+            return None
+        eff = normalize_allowed_pipes_map(
+            getattr(self, "trunk_allowed_pipes", None) or getattr(self, "allowed_pipes", {}) or {}
+        )
+        db = getattr(self, "pipe_db", None) or {}
+        cands = allowed_pipe_candidates_sorted(eff, db)
+        best_d = 1e18
+        best: Optional[dict] = None
+        for c in cands:
+            diff = abs(float(c["inner"]) - d_tgt)
+            if diff < best_d:
+                best_d = diff
+                best = c
+        if best is None:
+            return None
+        return self._pipe_color_from_db(best["mat"], best["pn"], best["d"])
+
+    def _trunk_topology_dominant_slot_for_segment(self, seg_index: int) -> Optional[int]:
+        """
+        Домінантний полив (індекс слота 0..47) лише за топологією дерева та списками слотів,
+        без гідравлічного кешу: скільки споживачів слота в піддереві «нижче» за це ребро.
+        """
+        topo = self._trunk_topology_oriented()
+        if topo is None:
+            return None
+        self.normalize_consumer_schedule()
+        slots = self.consumer_schedule.get("irrigation_slots") or []
+        if not any(isinstance(s, list) and s for s in slots[:48]):
+            return None
+        segs = list(getattr(self, "trunk_map_segments", []) or [])
+        if seg_index < 0 or seg_index >= len(segs):
+            return None
+        seg = segs[seg_index]
+        if not isinstance(seg, dict):
+            return None
+        ni = seg.get("node_indices")
+        if not isinstance(ni, list) or len(ni) != 2:
+            return None
+        try:
+            a, b = int(ni[0]), int(ni[1])
+        except (TypeError, ValueError):
+            return None
+        parent = topo["parent"]
+        n = len(parent)
+        if not (0 <= a < n and 0 <= b < n):
+            return None
+        downstream: Optional[int] = None
+        if parent[a] == b:
+            downstream = a
+        elif parent[b] == a:
+            downstream = b
+        if downstream is None:
+            return None
+        desc_idx = set(self._trunk_consumption_descendants(topo, downstream))
+        if not desc_idx:
+            return None
+        nodes = topo["nodes"]
+        id_to_idx: Dict[str, int] = {}
+        for i, node in enumerate(nodes):
+            nid = str(node.get("id", "")).strip()
+            if nid:
+                id_to_idx[nid] = i
+        best_key: Optional[Tuple[int, int]] = None
+        for sidx in range(min(48, len(slots))):
+            row = slots[sidx] if isinstance(slots[sidx], list) else []
+            if not row:
+                continue
+            cnt = 0
+            for x in row:
+                j = id_to_idx.get(str(x).strip())
+                if j is not None and j in desc_idx:
+                    cnt += 1
+            if cnt <= 0:
+                continue
+            key = (-cnt, sidx)
+            if best_key is None or key < best_key:
+                best_key = key
+        if best_key is None:
+            return None
+        return int(best_key[1])
 
     def _trunk_edge_undirected_to_segment_index(self) -> dict:
         out: dict = {}
@@ -1802,6 +4134,138 @@ class DripCAD:
             return None
         return str(hits[0][4])
 
+    def _destroy_select_hover_pick_ui(self) -> None:
+        """Скасувати таймер і закрити меню вибору об'єктів (режим «Вибір»)."""
+        aid = getattr(self, "_select_hover_menu_after_id", None)
+        if aid is not None:
+            try:
+                self.root.after_cancel(aid)
+            except Exception:
+                pass
+            self._select_hover_menu_after_id = None
+        mp = getattr(self, "_select_hover_menu_popup", None)
+        if mp is not None:
+            try:
+                mp.unpost()
+            except Exception:
+                pass
+            self._select_hover_menu_popup = None
+        self._select_hover_pick_canvas_xy = None
+        self._select_hover_pick_screen_xy = None
+
+    def _schedule_select_hover_pick_after_motion(self, event) -> None:
+        """Пауза ~1 с без руху ЛКМ — показати список усіх кандидатів під курсором; рух — скинути й почати знову."""
+        if getattr(self, "_canvas_special_tool", None) != "select":
+            self._destroy_select_hover_pick_ui()
+            return
+        if event.state & 0x0100:
+            self._destroy_select_hover_pick_ui()
+            return
+        if getattr(self, "_select_marquee_active", False) and getattr(
+            self, "_select_marquee_dragged", False
+        ):
+            self._destroy_select_hover_pick_ui()
+            return
+        aid = getattr(self, "_select_hover_menu_after_id", None)
+        if aid is not None:
+            try:
+                self.root.after_cancel(aid)
+            except Exception:
+                pass
+            self._select_hover_menu_after_id = None
+        mp = getattr(self, "_select_hover_menu_popup", None)
+        if mp is not None:
+            try:
+                mp.unpost()
+            except Exception:
+                pass
+            self._select_hover_menu_popup = None
+
+        try:
+            self._select_hover_pick_canvas_xy = (int(event.x), int(event.y))
+            self._select_hover_pick_screen_xy = (int(event.x_root), int(event.y_root))
+        except (tk.TclError, TypeError, ValueError):
+            self._select_hover_pick_canvas_xy = None
+            self._select_hover_pick_screen_xy = None
+
+        def _tick() -> None:
+            self._select_hover_menu_after_id = None
+            self._show_select_hover_pick_popup()
+
+        self._select_hover_menu_after_id = self.root.after(1000, _tick)
+
+    def _show_select_hover_pick_popup(self) -> None:
+        if getattr(self, "_canvas_special_tool", None) != "select":
+            return
+        if getattr(self, "_select_marquee_active", False):
+            return
+        try:
+            if not self.canvas.winfo_exists():
+                return
+        except tk.TclError:
+            return
+        cxy = getattr(self, "_select_hover_pick_canvas_xy", None)
+        if not (isinstance(cxy, (list, tuple)) and len(cxy) >= 2):
+            return
+        px, py = int(cxy[0]), int(cxy[1])
+        try:
+            cw = int(self.canvas.winfo_width())
+            ch = int(self.canvas.winfo_height())
+        except tk.TclError:
+            return
+        if px < 0 or py < 0 or px >= cw or py >= ch:
+            return
+        wx, wy = self.to_world(float(px), float(py))
+        hits = self._collect_world_pick_hits(wx, wy)
+        if len(hits) < 2:
+            return
+
+        rows: List[Tuple[str, object, str]] = []
+        seen: Set[Tuple[str, str]] = set()
+        for _pr, _d, cat, payload, lab in hits:
+            try:
+                key = (cat, repr(payload))
+            except Exception:
+                key = (cat, str(payload))
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append((cat, payload, str(lab)))
+
+        if len(rows) < 2:
+            return
+
+        sxy = getattr(self, "_select_hover_pick_screen_xy", None)
+        if not (isinstance(sxy, (list, tuple)) and len(sxy) >= 2):
+            return
+        rx, ry = int(sxy[0]), int(sxy[1])
+
+        m = tk.Menu(self.root, tearoff=0)
+        self._select_hover_menu_popup = m
+        for i, (_c, _p, lab) in enumerate(rows):
+            line = str(lab).replace("\n", " · ")
+            if len(line) > 72:
+                line = line[:69] + "…"
+            m.add_command(
+                label=line,
+                command=lambda idx=i: self._apply_hover_pick_row(rows[idx]),
+            )
+
+        try:
+            m.tk_popup(rx, ry)
+        finally:
+            try:
+                m.grab_release()
+            except Exception:
+                pass
+            self._select_hover_menu_popup = None
+
+    def _apply_hover_pick_row(self, row: Tuple[str, object, str]) -> None:
+        cat, payload, lab = row[0], row[1], row[2]
+        self._canvas_selection_keys = [(cat, payload, str(lab))]
+        self._destroy_select_hover_pick_ui()
+        self.redraw()
+
     @staticmethod
     def _world_rect_normalize(
         x0: float, y0: float, x1: float, y1: float
@@ -1879,7 +4343,12 @@ class DripCAD:
         for si, seg in enumerate(getattr(self, "trunk_map_segments", []) or []):
             pl = self._trunk_segment_world_path(seg)
             if line_ok(pl):
-                add("trunk_seg", si, f"Магістраль, відрізок {si + 1}")
+                lab = (
+                    self.trunk_segment_display_caption(si)
+                    if hasattr(self, "trunk_segment_display_caption")
+                    else f"Магістраль, відрізок {si + 1}"
+                )
+                add("trunk_seg", si, lab)
 
         for bi, b in enumerate(getattr(self, "field_blocks", []) or []):
             for sm_i, sm in enumerate(list(b.get("submain_lines") or [])):
@@ -2160,19 +4629,43 @@ class DripCAD:
         idx = int(self.view_notebook.index("current"))
         is_map = idx == 1
         if is_map:
+            self._destroy_select_hover_pick_ui()
             self._canvas_special_tool = None
             self._canvas_trunk_draft_world = None
             self._canvas_polyline_draft = []
             self._canvas_trunk_route_draft_indices = []
+            self._trunk_route_endpoint_pending_idx = None
+            self._trunk_route_edge_end_idx = None
             if not self._ensure_embedded_map_panel():
                 self.view_notebook.select(0)
                 return
             self.lbl_view_mode.config(text="Режим: Карта")
             self.lbl_map_mode_hint.config(text="Карта: взаємодія з реальною місцевістю", fg="#88dd88")
             self._refresh_canvas_cursor_for_special_tool()
-        else:
             if getattr(self, "_embedded_map_ready", False):
                 host = getattr(self, "_embedded_map_host", None)
+                res = getattr(host, "_resume_background_jobs", None) if host is not None else None
+                if callable(res):
+                    try:
+                        res()
+                    except Exception:
+                        pass
+        else:
+            pending = getattr(self, "_map_overlay_refresh_after_id", None)
+            if pending is not None:
+                try:
+                    self.root.after_cancel(pending)
+                except Exception:
+                    pass
+                self._map_overlay_refresh_after_id = None
+            if getattr(self, "_embedded_map_ready", False):
+                host = getattr(self, "_embedded_map_host", None)
+                susp = getattr(host, "_suspend_background_jobs", None) if host is not None else None
+                if callable(susp):
+                    try:
+                        susp()
+                    except Exception:
+                        pass
                 fn = getattr(host, "_set_map_tool", None) if host is not None else None
                 if callable(fn):
                     try:
@@ -2339,7 +4832,10 @@ class DripCAD:
                 return
 
             zone_ring = None
-            if getattr(self.topo, "srtm_boundary_pts_local", None) and len(self.topo.srtm_boundary_pts_local) >= 3:
+            pz_disp = self.project_zone_display_ring_local()
+            if pz_disp and len(pz_disp) >= 3:
+                zone_ring = list(pz_disp)
+            elif getattr(self.topo, "srtm_boundary_pts_local", None) and len(self.topo.srtm_boundary_pts_local) >= 3:
                 zone_ring = list(self.topo.srtm_boundary_pts_local)
             else:
                 u = self.field_union_polygon()
@@ -2348,7 +4844,7 @@ class DripCAD:
                     zone_ring = [(minx, miny), (minx, maxy), (maxx, maxy), (maxx, miny)]
 
             if not zone_ring:
-                lbl.config(text="SRTM-модель: немає зони проєкту", fg="#AAAAAA")
+                lbl.config(text="SRTM-модель: немає зони (майданчик / KML / поле)", fg="#AAAAAA")
                 return
 
             from modules.geo_module import srtm_tiles
@@ -2673,11 +5169,11 @@ class DripCAD:
             wc = foc.winfo_class()
             if wc in ("Entry", "Text", "TEntry"):
                 return
-        has_trunk_pick = any(
-            c in ("trunk_node", "trunk_seg")
-            for c, _, _ in (getattr(self, "_canvas_selection_keys", []) or [])
-        )
-        if has_trunk_pick or foc == self.canvas:
+        keys_list = list(getattr(self, "_canvas_selection_keys", []) or [])
+        has_trunk_graph_pick = any(c in ("trunk_node", "trunk_seg") for c, _, _ in keys_list)
+        has_scene_line_pick = any(c == "scene_line" for c, _, _ in keys_list)
+        # Вузли/ребра магістралі — лише через ПКМ-меню; Delete/Backspace не чіпають граф.
+        if has_scene_line_pick:
             if self._delete_selected_trunk_map_elements() > 0:
                 self.notify_irrigation_schedule_ui()
                 self.redraw()
@@ -2687,6 +5183,8 @@ class DripCAD:
                     pass
                 return "break"
         if foc == self.canvas:
+            if has_trunk_graph_pick:
+                return "break"
             self.clear_all_field_blocks()
             return "break"
 
@@ -2720,6 +5218,10 @@ class DripCAD:
             return True
         if len(getattr(self, "_canvas_trunk_route_draft_indices", []) or []) > 0:
             return True
+        if getattr(self, "_trunk_route_endpoint_pending_idx", None) is not None:
+            return True
+        if getattr(self, "_trunk_route_edge_end_idx", None) is not None:
+            return True
         return False
 
     def cancel_active_draft(self, event=None) -> bool:
@@ -2733,6 +5235,8 @@ class DripCAD:
             self._canvas_trunk_draft_world = None
             self._canvas_polyline_draft = []
             self._canvas_trunk_route_draft_indices = []
+            self._trunk_route_endpoint_pending_idx = None
+            self._trunk_route_edge_end_idx = None
             if getattr(self, "_canvas_special_tool", None) in _CANVAS_TRUNK_POINT_TOOLS:
                 self._canvas_special_tool = None
                 self._refresh_canvas_cursor_for_special_tool()
@@ -2769,6 +5273,9 @@ class DripCAD:
             wc = foc.winfo_class()
             if wc in ("Entry", "TEntry", "Text"):
                 return
+        if getattr(self, "_select_hover_menu_popup", None) is not None:
+            self._destroy_select_hover_pick_ui()
+            return "break"
         if self.cancel_active_draft():
             return "break"
 
@@ -2796,16 +5303,51 @@ class DripCAD:
         except Exception:
             return polys[0]
 
-    def contour_clip_geometry(self):
-        """
-        Полігон обрізки для ізоліній рельєфу та (разом із fetch) для завантаження DEM.
-        Пріоритет: 1) прямокутник зони проєкту з карти; 2) KML зони SRTM; 3) об’єднання блоків поля;
-        4) опукла оболонка за точками висоти.
-        """
+    def _project_zone_polygon_local(self) -> Optional[Polygon]:
+        """Майданчик проєкту (рамка на карті) — окремо від блоків поля та від KML-зони SRTM."""
+        ring = getattr(self, "project_zone_ring_local", None)
+        pts: List[Tuple[float, float]] = []
+        if isinstance(ring, (list, tuple)):
+            for p in ring:
+                if isinstance(p, (list, tuple)) and len(p) >= 2:
+                    try:
+                        pts.append((float(p[0]), float(p[1])))
+                    except (TypeError, ValueError):
+                        continue
+        if len(pts) >= 3:
+            try:
+                g = Polygon(pts)
+                return g.buffer(0) if not g.is_valid else g
+            except Exception:
+                pass
         if self.project_zone_bounds_local is not None:
             minx, miny, maxx, maxy = self.project_zone_bounds_local
             g = Polygon([(minx, miny), (maxx, miny), (maxx, maxy), (minx, maxy)])
             return g.buffer(0) if not g.is_valid else g
+        return None
+
+    def project_zone_display_ring_local(self) -> Optional[List[Tuple[float, float]]]:
+        """Кільце для оверлею/підбору (локальні м)."""
+        g = self._project_zone_polygon_local()
+        if g is None or g.is_empty:
+            return None
+        try:
+            c = list(g.exterior.coords)
+            if len(c) >= 4:
+                return [(float(x), float(y)) for x, y in c[:-1]]
+        except Exception:
+            pass
+        return None
+
+    def contour_clip_geometry(self):
+        """
+        Полігон обрізки для ізоліній рельєфу та (разом із fetch) для завантаження DEM.
+        Пріоритет: 1) зона проєкту (майданчик на карті); 2) KML зони SRTM; 3) об’єднання блоків поля;
+        4) опукла оболонка за точками висоти.
+        """
+        pz = self._project_zone_polygon_local()
+        if pz is not None and not pz.is_empty:
+            return pz
         # Ізолінії та рамка «зона рельєфу» — спочатку KML зони SRTM (як для тайлів), потім поле поливу
         if self.topo.srtm_boundary_pts_local and len(self.topo.srtm_boundary_pts_local) >= 3:
             g = Polygon(self.topo.srtm_boundary_pts_local)
@@ -2822,8 +5364,9 @@ class DripCAD:
         return None
 
     def field_download_bounds_xy(self):
-        if self.project_zone_bounds_local is not None:
-            return tuple(self.project_zone_bounds_local)
+        pz = self._project_zone_polygon_local()
+        if pz is not None and not pz.is_empty:
+            return tuple(pz.bounds)
         u = self.field_union_polygon()
         if u is not None and not u.is_empty:
             return tuple(u.bounds)
@@ -2857,7 +5400,7 @@ class DripCAD:
         xs = [p[0] for p in ring_local]
         ys = [p[1] for p in ring_local]
         self.project_zone_bounds_local = (min(xs), min(ys), max(xs), max(ys))
-        self.topo.srtm_boundary_pts_local = list(ring_local)
+        self.project_zone_ring_local = [(float(p[0]), float(p[1])) for p in ring_local]
         self.cached_contours = []
         if hasattr(self, "sync_srtm_model_status"):
             self.sync_srtm_model_status()
@@ -2912,14 +5455,24 @@ class DripCAD:
         return g
 
     def _lateral_grid_clip_polygon(self, block_poly: Polygon) -> Polygon:
-        """Обрізання ліній сітки: уся зона проєкту з карти, інакше — контур блоку."""
-        if self.project_zone_bounds_local is not None:
-            minx, miny, maxx, maxy = self.project_zone_bounds_local
-            g = Polygon([(minx, miny), (maxx, miny), (maxx, maxy), (minx, maxy)])
-            if not g.is_valid:
-                g = g.buffer(0)
-            return g
-        return block_poly
+        """Обрізання променів сітки: перетин контуру блоку з майданчиком проєкту (якщо задано), інакше блок."""
+        if block_poly.is_empty:
+            pz0 = self._project_zone_polygon_local()
+            return pz0 if pz0 is not None and not pz0.is_empty else Polygon()
+        pz = self._project_zone_polygon_local()
+        if pz is None or pz.is_empty:
+            return block_poly
+        try:
+            inter = pz.intersection(block_poly)
+            if inter.is_empty:
+                return block_poly
+            if inter.geom_type == "Polygon":
+                return inter
+            if inter.geom_type == "MultiPolygon":
+                return max(inter.geoms, key=lambda g: g.area)
+            return block_poly
+        except Exception:
+            return block_poly
 
     def _all_auto_laterals(self):
         return [lat for b in self.field_blocks for lat in b["auto_laterals"]]
@@ -3176,6 +5729,44 @@ class DripCAD:
             return False
         return abs(x) < 1e-12
 
+    def _ensure_emitter_kx_ready(self) -> bool:
+        """
+        Для некомпенсованого режиму вимагаємо явні k і x.
+        Якщо поля порожні/некоректні — показуємо беззвучне кастомне попередження і блокуємо розрахунок.
+        """
+        if self._emitter_compensated_effective():
+            return True
+        k_raw = (self.var_emit_k_coeff.get() or "").strip()
+        x_raw = (self.var_emit_x_exp.get() or "").strip()
+        if not k_raw or not x_raw:
+            silent_showwarning(
+                self.root,
+                "Потрібні параметри емітера",
+                "Для некомпенсованої крапельниці потрібно задати k і x.\n"
+                "Введіть їх на вкладці «Гідравліка» у полях «k / x», потім повторіть розрахунок.",
+            )
+            return False
+        try:
+            k = float(k_raw.replace(",", "."))
+            x = float(x_raw.replace(",", "."))
+        except (TypeError, ValueError):
+            silent_showwarning(
+                self.root,
+                "Потрібні параметри емітера",
+                "k і x мають бути числовими значеннями.\n"
+                "Перевірте поля «k / x» на вкладці «Гідравліка».",
+            )
+            return False
+        if (not math.isfinite(k)) or (not math.isfinite(x)) or k <= 0.0:
+            silent_showwarning(
+                self.root,
+                "Потрібні параметри емітера",
+                "Для некомпенсованого режиму задайте коректні значення:\n"
+                "k > 0, x — скінченне число (зазвичай 0 < x < 1).",
+            )
+            return False
+        return True
+
     def _lateral_connection_sm_index_and_chainage(self, lat: LineString):
         """Індекс сабмейну та s (м) узгоджено з розрахунком (як у lat_geom)."""
         sm_lines = self._hydraulic_submain_lines()
@@ -3241,6 +5832,28 @@ class DripCAD:
             except (ValueError, TypeError):
                 out_f.append(ef0)
         return out_s, out_f
+
+    def _per_lateral_inner_d_mm(self):
+        """Внутрішній Ø латераля по блоках (мм); порядок як у _flatten_all_lats / lateral_block_idx."""
+        try:
+            d0 = float(str(self.var_lat_inner_d_mm.get()).replace(",", ".").strip())
+        except (TypeError, ValueError):
+            d0 = 13.6
+        d0 = max(0.5, min(200.0, d0))
+        out: List[float] = []
+        for bi in self._lateral_block_indices():
+            blk = self.field_blocks[bi] if 0 <= bi < len(self.field_blocks) else {}
+            p = blk.get("params") or {}
+            raw = p.get("lateral_inner_d_mm")
+            if raw is None or (isinstance(raw, str) and not str(raw).strip()):
+                out.append(d0)
+                continue
+            try:
+                dv = float(str(raw).replace(",", ".").strip())
+            except (TypeError, ValueError):
+                dv = d0
+            out.append(max(0.5, min(200.0, dv)))
+        return out
 
     def _submain_segment_lines(self, block):
         """Окремі відрізки сабмейну в блоці; початок відрізка = перша точка полілінії (кран для цього шматка)."""
@@ -4072,9 +6685,16 @@ class DripCAD:
             return None
         ckey = self._pressure_zone_geom_cache_key(bun)
         if ckey is not None:
-            cache = getattr(self, "_pressure_zone_geom_cache", None) or {}
+            cache = getattr(self, "_pressure_zone_geom_cache", None)
+            if not isinstance(cache, OrderedDict):
+                cache = OrderedDict()
+                self._pressure_zone_geom_cache = cache
             hit = cache.get(ckey)
             if hit is not None and not hit.is_empty:
+                try:
+                    cache.move_to_end(ckey)
+                except Exception:
+                    pass
                 return hit
         pts = [(float(it["wx"]), float(it["wy"])) for it in items]
         block_poly = self._block_poly(self.field_blocks[bi])
@@ -4136,11 +6756,12 @@ class DripCAD:
             return None
         if ckey is not None:
             cache = getattr(self, "_pressure_zone_geom_cache", None)
-            if cache is None or not isinstance(cache, dict):
-                cache = {}
-            if len(cache) > 16:
-                cache.clear()
+            if not isinstance(cache, OrderedDict):
+                cache = OrderedDict()
             cache[ckey] = clipped
+            cache.move_to_end(ckey)
+            while len(cache) > 16:
+                cache.popitem(last=False)
             self._pressure_zone_geom_cache = cache
         return clipped
 
@@ -4279,6 +6900,9 @@ class DripCAD:
         self._moving_section_label_sub_idx = None
         self._moving_section_label_sm_idx = None
         self._moving_section_label_preview = None
+        self._moving_trunk_tel_seg_idx = None
+        self._moving_trunk_tel_chunk_idx = None
+        self._moving_trunk_tel_preview = None
         self.sync_hydro_pipe_summary()
         self.redraw()
 
@@ -4359,16 +6983,25 @@ class DripCAD:
                 dz = float(row.get("dz_m", 0.0))
             except Exception:
                 dz = 0.0
-            edges.append(
-                {
-                    "parent_id": pid,
-                    "child_id": cid,
-                    "length_m": lm,
-                    "d_inner_mm": dmm,
-                    "c_hw": chw,
-                    "dz_m": dz,
-                }
-            )
+            edge_row = {
+                "parent_id": pid,
+                "child_id": cid,
+                "length_m": lm,
+                "d_inner_mm": dmm,
+                "c_hw": chw,
+                "dz_m": dz,
+            }
+            secs = row.get("sections")
+            if not isinstance(secs, list) or len(secs) == 0:
+                alt = row.get("telescoped_sections")
+                if isinstance(alt, list) and len(alt) > 0:
+                    secs = alt
+                elif not isinstance(secs, list):
+                    secs = []
+            if isinstance(secs, list) and len(secs) > 0:
+                edge_row["sections"] = secs
+                edge_row["telescoped_sections"] = secs
+            edges.append(edge_row)
         if not nodes:
             return self._default_trunk_tree_payload()
         return {
@@ -4377,6 +7010,69 @@ class DripCAD:
             "nodes": nodes,
             "edges": edges,
         }
+
+    @staticmethod
+    def _trunk_non_empty_section_list_from_seg(seg: Any) -> List[Any]:
+        """Секції телескопа з сегмента карти: спершу telescoped_sections, інакше непорожній sections."""
+        if not isinstance(seg, dict):
+            return []
+        for key in ("telescoped_sections", "sections"):
+            v = seg.get(key)
+            if isinstance(v, list) and len(v) > 0:
+                return list(v)
+        return []
+
+    @staticmethod
+    def _rescale_trunk_telescope_sections_for_length(secs: Sequence[Any], new_total_m: float) -> List[dict]:
+        """
+        Масштабує length_m (і пропорційно head_loss_m / weight_kg / objective_cost) під нову сумарну довжину ребра.
+        Використовується при sync карти → дерево, коли на сегменті ще немає списку секцій, а в дереві він був.
+        """
+        rows: List[dict] = []
+        s_old = 0.0
+        for sec in secs:
+            if not isinstance(sec, dict):
+                continue
+            try:
+                lm = float(sec.get("length_m", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                continue
+            if lm <= 1e-12:
+                continue
+            s_old += lm
+            rows.append(copy.deepcopy(sec))
+        if not rows or s_old <= 1e-12 or float(new_total_m) <= 1e-12:
+            return []
+        if abs(s_old - float(new_total_m)) < 1e-6:
+            return rows
+        scale = float(new_total_m) / s_old
+        scaled_lens: List[float] = []
+        for r in rows[:-1]:
+            try:
+                lm0 = float(r.get("length_m", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                lm0 = 0.0
+            scaled_lens.append(max(0.0, lm0 * scale))
+        last = max(0.0, float(new_total_m) - sum(scaled_lens))
+        scaled_lens.append(last)
+        out: List[dict] = []
+        for r, ln in zip(rows, scaled_lens):
+            try:
+                lm0 = float(r.get("length_m", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                lm0 = 0.0
+            rr = dict(r)
+            rr["length_m"] = float(ln)
+            if lm0 > 1e-12:
+                ratio = float(ln) / lm0
+                for fld in ("head_loss_m", "weight_kg", "objective_cost"):
+                    try:
+                        v0 = float(rr.get(fld, 0.0) or 0.0)
+                        rr[fld] = float(v0 * ratio)
+                    except (TypeError, ValueError):
+                        pass
+            out.append(rr)
+        return out
 
     def sync_trunk_tree_data_from_trunk_map(self) -> bool:
         """
@@ -4413,8 +7109,8 @@ class DripCAD:
         except (TypeError, ValueError):
             prev_head = 30.0
 
-        old_or: Dict[Tuple[str, str], Tuple[float, float]] = {}
-        old_un: Dict[Tuple[str, str], Tuple[float, float]] = {}
+        old_or: Dict[Tuple[str, str], Tuple[float, float, list]] = {}
+        old_un: Dict[Tuple[str, str], Tuple[float, float, list]] = {}
         for e in prev.get("edges", []) or []:
             if not isinstance(e, dict):
                 continue
@@ -4432,9 +7128,16 @@ class DripCAD:
                 chw = 140.0
             if dmm <= 0:
                 dmm = 90.0
-            old_or[(pa, pb)] = (dmm, chw)
+            secs = e.get("sections")
+            if not isinstance(secs, list) or len(secs) == 0:
+                alt = e.get("telescoped_sections")
+                if isinstance(alt, list) and len(alt) > 0:
+                    secs = list(alt)
+                else:
+                    secs = []
+            old_or[(pa, pb)] = (dmm, chw, secs)
             a, b = sorted((pa, pb))
-            old_un[(a, b)] = (dmm, chw)
+            old_un[(a, b)] = (dmm, chw, secs)
 
         new_nodes: List[dict] = []
         for i, node in enumerate(nodes):
@@ -4457,10 +7160,13 @@ class DripCAD:
             lm = 0.0
             d_seg: Optional[float] = None
             ch_seg: Optional[float] = None
+            sec_seg: Optional[list] = None
+            bom_zero = False
             if si is not None and 0 <= si < len(segs):
                 lm = float(_segment_length_m(nodes, segs[si]))
                 seg = segs[si]
                 if isinstance(seg, dict):
+                    bom_zero = bool(seg.get("bom_length_zero", False))
                     raw_d = seg.get("d_inner_mm")
                     if raw_d is not None:
                         try:
@@ -4473,6 +7179,7 @@ class DripCAD:
                             ch_seg = float(raw_c)
                         except (TypeError, ValueError):
                             ch_seg = None
+                    sec_seg = self._trunk_non_empty_section_list_from_seg(seg)
             if lm <= 1e-9:
                 try:
                     x0, y0 = float(nodes[u]["x"]), float(nodes[u]["y"])
@@ -4484,19 +7191,31 @@ class DripCAD:
             if d_seg is not None and d_seg > 0.0:
                 dmm = d_seg
                 chw = float(ch_seg) if ch_seg is not None else 140.0
+                secs = list(sec_seg) if sec_seg else []
+                if not secs:
+                    _pd, _pch, prior_secs = old_or.get(
+                        (pa, pb), old_un.get(tuple(sorted((pa, pb))), (90.0, 140.0, []))
+                    )
+                    if isinstance(prior_secs, list) and prior_secs:
+                        secs = self._rescale_trunk_telescope_sections_for_length(prior_secs, float(lm))
             else:
-                dmm, chw = old_or.get((pa, pb), old_un.get(tuple(sorted((pa, pb))), (90.0, 140.0)))
+                dmm, chw, secs = old_or.get(
+                    (pa, pb), old_un.get(tuple(sorted((pa, pb))), (90.0, 140.0, []))
+                )
 
-            new_edges.append(
-                {
+            edge_row = {
                     "parent_id": pa,
                     "child_id": pb,
                     "length_m": max(0.0, lm),
+                    "length_bom_m": 0.0 if bom_zero else max(0.0, lm),
+                    "bom_length_zero": bool(bom_zero),
                     "d_inner_mm": float(dmm),
                     "c_hw": float(chw),
                     "dz_m": 0.0,
                 }
-            )
+            if isinstance(secs, list) and secs:
+                edge_row["sections"] = secs
+            new_edges.append(edge_row)
 
         merged = {
             "source_id": tid(src_idx),
@@ -4515,6 +7234,9 @@ class DripCAD:
             return str(k[0]).strip(), str(k[1]).strip()
         if isinstance(k, str):
             s = k.strip()
+            if "->" in s and not s.startswith("("):
+                p0, p1 = s.split("->", 1)
+                return p0.strip(), p1.strip()
             if s.startswith("("):
                 try:
                     t = ast.literal_eval(s)
@@ -4548,15 +7270,60 @@ class DripCAD:
                 out[key] = max(out.get(key, 0.0), q)
         return out
 
-    def _sync_trunk_segment_hydraulic_props_from_tree(self) -> None:
-        """Копіює d_inner_mm / c_hw з trunk_tree_data у trunk_map_segments (для збереження та sync)."""
-        nodes = list(getattr(self, "trunk_map_nodes", []) or [])
-        segs = getattr(self, "trunk_map_segments", None)
+    @staticmethod
+    def _trunk_uniform_pipe_attrs_from_sections(secs: Sequence[Any]) -> Optional[Tuple[str, str, str]]:
+        """
+        Якщо всі секції в списку мають однакові (material, pn, d_nom_mm) — повертає (material, pn, od_str),
+        інакше None. Використовується для синхронізації pipe_material/pipe_pn/pipe_od сегмента з телескопом.
+        """
+        if not isinstance(secs, (list, tuple)) or not secs:
+            return None
+        key0: Optional[Tuple[str, str, str]] = None
+        for s in secs:
+            if not isinstance(s, dict):
+                return None
+            mat = str(s.get("material", "")).strip()
+            pn = str(s.get("pn", "")).strip()
+            try:
+                od = float(s.get("d_nom_mm", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                return None
+            if not mat or not pn or od <= 1e-6:
+                return None
+            # Нормалізуємо OD до рядка без дробової частини (каталог ключ-рядком "110", "90.0" → "90").
+            if abs(od - round(od)) < 1e-6:
+                od_s = str(int(round(od)))
+            else:
+                od_s = f"{od:g}"
+            key = (mat, pn, od_s)
+            if key0 is None:
+                key0 = key
+            elif key != key0:
+                return None
+        return key0
+
+    def _sync_trunk_segment_hydraulic_props_from_tree(
+        self,
+        *,
+        trunk_nodes: Optional[List[Any]] = None,
+        trunk_segments: Optional[List[Any]] = None,
+        trunk_tree_data: Optional[Any] = None,
+    ) -> None:
+        """Копіює d_inner_mm / c_hw (і pipe_material/pipe_pn/pipe_od за секціями) з trunk_tree у сегменти."""
+        nodes = list(
+            trunk_nodes if trunk_nodes is not None else (getattr(self, "trunk_map_nodes", []) or [])
+        )
+        segs = (
+            trunk_segments
+            if trunk_segments is not None
+            else getattr(self, "trunk_map_segments", None)
+        )
         if not nodes or not isinstance(segs, list):
             return
-        payload = self._normalize_trunk_tree_payload(getattr(self, "trunk_tree_data", {}))
+        td = trunk_tree_data if trunk_tree_data is not None else getattr(self, "trunk_tree_data", {})
+        payload = self._normalize_trunk_tree_payload(td)
         edges = payload.get("edges") or []
-        by_uv: Dict[Tuple[str, str], Tuple[float, float]] = {}
+        by_uv: Dict[Tuple[str, str], Tuple[float, float, bool, list]] = {}
         for e in edges:
             if not isinstance(e, dict):
                 continue
@@ -4572,8 +7339,14 @@ class DripCAD:
                 chw = float(e.get("c_hw", 140.0) or 140.0)
             except (TypeError, ValueError):
                 chw = 140.0
+            bom_zero = bool(e.get("bom_length_zero", False))
+            secs = e.get("sections")
+            if not isinstance(secs, list):
+                secs = e.get("telescoped_sections")
+            if not isinstance(secs, list):
+                secs = []
             a, b = sorted((pa, pb))
-            by_uv[(a, b)] = (dmm, chw)
+            by_uv[(a, b)] = (dmm, chw, bom_zero, secs)
 
         def tid(i: int) -> str:
             if i < 0 or i >= len(nodes):
@@ -4596,19 +7369,33 @@ class DripCAD:
             hit = by_uv.get(tuple(sorted((pa, pb))))
             if hit is None:
                 continue
-            dmm, chw = hit
+            dmm, chw, bom_zero, secs = hit
             seg["d_inner_mm"] = float(dmm)
             seg["c_hw"] = float(chw)
+            seg["bom_length_zero"] = bool(bom_zero)
+            if secs:
+                seg["sections"] = secs
+                seg["telescoped_sections"] = copy.deepcopy(secs)
+                # Пайп-атрибути сегмента — з секцій: однорідний телескоп → ставимо;
+                # змішаний — прибираємо, щоб полотно малювало по чанках (per-section колір),
+                # а саме pipe_od більше не «показувало» старий діаметр (напр., 110 замість 90).
+                uni = DripCAD._trunk_uniform_pipe_attrs_from_sections(secs)
+                if uni is not None:
+                    seg["pipe_material"], seg["pipe_pn"], seg["pipe_od"] = uni
+                else:
+                    for k in ("pipe_material", "pipe_pn", "pipe_od"):
+                        seg.pop(k, None)
 
     def _auto_size_trunk_pipes_from_irrigation_cache(
         self, cache: dict, v_max_mps: float
     ) -> List[str]:
         """
-        Підбір d_inner_mm / c_hw по max Q на ребрі та v ≤ v_max серед trunk_allowed_pipes ∩ pipes_db.
+        Підбір d_inner_mm / c_hw по max Q на ребрі серед trunk_allowed_pipes ∩ pipes_db.
+        Якщо v_max_mps > 0 — мінімальний d за v ≤ v_max; якщо 0 — найменший дозволений діаметр (швидкість не обмежує).
         Оновлює trunk_tree_data; без JSON-редактора.
         """
         msgs: List[str] = []
-        v_max = max(0.2, min(8.0, float(v_max_mps)))
+        v_lim = max(0.0, min(8.0, float(v_max_mps)))
         qmax = self._aggregate_max_edge_q_m3s_from_irrigation_cache(cache)
         if not qmax:
             return msgs
@@ -4635,13 +7422,22 @@ class DripCAD:
             qv = qmax.get(tuple(sorted((pa, pb))), 0.0)
             if qv <= 1e-12:
                 continue
-            d_req_mm = math.sqrt(max(0.0, 4.0 * qv / (math.pi * v_max))) * 1000.0
+            if v_lim <= 1e-12:
+                d_req_mm = 0.0
+            else:
+                d_req_mm = math.sqrt(max(0.0, 4.0 * qv / (math.pi * v_lim))) * 1000.0
             pick = pick_smallest_allowed_pipe_for_inner_req(cands, d_req_mm)
             if pick is None:
-                msgs.append(
-                    f"Немає позиції в дозволених трубах для {pa}→{pb} "
-                    f"(Q≈{qv * 3600.0:.3f} м³/год, потрібно d≥{d_req_mm:.1f} мм при v≤{v_max:.2f} м/с)."
-                )
+                if v_lim <= 1e-12:
+                    msgs.append(
+                        f"Немає позиції в дозволених трубах для {pa}→{pb} "
+                        f"(Q≈{qv * 3600.0:.3f} м³/год)."
+                    )
+                else:
+                    msgs.append(
+                        f"Немає позиції в дозволених трубах для {pa}→{pb} "
+                        f"(Q≈{qv * 3600.0:.3f} м³/год, потрібно d≥{d_req_mm:.1f} мм при v≤{v_lim:.2f} м/с)."
+                    )
                 continue
             e["d_inner_mm"] = float(pick["inner"])
             e["c_hw"] = float(pick["c_hw"])
@@ -4980,6 +7776,22 @@ class DripCAD:
         self._refresh_active_block_combo()
         self.redraw()
 
+    def _clear_select_tool_if_blocking_draw_mode(self, mode: str) -> None:
+        """Інструмент «Вибір» перехоплює ЛКМ; для SET_DIR/сабмейну/тощо його треба вимкнути."""
+        if getattr(self, "_canvas_special_tool", None) != "select":
+            return
+        if str(mode) not in _MODES_AUTO_EXIT_SELECT_TOOL:
+            return
+        self._destroy_select_hover_pick_ui()
+        self._canvas_special_tool = None
+        self._select_marquee_active = False
+        self._select_marquee_dragged = False
+        self._select_marquee_start_screen = None
+        self._select_marquee_curr_screen = None
+        self._select_marquee_start_world = None
+        self._select_marquee_curr_world = None
+        self._refresh_canvas_cursor_for_special_tool()
+
     def proceed_to_set_direction(self):
         if len(self.points) > 0:
             silent_showwarning(self.root, 
@@ -4993,6 +7805,7 @@ class DripCAD:
         self._dir_target_block_idx = None
         self.dir_points = []
         self.mode.set("SET_DIR")
+        self._clear_select_tool_if_blocking_draw_mode("SET_DIR")
         self.reset_temp()
         self.redraw()
 
@@ -5082,11 +7895,23 @@ class DripCAD:
         self.redraw()
 
     def reset_calc(self):
-        self._pressure_zone_geom_cache = {}
+        self._pressure_zone_geom_cache = OrderedDict()
         cr = self.calc_results
         if (cr.get("sections") or cr.get("valves") or cr.get("emitters")):
             self.calc_results = {"sections": [], "valves": {}, "emitters": {}, "submain_profiles": {}}
             self.redraw()
+
+    def release_geo_hydro_workspace_caches(self, *, clear_cached_contours: bool = False) -> None:
+        """Скинути важкі кеші UI (гідро магістралі, ізолінії виливу, зони тиску)."""
+        self.trunk_irrigation_hydro_cache = None
+        self._emit_isolines_cache = {"sig": None, "contours": [], "contours_by_cls": {}}
+        self._pressure_zone_geom_cache = OrderedDict()
+        ql = getattr(self, "_q_nom_contour_line_cache", None)
+        if isinstance(ql, dict):
+            ql.clear()
+            self._q_nom_contour_line_cache = ql
+        if clear_cached_contours:
+            self.cached_contours = []
 
     def _lat_index_range_for_block(self, bi: int):
         start = 0
@@ -5566,6 +8391,23 @@ class DripCAD:
 
         self._full_redraw_idle_id = self.root.after(delay_ms, _go)
 
+    def _on_heavy_emitter_param_changed(self, *_args) -> None:
+        """
+        Параметри емітерів (Q/H/x тощо) можуть робити redraw дуже важким.
+        Показуємо легкий кадр одразу, а повний — відкладено (debounce).
+        """
+        self.reset_calc()
+        self.redraw(skip_heavy_canvas_layers=True)
+        self._schedule_debounced_full_redraw(140)
+
+    def _on_heavy_canvas_toggle_changed(self, *_args) -> None:
+        """
+        Перемикачі важких шарів (ізолінії/маски): спочатку легка перемальовка,
+        потім повна, щоб UI не «липнув» при зміні параметрів.
+        """
+        self.redraw(skip_heavy_canvas_layers=True)
+        self._schedule_debounced_full_redraw(140)
+
     def handle_zoom(self, e):
         f = 1.1 if e.delta > 0 else 0.9
         mx, my = self.to_world(e.x, e.y)
@@ -5685,8 +8527,10 @@ class DripCAD:
         top.attributes("-topmost", True)
         top.after(150, lambda w=top: w.attributes("-topmost", False))
         canvas = self.graph_canvas
-        canvas.delete("all")
-        
+        try:
+            canvas.delete("all")
+        except tk.TclError:
+            pass
         max_x1 = max([d["x"] for d in l1_data] + [0])
         max_x2 = max([d["x"] for d in l2_data] + [0])
         total_width = max_x1 + max_x2
@@ -5817,10 +8661,9 @@ class DripCAD:
         )
         try:
             eof = float(self.var_emit_flow.get().replace(",", "."))
-            h_ref_e = float(self.var_emit_h_ref.get().replace(",", "."))
             h_min_work = float(self.var_emit_h_min.get().replace(",", "."))
         except ValueError:
-            eof, h_ref_e, h_min_work = 1.0, 10.0, 1.0
+            eof, h_min_work = 1.0, 1.0
         comp = bool(self._emitter_compensated_effective())
         hm_work = max(0.05, h_min_work)
         q_lo_b = 0.0
@@ -5829,7 +8672,7 @@ class DripCAD:
             q_lo_b = lat_sol.emitter_flow_lph(
                 max(hpmin, 1e-6),
                 eof,
-                max(0.05, h_ref_e),
+                10.0,
                 compensated=comp,
                 h_min_work_m=hm_work,
             )
@@ -5837,7 +8680,7 @@ class DripCAD:
             q_hi_b = lat_sol.emitter_flow_lph(
                 max(hpmax, 1e-6),
                 eof,
-                max(0.05, h_ref_e),
+                10.0,
                 compensated=comp,
                 h_min_work_m=hm_work,
             )
@@ -6252,11 +9095,10 @@ class DripCAD:
                 e_step = float(self.var_emit_step.get().replace(",", "."))
                 e_flow = float(self.var_emit_flow.get().replace(",", "."))
                 h_min_e = float(self.var_emit_h_min.get().replace(",", "."))
-                h_ref_e = float(self.var_emit_h_ref.get().replace(",", "."))
             except ValueError:
                 silent_showerror(self.root, 
                     "Помилка",
-                    "Перевірте крок емітерів, номінальний Q, H опорна та H мін на вкладці параметрів.",
+                    "Перевірте крок емітерів, номінальний Q та H мін на вкладці параметрів.",
                 )
                 return
             emitter_opts = {
@@ -6272,7 +9114,7 @@ class DripCAD:
                     e_flow,
                     lambda x, y: self.topo.get_z(x, y),
                     emitter_opts=emitter_opts,
-                    h_ref_m=max(0.05, h_ref_e),
+                    h_ref_m=10.0,
                 )
             except Exception as ex:
                 silent_showerror(self.root, "Помилка", str(ex))
@@ -6317,6 +9159,40 @@ class DripCAD:
         """Скільки метрів у світі відповідає заданій товщині на екрані (залежить від zoom)."""
         return float(px) / max(self.zoom, 0.01)
 
+    def _set_trunk_panel_active_offcanvas(self, active: bool) -> None:
+        self._trunk_panel_active_offcanvas = bool(active)
+
+    def _set_trunk_panel_active_map(self, active: bool) -> None:
+        self._trunk_panel_active_map = bool(active)
+
+    def _update_trunk_panel_state_offcanvas_from_notebook(self) -> None:
+        nb = getattr(self, "_draw_tools_notebook", None)
+        if nb is None:
+            self._set_trunk_panel_active_offcanvas(False)
+            return
+        try:
+            tab_id = str(nb.select())
+            tab_txt = str(nb.tab(tab_id, "text")).strip().lower()
+            self._set_trunk_panel_active_offcanvas(tab_txt == "магістраль")
+        except Exception:
+            self._set_trunk_panel_active_offcanvas(False)
+
+    def _trunk_interaction_priority_active(self) -> bool:
+        tool = str(getattr(self, "_canvas_special_tool", "") or "")
+        if tool in _CANVAS_TRUNK_CHAIN_TOOLS:
+            return True
+        try:
+            selected = self.view_notebook.select()
+            if selected == str(self.draw_panel):
+                return bool(getattr(self, "_trunk_panel_active_offcanvas", False))
+            if selected == str(self.map_panel):
+                return bool(getattr(self, "_trunk_panel_active_map", False))
+        except Exception:
+            pass
+        return bool(getattr(self, "_trunk_panel_active_offcanvas", False)) or bool(
+            getattr(self, "_trunk_panel_active_map", False)
+        )
+
     def _trunk_snap_radius_m(self) -> float:
         """Радіус прив’язки до вузла магістралі: не менше фіксованого м і ~14 px на екрані (легше клацати ребро)."""
         return max(_TRUNK_NODE_SNAP_CANVAS_M, self._world_m_from_screen_px(14.0))
@@ -6351,20 +9227,124 @@ class DripCAD:
         ni, _dist = self._nearest_trunk_node_index_world(wx, wy)
         if ni is None:
             return None, False
-        nodes = list(self.trunk_map_nodes)
         draft_i = list(getattr(self, "_canvas_trunk_route_draft_indices", []) or [])
-        if not draft_i:
-            last_end = getattr(self, "_trunk_route_last_node_idx", None)
-            if last_end is None:
-                src_ix = self._canvas_first_trunk_source_index()
-                ok = src_ix is not None and ni == src_ix
-                return ni, ok
-            k = str(nodes[ni].get("kind", "")).lower()
-            ok = ni == last_end or k == "junction"
-            return ni, ok
-        if ni == draft_i[-1]:
+        if draft_i and ni == draft_i[-1]:
             return ni, False
         return ni, True
+
+    def _reset_trunk_route_endpoint_state(self) -> None:
+        self._trunk_route_endpoint_pending_idx = None
+        self._trunk_route_edge_end_idx = None
+
+    def _append_trunk_bend_at_world_xy(self, wx: float, wy: float) -> int:
+        """Новий пікет (bend) у світових м; повертає індекс у trunk_map_nodes."""
+        from modules.geo_module import srtm_tiles
+
+        gr = getattr(self, "geo_ref", None)
+        row: Dict[str, object] = {"kind": "bend", "x": float(wx), "y": float(wy)}
+        if gr and len(gr) >= 2:
+            ref_lon, ref_lat = float(gr[0]), float(gr[1])
+            lat, lon = srtm_tiles.local_xy_to_lat_lon(float(wx), float(wy), ref_lon, ref_lat)
+            row["lat"] = float(lat)
+            row["lon"] = float(lon)
+        self.trunk_map_nodes.append(row)
+        ensure_trunk_node_ids(self.trunk_map_nodes)
+        return len(self.trunk_map_nodes) - 1
+
+    def _finish_canvas_trunk_route_segment_to_end(self, end_idx: int) -> None:
+        """Фіксує одне ребро-трубу: чернетка ламаної + вузол кінця; path_local = реальна трас."""
+        draft = list(getattr(self, "_canvas_trunk_route_draft_indices", []) or [])
+        nodes = list(getattr(self, "trunk_map_nodes", []) or [])
+        if len(draft) < 1:
+            silent_showwarning(self.root, "Магістраль", "Додайте хоча б початкову вершину труби (ЛКМ).")
+            return
+        if end_idx < 0 or end_idx >= len(nodes):
+            silent_showerror(self.root, "Магістраль", "Некоректний вузол кінця ребра.")
+            return
+        idxs = list(draft)
+        if not idxs or idxs[-1] != end_idx:
+            idxs.append(int(end_idx))
+        if len(idxs) < 2:
+            silent_showwarning(self.root, "Магістраль", "Потрібні щонайменше дві різні вершини (початок і кінець).")
+            return
+        path_local: List[Tuple[float, float]] = []
+        for ii in idxs:
+            if not (0 <= ii < len(nodes)):
+                silent_showerror(self.root, "Магістраль", "Некоректні індекси вузлів у трасі.")
+                return
+            try:
+                path_local.append((float(nodes[ii]["x"]), float(nodes[ii]["y"])))
+            except (KeyError, TypeError, ValueError):
+                silent_showerror(self.root, "Магістраль", "Не вдалося прочитати координати вузла.")
+                return
+        segs = self.trunk_map_segments
+        proposed = {"node_indices": list(idxs), "path_local": path_local}
+        ensure_trunk_node_ids(nodes)
+        segs.append(proposed)
+        self._trunk_route_last_node_idx = int(end_idx)
+        self._canvas_trunk_route_draft_indices = []
+        self._reset_trunk_route_endpoint_state()
+        self.normalize_trunk_segments_to_graph_edges()
+        try:
+            self._schedule_embedded_map_overlay_refresh()
+        except Exception:
+            pass
+
+    def handle_trunk_route_right_click_world(self, wx: float, wy: float) -> bool:
+        """
+        ПКМ у режимі «Траса магістралі» (є вузли).
+        Повертає True, якщо інструмент варто вимкнути (завершено ребро або стара логіка).
+        """
+        nodes = list(getattr(self, "trunk_map_nodes", []) or [])
+        pending = getattr(self, "_trunk_route_endpoint_pending_idx", None)
+        end_idx = getattr(self, "_trunk_route_edge_end_idx", None)
+        draft = list(getattr(self, "_canvas_trunk_route_draft_indices", []) or [])
+
+        if pending is not None:
+            ni, _d = self._nearest_trunk_node_index_world(wx, wy)
+            if ni is None or ni != pending:
+                self._trunk_route_endpoint_pending_idx = None
+                silent_showinfo(
+                    self.root,
+                    "Магістраль",
+                    "Позначку кінця скасовано. ЛКМ на вузол призначення, потім ПКМ на тому ж вузлі.",
+                )
+                return False
+            self._trunk_route_edge_end_idx = int(pending)
+            self._trunk_route_endpoint_pending_idx = None
+            nid = str(nodes[int(self._trunk_route_edge_end_idx)].get("id", "")).strip()
+            if not nid:
+                nid = f"T{int(self._trunk_route_edge_end_idx)}"
+            silent_showinfo(
+                self.root,
+                "Магістраль",
+                f"Кінець труби: {nid}. Далі ЛКМ — початковий вузол, потім ЛКМ по трасі "
+                f"(вузли або вільні точки — додаються пікети); ПКМ — з’єднати останню точку з кінцем.",
+            )
+            return False
+
+        if end_idx is not None:
+            if len(draft) >= 1:
+                self._finish_canvas_trunk_route_segment_to_end(int(end_idx))
+                return True
+            self._trunk_route_edge_end_idx = None
+            silent_showinfo(
+                self.root,
+                "Магістраль",
+                "Кінець ребра скасовано. Знову: ЛКМ і ПКМ на вузлі призначення.",
+            )
+            return False
+
+        return self._finish_canvas_trunk_route_segment_legacy()
+
+    def _trunk_consumption_is_terminal(self, node_index: int) -> bool:
+        topo = self._trunk_topology_oriented()
+        if topo is None:
+            return True
+        children = topo.get("children") or []
+        if not (0 <= int(node_index) < len(children)):
+            return True
+        return len(children[int(node_index)]) == 0
 
     def _canvas_first_trunk_source_index(self):
         for i, node in enumerate(self.trunk_map_nodes):
@@ -6387,13 +9367,17 @@ class DripCAD:
             "trunk_junction": "junction",
             "trunk_consumer": "consumption",
         }.get(tool, "junction")
+        wx = float(wx)
+        wy = float(wy)
+        if tool == "trunk_consumer":
+            wx, wy = self._snap_world_xy_to_nearest_field_valve(wx, wy)
         gr = getattr(self, "geo_ref", None)
         if gr and len(gr) >= 2:
             ref_lon, ref_lat = float(gr[0]), float(gr[1])
         else:
             ref_lon, ref_lat = 30.5234, 50.4501
             self.geo_ref = (ref_lon, ref_lat)
-        lat, lon = srtm_tiles.local_xy_to_lat_lon(float(wx), float(wy), ref_lon, ref_lat)
+        lat, lon = srtm_tiles.local_xy_to_lat_lon(wx, wy, ref_lon, ref_lat)
 
         if tool == "trunk_pump":
             src_i = self._canvas_first_trunk_source_index()
@@ -6436,8 +9420,11 @@ class DripCAD:
         tool = getattr(self, "_canvas_special_tool", None)
         if tool not in _CANVAS_TRUNK_POINT_TOOLS:
             return
-        self.place_trunk_point_tool_world_xy(tool, float(wx), float(wy))
-        self._canvas_trunk_draft_world = (float(wx), float(wy))
+        fwx, fwy = float(wx), float(wy)
+        self.place_trunk_point_tool_world_xy(tool, fwx, fwy)
+        if tool == "trunk_consumer":
+            fwx, fwy = self._snap_world_xy_to_nearest_field_valve(fwx, fwy)
+        self._canvas_trunk_draft_world = (fwx, fwy)
 
     def _canvas_trunk_point_exit_tool(self) -> None:
         self._canvas_trunk_draft_world = None
@@ -6450,58 +9437,65 @@ class DripCAD:
         self.redraw()
 
     def _canvas_trunk_route_left_click(self, wx: float, wy: float) -> None:
-        nodes = list(self.trunk_map_nodes)
-        ni, _dist = self._nearest_trunk_node_index_world(wx, wy)
-        if ni is None:
-            r_m = int(max(1, round(self._trunk_snap_radius_m())))
-            silent_showinfo(self.root, 
-                "Магістраль",
-                f"Немає вузла в радіусі ~{r_m} м (залежить від масштабу). "
-                "Наведіть курсор на насос, кран, пікет, розгалуження або споживача — з’явиться підсвітка.",
-            )
+        nodes = list(getattr(self, "trunk_map_nodes", []) or [])
+        if not nodes:
             return
-        draft_i = list(getattr(self, "_canvas_trunk_route_draft_indices", []) or [])
-        if not draft_i:
-            last_end = getattr(self, "_trunk_route_last_node_idx", None)
-            if last_end is None:
-                src_ix = self._canvas_first_trunk_source_index()
-                if src_ix is None:
-                    silent_showwarning(self.root, 
-                        "Магістраль",
-                        "Спочатку задайте на полотні вузол витоку — «Насос».",
-                    )
-                    return
-                if ni != src_ix:
-                    silent_showwarning(self.root, 
-                        "Магістраль",
-                        "Перший клік першого відрізка має бути на насосі (витік).",
-                    )
-                    return
-            else:
-                k = str(nodes[ni].get("kind", "")).lower()
-                start_ok = ni == last_end or k == "junction"
-                if not start_ok:
-                    silent_showwarning(self.root, 
-                        "Магістраль",
-                        "Початок нового відрізка: кінець попереднього вузла або вузол «Розгалуження» (нова гілка).",
-                    )
-                    return
-        else:
-            if ni == draft_i[-1]:
-                silent_showinfo(self.root, 
+        end_idx = getattr(self, "_trunk_route_edge_end_idx", None)
+        if end_idx is None:
+            ni, _dist = self._nearest_trunk_node_index_world(wx, wy)
+            if ni is None:
+                r_m = int(max(1, round(self._trunk_snap_radius_m())))
+                silent_showinfo(
+                    self.root,
                     "Магістраль",
-                    "Оберіть наступний вузол по трасі (не дублюйте попередній).",
+                    f"Кінець ребра: ЛКМ на вузол призначення, потім ПКМ на тому ж вузлі "
+                    f"(радіус прив’язки ~{r_m} м).",
                 )
                 return
-        draft_i.append(ni)
+            self._trunk_route_endpoint_pending_idx = int(ni)
+            self.redraw()
+            return
+
+        draft_i = list(getattr(self, "_canvas_trunk_route_draft_indices", []) or [])
+        r_snap = self._trunk_snap_radius_m()
+        ni, dist = self._nearest_trunk_node_index_world(wx, wy)
+        if not draft_i:
+            if ni is None or dist > r_snap:
+                silent_showinfo(
+                    self.root,
+                    "Магістраль",
+                    "Початок труби: ЛКМ на існуючий вузол магістралі (у радіусі прив’язки). "
+                    "Далі можна ЛКМ по вільній трасі — додадуться пікети.",
+                )
+                return
+            if int(ni) == int(end_idx):
+                silent_showinfo(self.root, "Магістраль", "Початок не може збігатися з кінцем ребра.")
+                return
+            draft_i.append(int(ni))
+        else:
+            if ni is not None and dist <= r_snap:
+                if int(ni) == int(draft_i[-1]):
+                    silent_showinfo(
+                        self.root,
+                        "Магістраль",
+                        "Оберіть наступну вершину траси (не дублюйте попередню).",
+                    )
+                    return
+                draft_i.append(int(ni))
+            else:
+                new_i = self._append_trunk_bend_at_world_xy(float(wx), float(wy))
+                if draft_i and int(new_i) == int(draft_i[-1]):
+                    return
+                draft_i.append(int(new_i))
         self._canvas_trunk_route_draft_indices = draft_i
         self.redraw()
 
-    def _finish_canvas_trunk_route_segment(self) -> None:
+    def _finish_canvas_trunk_route_segment_legacy(self) -> bool:
+        """Стара схема без попереднього кінця: лише вузли по чернетці, ПКМ фіксує ланцюг ≥2."""
         idxs = list(getattr(self, "_canvas_trunk_route_draft_indices", []) or [])
         nodes = list(self.trunk_map_nodes)
         if len(idxs) >= 2:
-            path_local = []
+            path_local: List[Tuple[float, float]] = []
             ok = True
             for ii in idxs:
                 if not (0 <= ii < len(nodes)):
@@ -6517,34 +9511,24 @@ class DripCAD:
             if ok:
                 segs = self.trunk_map_segments
                 proposed = {"node_indices": list(idxs), "path_local": path_local}
-                trial = list(segs) + [proposed]
                 ensure_trunk_node_ids(nodes)
-                graph_errs = validate_trunk_map_graph(nodes, trial, complete_only=False)
-                if graph_errs:
-                    msg = "\n".join(graph_errs[:10])
-                    if len(graph_errs) > 10:
-                        msg += f"\n… ще {len(graph_errs) - 10}."
-                    silent_showwarning(self.root, "Граф магістралі", msg)
-                    self._canvas_trunk_route_draft_indices = []
-                    self.redraw()
-                    return
                 segs.append(proposed)
                 self._trunk_route_last_node_idx = idxs[-1]
                 self._canvas_trunk_route_draft_indices = []
+                self._reset_trunk_route_endpoint_state()
                 self.normalize_trunk_segments_to_graph_edges()
                 try:
                     self._schedule_embedded_map_overlay_refresh()
                 except Exception:
                     pass
                 self.redraw()
-                return
-        elif len(idxs) == 1:
-            silent_showinfo(self.root, 
-                "Магістраль",
-                "Для відрізка потрібні щонайменше два вузли. Додайте ще один ЛКМ або почніть спочатку.",
-            )
+                return True
+        if len(idxs) == 1:
+            self.redraw()
+            return True
         self._canvas_trunk_route_draft_indices = []
         self.redraw()
+        return True
 
     @staticmethod
     def _trunk_map_node_caption(node: dict, index: int) -> str:
@@ -6567,7 +9551,15 @@ class DripCAD:
                 "groups": [],
                 "irrigation_slots": [[] for _ in range(48)],
                 "max_pump_head_m": 50.0,
-                "trunk_schedule_v_max_mps": 2.0,
+                "trunk_schedule_v_max_mps": 0.0,
+                "trunk_schedule_min_seg_m": 0.0,
+                "trunk_schedule_max_sections_per_edge": 2,
+                "trunk_schedule_opt_goal": "weight",
+                "trunk_schedule_test_q_m3h": 60.0,
+                "trunk_schedule_test_h_m": 40.0,
+                "trunk_display_velocity_warn_mps": 0.0,
+                "trunk_pipes_selected": False,
+                "trunk_telescope_label_pos": {},
             }
             return
         groups = raw.get("groups")
@@ -6610,20 +9602,261 @@ class DripCAD:
         except (TypeError, ValueError):
             mph = 50.0
         mph = max(1.0, min(400.0, float(mph)))
-        vm = 2.0
+        vm = 0.0
         try:
             vx = raw.get("trunk_schedule_v_max_mps")
             if vx is not None and str(vx).strip() != "":
                 vm = float(vx)
         except (TypeError, ValueError):
-            vm = 2.0
-        vm = max(0.2, min(8.0, float(vm)))
+            vm = 0.0
+        vm = max(0.0, min(8.0, float(vm)))
+        min_seg = 0.0
+        try:
+            vx = raw.get("trunk_schedule_min_seg_m")
+            if vx is not None and str(vx).strip() != "":
+                min_seg = float(vx)
+        except (TypeError, ValueError):
+            min_seg = 0.0
+        min_seg = max(0.0, min(1000.0, float(min_seg)))
+        max_sections_per_edge = 2
+        try:
+            vx = raw.get("trunk_schedule_max_sections_per_edge")
+            if vx is not None and str(vx).strip() != "":
+                max_sections_per_edge = int(float(vx))
+        except (TypeError, ValueError):
+            max_sections_per_edge = 2
+        max_sections_per_edge = max(1, min(4, int(max_sections_per_edge)))
+        opt_goal = str(raw.get("trunk_schedule_opt_goal", "weight")).strip().lower()
+        if opt_goal not in ("weight", "money", "cost_index"):
+            opt_goal = "weight"
+        if opt_goal == "cost_index":
+            opt_goal = "money"
+        tq = 60.0
+        try:
+            vx = raw.get("trunk_schedule_test_q_m3h")
+            if vx is not None and str(vx).strip() != "":
+                tq = float(vx)
+        except (TypeError, ValueError):
+            tq = 60.0
+        tq = max(0.0, min(10000.0, float(tq)))
+        th = 40.0
+        try:
+            vx = raw.get("trunk_schedule_test_h_m")
+            if vx is not None and str(vx).strip() != "":
+                th = float(vx)
+        except (TypeError, ValueError):
+            th = 40.0
+        th = max(0.0, min(400.0, float(th)))
+        vwarn = 0.0
+        try:
+            vx = raw.get("trunk_display_velocity_warn_mps")
+            if vx is not None and str(vx).strip() != "":
+                vwarn = float(vx)
+        except (TypeError, ValueError):
+            vwarn = 0.0
+        vwarn = max(0.0, min(8.0, float(vwarn)))
+        tel_pos: Dict[str, Tuple[float, float]] = {}
+        tp = raw.get("trunk_telescope_label_pos")
+        if isinstance(tp, dict):
+            for ks, vv in tp.items():
+                k = str(ks).strip()
+                if not k or ":" not in k:
+                    continue
+                if isinstance(vv, (list, tuple)) and len(vv) >= 2:
+                    try:
+                        tel_pos[k] = (float(vv[0]), float(vv[1]))
+                    except (TypeError, ValueError):
+                        pass
+        nseg = len(getattr(self, "trunk_map_segments", []) or [])
+        if nseg > 0:
+            pruned: Dict[str, Tuple[float, float]] = {}
+            for k, v in tel_pos.items():
+                parts = str(k).split(":")
+                if len(parts) != 2:
+                    continue
+                try:
+                    si = int(parts[0])
+                    ci = int(parts[1])
+                except ValueError:
+                    continue
+                if si < 0 or si >= nseg:
+                    continue
+                seg = (getattr(self, "trunk_map_segments", []) or [])[si]
+                if not isinstance(seg, dict):
+                    continue
+                pl = self._trunk_segment_world_path(seg)
+                if len(pl) < 2:
+                    continue
+                chunks = self._trunk_segment_telescope_path_chunks(seg, pl)
+                if ci < 0 or ci >= len(chunks):
+                    continue
+                _cpl, sec = chunks[ci]
+                if not isinstance(sec, dict):
+                    continue
+                pruned[k] = v
+            tel_pos = pruned
         self.consumer_schedule = {
             "groups": out,
             "irrigation_slots": slots,
             "max_pump_head_m": mph,
             "trunk_schedule_v_max_mps": vm,
+            "trunk_schedule_min_seg_m": min_seg,
+            "trunk_schedule_max_sections_per_edge": max_sections_per_edge,
+            "trunk_schedule_opt_goal": opt_goal,
+            "trunk_schedule_test_q_m3h": tq,
+            "trunk_schedule_test_h_m": th,
+            "trunk_display_velocity_warn_mps": vwarn,
+            "trunk_pipes_selected": bool(raw.get("trunk_pipes_selected", False)),
+            "trunk_telescope_label_pos": tel_pos,
         }
+
+    def sync_trunk_display_velocity_warn_var_from_schedule(self) -> None:
+        """Підставити в поле UI значення з consumer_schedule (завантаження проєкту тощо). Не викликати з redraw."""
+        if not hasattr(self, "var_trunk_display_velocity_warn_mps"):
+            return
+        try:
+            raw = getattr(self, "consumer_schedule", None) or {}
+            vv = float(raw.get("trunk_display_velocity_warn_mps", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            vv = 0.0
+        vv = max(0.0, min(8.0, float(vv)))
+        s = "0" if vv < 1e-12 else f"{vv:g}"
+        try:
+            self.var_trunk_display_velocity_warn_mps.set(s)
+        except tk.TclError:
+            pass
+
+    def trunk_schedule_test_q_m3h_effective(self) -> float:
+        """Типова витрата для поливу (м³/год), якщо на вузлі не задано trunk_schedule_q_m3h."""
+        self.normalize_consumer_schedule()
+        try:
+            return max(0.0, min(10000.0, float(self.consumer_schedule.get("trunk_schedule_test_q_m3h", 60.0))))
+        except (TypeError, ValueError):
+            return 60.0
+
+    def trunk_schedule_test_h_m_effective(self) -> float:
+        """Типова ціль H (м), якщо на вузлі не задано trunk_schedule_h_m."""
+        self.normalize_consumer_schedule()
+        try:
+            return max(0.0, min(400.0, float(self.consumer_schedule.get("trunk_schedule_test_h_m", 40.0))))
+        except (TypeError, ValueError):
+            return 40.0
+
+    def trunk_schedule_max_target_head_m_among_slots(
+        self, slots: object, *, default_h_m: float
+    ) -> float:
+        """
+        Максимум цільових мін. H по споживачах/кранах, які хоч раз з’являються у слотах поливу.
+        Для вузла без trunk_schedule_h_m використовується default_h_m (типовий H тесту).
+        Потрібен для бюджету втрат ΔH ≈ H_насос − H_ціль у найгіршому випадку (не плутати з тестовим 40 м,
+        якщо на споживачі задано 20 м).
+        """
+        nodes = list(getattr(self, "trunk_map_nodes", []) or [])
+        id_to_idx: Dict[str, int] = {}
+        for i, n in enumerate(nodes):
+            if not isinstance(n, dict):
+                continue
+            nid = str(n.get("id", "")).strip()
+            if nid:
+                id_to_idx[nid] = i
+        mx = 0.0
+        found = False
+        for slot in slots or []:
+            if not isinstance(slot, list):
+                continue
+            for x in slot:
+                nid = str(x).strip()
+                if not nid or nid not in id_to_idx:
+                    continue
+                node = nodes[id_to_idx[nid]]
+                kind = str(node.get("kind", "")).lower()
+                if kind not in ("consumption", "valve"):
+                    continue
+                found = True
+                raw = node.get("trunk_schedule_h_m")
+                try:
+                    if raw is None or str(raw).strip() == "":
+                        hv = float(default_h_m)
+                    else:
+                        hv = float(raw)
+                except (TypeError, ValueError):
+                    hv = float(default_h_m)
+                hv = max(0.0, min(400.0, hv))
+                mx = max(mx, hv)
+        if not found:
+            return max(0.0, min(400.0, float(default_h_m)))
+        return max(0.0, min(400.0, mx))
+
+    def trunk_display_velocity_warn_mps_effective(self) -> float:
+        """Поріг м/с для підсвітки відрізків магістралі, де v ≥ поріг; 0 — індикація вимкнена."""
+        # Не викликати normalize_consumer_schedule() тут: redraw малює багато сегментів і перезаписував би StringVar.
+        try:
+            raw = getattr(self, "consumer_schedule", None) or {}
+            return max(0.0, min(8.0, float(raw.get("trunk_display_velocity_warn_mps", 0.0) or 0.0)))
+        except (TypeError, ValueError):
+            return 0.0
+
+    def apply_trunk_display_velocity_warn_from_ui(self) -> bool:
+        """Зчитати поле панелі «Магістраль» у consumer_schedule; True якщо значення валідне."""
+        self.normalize_consumer_schedule()
+        raw = ""
+        if hasattr(self, "var_trunk_display_velocity_warn_mps"):
+            try:
+                raw = str(self.var_trunk_display_velocity_warn_mps.get()).replace(",", ".").strip()
+            except tk.TclError:
+                raw = ""
+        if raw == "":
+            v = 0.0
+        else:
+            try:
+                v = float(raw)
+            except (TypeError, ValueError):
+                silent_showwarning(self.root, "Магістраль", "Некоректне число для порогу швидкості (м/с).")
+                return False
+        v = max(0.0, min(8.0, float(v)))
+        self.consumer_schedule["trunk_display_velocity_warn_mps"] = v
+        if hasattr(self, "var_trunk_display_velocity_warn_mps"):
+            self.var_trunk_display_velocity_warn_mps.set("0" if v < 1e-12 else f"{v:g}")
+        self._after_consumer_schedule_edit()
+        return True
+
+    def trunk_segment_velocity_mps_from_hydro_cache(self, seg_index: int) -> Optional[float]:
+        """Швидкість у відрізку за кешем trunk_irrigation_hydro (домінантний слот); None якщо немає даних."""
+        h = getattr(self, "trunk_irrigation_hydro_cache", None)
+        if not isinstance(h, dict):
+            return None
+        sh = h.get("segment_hover")
+        if not isinstance(sh, dict):
+            return None
+        row = sh.get(str(seg_index))
+        if not isinstance(row, dict):
+            row = sh.get(int(seg_index))  # type: ignore[arg-type]
+        if not isinstance(row, dict):
+            return None
+        try:
+            q = float(row.get("q_m3s", 0.0) or 0.0)
+            dmm = float(row.get("d_inner_mm", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return None
+        if dmm <= 1e-6:
+            return None
+        d_m = dmm / 1000.0
+        area = math.pi * (d_m * 0.5) ** 2
+        if area <= 1e-12:
+            return None
+        return q / area
+
+    def trunk_consumer_effective_q_m3h(self, node: dict) -> float:
+        """Ефективна Q споживача (м³/год): як у вузлі або типове значення."""
+        if not isinstance(node, dict):
+            return 0.0
+        q_base = node.get("trunk_schedule_q_m3h")
+        if q_base is None:
+            q_base = self.trunk_schedule_test_q_m3h_effective()
+        try:
+            return max(0.0, float(q_base))
+        except (TypeError, ValueError):
+            return self.trunk_schedule_test_q_m3h_effective()
 
     def _irrigation_schedule_tab_active(self) -> bool:
         cp = getattr(self, "control_panel", None)
@@ -6639,7 +9872,8 @@ class DripCAD:
             return False
         if self.mode.get() not in ("VIEW", "PAN"):
             return False
-        if getattr(self, "_canvas_special_tool", None) is not None:
+        ct = getattr(self, "_canvas_special_tool", None)
+        if ct is not None and ct not in ("select", "map_pick_info"):
             return False
         return True
 
@@ -6661,7 +9895,7 @@ class DripCAD:
         if str(node.get("kind", "")).lower() not in ("consumption", "valve"):
             silent_showinfo(self.root, 
                 "Розклад",
-                "Оберіть вузол «Споживач» на магістралі (інші вузли не додаються до чернетки).",
+                "Оберіть вузол «Споживач» на магістралі (інші вузли не додаються до поточного вибору).",
             )
             return True
         nid = str(node.get("id", "")).strip()
@@ -6688,7 +9922,7 @@ class DripCAD:
             silent_showinfo(self.root, 
                 "Розклад",
                 "Чернетка порожня. ЛКМ по споживачах на полотні або карті (режим VIEW/PAN, вкладка «Розклад»). "
-                "Повторний ЛКМ знімає вузол з чернетки.",
+                "Повторний ЛКМ знімає вузол з поточного вибору.",
             )
             return True
         cp = getattr(self, "control_panel", None)
@@ -6760,6 +9994,93 @@ class DripCAD:
             return None
         return {"si": int(best_si), "row": row, "pl": pl, "dist_m": float(best_d)}
 
+    def _trunk_hydro_hover_pick_consumer(self, wx: float, wy: float):
+        """Найближчий вузол-споживач для показу реального тиску H після розрахунку."""
+        h = getattr(self, "trunk_irrigation_hydro_cache", None)
+        if not isinstance(h, dict):
+            return None
+        nodes = list(getattr(self, "trunk_map_nodes", []) or [])
+        if not nodes:
+            return None
+        tol_m = max(1.0, self._world_m_from_screen_px(18.0))
+        best_i = None
+        best_d = 1e18
+        for i, node in enumerate(nodes):
+            kind = str(node.get("kind", "")).strip().lower()
+            if kind not in ("consumption", "valve"):
+                continue
+            try:
+                nx = float(node.get("x", 0.0))
+                ny = float(node.get("y", 0.0))
+            except (TypeError, ValueError):
+                continue
+            d = math.hypot(float(wx) - nx, float(wy) - ny)
+            if d < best_d:
+                best_d = d
+                best_i = i
+        if best_i is None or best_d > tol_m:
+            return None
+        node = nodes[best_i]
+        nid = str(node.get("id", "")).strip()
+        if not nid:
+            return None
+        per_slot = h.get("per_slot")
+        if not isinstance(per_slot, dict):
+            return None
+        best_h = None
+        best_slot = None
+        for sk, row in per_slot.items():
+            if not isinstance(row, dict):
+                continue
+            nh = row.get("node_head_m")
+            if not isinstance(nh, dict):
+                continue
+            raw_h = nh.get(nid)
+            if raw_h is None:
+                continue
+            try:
+                hv = float(raw_h)
+            except (TypeError, ValueError):
+                continue
+            if best_h is None or hv < best_h:
+                best_h = hv
+                try:
+                    best_slot = int(sk)
+                except (TypeError, ValueError):
+                    best_slot = None
+        if best_h is None:
+            return None
+        return {"ni": int(best_i), "nid": nid, "node": node, "h_m": float(best_h), "slot_i": best_slot}
+
+    def _trunk_hydro_hover_pick_pump(self, wx: float, wy: float):
+        """Пік вузла насоса (source) для hover Q/P."""
+        h = getattr(self, "trunk_irrigation_hydro_cache", None)
+        if not isinstance(h, dict):
+            return None
+        nodes = list(getattr(self, "trunk_map_nodes", []) or [])
+        if not nodes:
+            return None
+        tol_m = max(1.0, self._world_m_from_screen_px(18.0))
+        best_i = None
+        best_d = 1e18
+        for i, node in enumerate(nodes):
+            kind = str(node.get("kind", "")).strip().lower()
+            if kind != "source":
+                continue
+            try:
+                nx = float(node.get("x", 0.0))
+                ny = float(node.get("y", 0.0))
+            except (TypeError, ValueError):
+                continue
+            d = math.hypot(float(wx) - nx, float(wy) - ny)
+            if d < best_d:
+                best_d = d
+                best_i = i
+        if best_i is None or best_d > tol_m:
+            return None
+        node = nodes[int(best_i)]
+        return {"ni": int(best_i), "node": node, "dist_m": float(best_d)}
+
     @staticmethod
     def _fmt_flow_m3h(q_m3h: float) -> str:
         """Форматування витрати без експоненти (не «1.5e-2»)."""
@@ -6785,40 +10106,116 @@ class DripCAD:
             return
         if m == "ZOOM_BOX" and self._zoom_box_start is not None:
             return
+        p_pick = self._trunk_hydro_hover_pick_pump(wx, wy)
+        if p_pick is not None:
+            node = p_pick["node"]
+            nid = str(node.get("id", "")).strip() or "?"
+            try:
+                nx = float(node.get("x", 0.0))
+                ny = float(node.get("y", 0.0))
+            except (TypeError, ValueError):
+                return
+            sx, sy = self.to_screen(nx, ny)
+            if self._trunk_map_hover_show_pipes_detail():
+                qp = self.trunk_irrigation_hydro_pump_qp_hover_lines()
+                if qp is None:
+                    return
+                lines = [qp[0], qp[1]]
+            else:
+                lines = [f"Насос (витік), {nid}", "Топологія вузла (без Q/P з розрахунку)"]
+            self.canvas.create_oval(
+                sx - 10, sy - 10, sx + 10, sy + 10,
+                outline="#FFF59D", width=3, fill="",
+                tags="trunk_hydro_hover",
+            )
+            tw = min(340, max(180, 10 + max(len(s) for s in lines) * 7))
+            th = 6 + len(lines) * 15
+            tx = min(max(scr_x + 14, 8), max(8, int(self.canvas.winfo_width()) - tw - 16))
+            ty = min(max(scr_y - th - 12, 8), max(28, int(self.canvas.winfo_height()) - th - 8))
+            self.canvas.create_rectangle(
+                tx - 6, ty - 4, tx + tw, ty + th,
+                fill="#0f141c", outline="#5c6bc0", width=1,
+                tags="trunk_hydro_hover",
+            )
+            self.canvas.create_text(
+                tx, ty, anchor=tk.NW,
+                fill="#E8EAF6", font=("Segoe UI", 9, "bold"),
+                tags="trunk_hydro_hover", text="\n".join(lines),
+            )
+            return
+        c_pick = self._trunk_hydro_hover_pick_consumer(wx, wy)
+        if c_pick is not None:
+            ni = int(c_pick["ni"])
+            node = c_pick["node"]
+            h_m = float(c_pick["h_m"])
+            slot_i = c_pick.get("slot_i")
+            try:
+                nx = float(node.get("x", 0.0))
+                ny = float(node.get("y", 0.0))
+            except (TypeError, ValueError):
+                nx, ny = float(wx), float(wy)
+            sx, sy = self.to_screen(nx, ny)
+            cap = self.trunk_consumer_display_caption(node, ni)
+            if self._trunk_map_hover_show_pipes_detail():
+                if slot_i is None:
+                    slot_txt = "реальний H (мін по слотах)"
+                else:
+                    slot_txt = f"полив {int(slot_i) + 1} (мін H)"
+                lines = [cap, f"H ≈ {h_m:.2f} м вод. ст.", slot_txt]
+            else:
+                role = (
+                    "кінцевий"
+                    if hasattr(self, "_trunk_consumption_is_terminal")
+                    and self._trunk_consumption_is_terminal(ni)
+                    else "проміжний"
+                )
+                lines = [cap, f"Споживач ({role}) — топологія"]
+            self.canvas.create_oval(
+                sx - 10, sy - 10, sx + 10, sy + 10,
+                outline="#FFF59D", width=3, fill="",
+                tags="trunk_hydro_hover",
+            )
+            tw = min(360, max(180, 10 + max(len(s) for s in lines) * 7))
+            th = 6 + len(lines) * 15
+            tx = min(max(scr_x + 14, 8), max(8, int(self.canvas.winfo_width()) - tw - 16))
+            ty = min(max(scr_y - th - 12, 8), max(28, int(self.canvas.winfo_height()) - th - 8))
+            self.canvas.create_rectangle(
+                tx - 6, ty - 4, tx + tw, ty + th,
+                fill="#0f141c", outline="#5c6bc0", width=1,
+                tags="trunk_hydro_hover",
+            )
+            self.canvas.create_text(
+                tx, ty, anchor=tk.NW,
+                fill="#E8EAF6", font=("Segoe UI", 9, "bold"),
+                tags="trunk_hydro_hover", text="\n".join(lines),
+            )
+            return
         pick = self._trunk_hydro_hover_pick(wx, wy)
         if pick is None:
             return
         si = int(pick["si"])
         row = pick["row"]
         pl = pick["pl"]
-        try:
-            dmm = float(row.get("d_inner_mm", 0.0) or 0.0)
-        except (TypeError, ValueError):
-            dmm = 0.0
-        try:
-            qv = float(row.get("q_m3s", 0.0) or 0.0)
-        except (TypeError, ValueError):
-            qv = 0.0
-        dom = row.get("dominant_slot")
-        q_m3h = qv * 3600.0
-        if dom is not None:
-            try:
-                slot_n = int(dom) + 1
-            except (TypeError, ValueError):
-                slot_txt = "полив —"
-            else:
-                slot_txt = f"полив {slot_n}"
+        draw_pl = pl
+        sec_pick: Optional[dict] = None
+        if not self._trunk_map_hover_show_pipes_detail():
+            lines = [s for s in str(self.trunk_map_pick_label_for_segment(si)).split("\n") if s.strip()]
         else:
-            slot_txt = "немає потоку (Q≈0)"
-        pipe_lab = self.trunk_pipe_label_for_inner_mm(dmm)
-        line_q = f"Q ≈ {self._fmt_flow_m3h(q_m3h)} м³/год"
-        lines = [pipe_lab, line_q, slot_txt]
+            geom = self._trunk_pipes_hover_geom_caption(si, wx, wy, row)
+            if geom is None:
+                return
+            draw_pl, lines, sec_pick = geom
         scr: list = []
-        for xy in pl:
+        for xy in draw_pl:
             scr.extend(self.to_screen(float(xy[0]), float(xy[1])))
         if len(scr) < 4:
             return
-        col = self.trunk_hydro_segment_line_color(si) or "#78909C"
+        if self._trunk_map_hover_show_pipes_detail() and sec_pick is not None:
+            col = self._trunk_telescope_chunk_line_color(si, sec_pick) or (
+                self.trunk_hydro_segment_line_color(si) or "#78909C"
+            )
+        else:
+            col = self.trunk_hydro_segment_line_color(si) or "#78909C"
         lw = max(6, min(18, int(8 + self.zoom * 0.12)))
         self.canvas.create_line(scr, fill="#FFFDE7", width=lw + 4, tags="trunk_hydro_hover")
         self.canvas.create_line(scr, fill=col, width=lw, tags="trunk_hydro_hover")
@@ -6851,50 +10248,125 @@ class DripCAD:
         m = self.mode.get()
         if m in ("RULER", "INFO", "LAT_TIP", "DEL"):
             return
+        p_pick = self._trunk_hydro_hover_pick_pump(wx, wy)
+        if p_pick is not None:
+            node = p_pick["node"]
+            nid = str(node.get("id", "")).strip() or "?"
+            try:
+                nx = float(node.get("x", 0.0))
+                ny = float(node.get("y", 0.0))
+            except (TypeError, ValueError):
+                return
+            txy = to_canvas_xy(nx, ny)
+            if not txy:
+                return
+            if self._trunk_map_hover_show_pipes_detail():
+                qp = self.trunk_irrigation_hydro_pump_qp_hover_lines()
+                if qp is None:
+                    return
+                lines = [qp[0], qp[1]]
+            else:
+                lines = [f"Насос (витік), {nid}", "Топологія вузла (без Q/P з розрахунку)"]
+            tx, ty = int(txy[0]) + 10, int(txy[1]) - 10
+            tw = min(340, max(170, 8 + max(len(s) for s in lines) * 6))
+            th = 8 + len(lines) * 13
+            canvas.create_oval(
+                int(txy[0]) - 8, int(txy[1]) - 8, int(txy[0]) + 8, int(txy[1]) + 8,
+                outline="#FFF59D", width=3, fill="", tags="map_live_preview",
+            )
+            canvas.create_rectangle(
+                tx - 4, ty - th, tx + tw, ty + 6,
+                fill="#0f141c", outline="#5c6bc0", width=1, tags="map_live_preview",
+            )
+            canvas.create_text(
+                tx, ty - th + 4, anchor=tk.NW,
+                fill="#E8EAF6", font=("Segoe UI", 8, "bold"),
+                tags="map_live_preview", text="\n".join(lines),
+            )
+            return
+        c_pick = self._trunk_hydro_hover_pick_consumer(wx, wy)
+        if c_pick is not None:
+            ni = int(c_pick["ni"])
+            node = c_pick["node"]
+            h_m = float(c_pick["h_m"])
+            slot_i = c_pick.get("slot_i")
+            try:
+                nx = float(node.get("x", 0.0))
+                ny = float(node.get("y", 0.0))
+            except (TypeError, ValueError):
+                nx, ny = float(wx), float(wy)
+            txy = to_canvas_xy(nx, ny)
+            if not txy:
+                return
+            cap = self.trunk_consumer_display_caption(node, ni)
+            if self._trunk_map_hover_show_pipes_detail():
+                if slot_i is None:
+                    slot_txt = "реальний H (мін по слотах)"
+                else:
+                    slot_txt = f"полив {int(slot_i) + 1} (мін H)"
+                lines = [cap, f"H ≈ {h_m:.2f} м вод. ст.", slot_txt]
+            else:
+                role = (
+                    "кінцевий"
+                    if hasattr(self, "_trunk_consumption_is_terminal")
+                    and self._trunk_consumption_is_terminal(ni)
+                    else "проміжний"
+                )
+                lines = [cap, f"Споживач ({role}) — топологія"]
+            tx, ty = int(txy[0]) + 10, int(txy[1]) - 10
+            tw = min(340, max(170, 8 + max(len(s) for s in lines) * 6))
+            th = 8 + len(lines) * 13
+            canvas.create_oval(
+                int(txy[0]) - 8, int(txy[1]) - 8, int(txy[0]) + 8, int(txy[1]) + 8,
+                outline="#FFF59D", width=3, fill="", tags="map_live_preview",
+            )
+            canvas.create_rectangle(
+                tx - 4, ty - th, tx + tw, ty + 6,
+                fill="#0f141c", outline="#5c6bc0", width=1, tags="map_live_preview",
+            )
+            canvas.create_text(
+                tx, ty - th + 4, anchor=tk.NW,
+                fill="#E8EAF6", font=("Segoe UI", 8, "bold"),
+                tags="map_live_preview", text="\n".join(lines),
+            )
+            return
         pick = self._trunk_hydro_hover_pick(wx, wy)
         if pick is None:
             return
         si = int(pick["si"])
         row = pick["row"]
         pl = pick["pl"]
-        try:
-            dmm = float(row.get("d_inner_mm", 0.0) or 0.0)
-        except (TypeError, ValueError):
-            dmm = 0.0
-        try:
-            qv = float(row.get("q_m3s", 0.0) or 0.0)
-        except (TypeError, ValueError):
-            qv = 0.0
-        dom = row.get("dominant_slot")
-        q_m3h = qv * 3600.0
-        if dom is not None:
-            try:
-                slot_n = int(dom) + 1
-                slot_txt = f"полив {slot_n}"
-            except (TypeError, ValueError):
-                slot_txt = "полив —"
+        draw_pl = pl
+        sec_pick: Optional[dict] = None
+        if not self._trunk_map_hover_show_pipes_detail():
+            lines = [s for s in str(self.trunk_map_pick_label_for_segment(si)).split("\n") if s.strip()]
         else:
-            slot_txt = "немає потоку (Q≈0)"
-        pipe_lab = self.trunk_pipe_label_for_inner_mm(dmm)
-        line_q = f"Q ≈ {self._fmt_flow_m3h(q_m3h)} м³/год"
-        lines = [pipe_lab, line_q, slot_txt]
+            geom = self._trunk_pipes_hover_geom_caption(si, wx, wy, row)
+            if geom is None:
+                return
+            draw_pl, lines, sec_pick = geom
         scr_flat: list = []
-        for xy in pl:
+        for xy in draw_pl:
             cc = to_canvas_xy(float(xy[0]), float(xy[1]))
             if cc:
                 scr_flat.extend(cc)
         if len(scr_flat) < 4:
             return
-        col = self.trunk_hydro_segment_line_color(si) or "#78909C"
+        if self._trunk_map_hover_show_pipes_detail() and sec_pick is not None:
+            col = self._trunk_telescope_chunk_line_color(si, sec_pick) or (
+                self.trunk_hydro_segment_line_color(si) or "#78909C"
+            )
+        else:
+            col = self.trunk_hydro_segment_line_color(si) or "#78909C"
         canvas.create_line(*scr_flat, fill="#FFFDE7", width=12, tags="map_live_preview")
         canvas.create_line(*scr_flat, fill=col, width=7, tags="map_live_preview")
         # Точка підпису — найближча на полілінії до курсора
         try:
-            ls = LineString([(float(a), float(b)) for a, b in pl])
+            ls = LineString([(float(a), float(b)) for a, b in draw_pl])
             cp = ls.interpolate(ls.project(Point(float(wx), float(wy))))
             txy = to_canvas_xy(float(cp.x), float(cp.y))
         except Exception:
-            txy = to_canvas_xy(float(pl[0][0]), float(pl[0][1]))
+            txy = to_canvas_xy(float(draw_pl[0][0]), float(draw_pl[0][1]))
         if not txy:
             return
         tw = min(340, max(150, 8 + max(len(s) for s in lines) * 6))
@@ -6948,7 +10420,7 @@ class DripCAD:
         cx: float,
         cy: float,
         nid: str,
-        tags: str,
+        tags: Any,
     ) -> None:
         tid = str(nid or "").strip()
         if not tid:
@@ -6995,15 +10467,106 @@ class DripCAD:
         except Exception:
             pass
 
-    def trunk_hydro_segment_line_color(self, seg_index: int) -> Optional[str]:
-        h = getattr(self, "trunk_irrigation_hydro_cache", None)
+    @staticmethod
+    def _trunk_irrigation_hydro_dict_has_results(h: Any) -> bool:
+        """Чи кеш HW розкладу магістралі містить дані для кольорів/підписів (не лише порожні поля)."""
         if not isinstance(h, dict):
+            return False
+        sh = h.get("segment_hover")
+        if isinstance(sh, dict) and sh:
+            return True
+        ps = h.get("per_slot")
+        if isinstance(ps, dict) and ps:
+            return True
+        env = h.get("envelope") if isinstance(h.get("envelope"), dict) else {}
+        try:
+            if float(env.get("max_total_q_m3s", 0.0) or 0.0) > 1e-18:
+                return True
+        except (TypeError, ValueError):
+            pass
+        return False
+
+    def trunk_hydro_segment_line_color(self, seg_index: int) -> Optional[str]:
+        segs = getattr(self, "trunk_map_segments", []) or []
+        if seg_index < 0 or seg_index >= len(segs):
             return None
-        m = h.get("seg_dominant_slot") or {}
-        si = m.get(int(seg_index))
-        if si is None:
-            return None
-        return self.irrigation_slot_color_hex(int(si))
+        seg = segs[seg_index] if isinstance(segs[seg_index], dict) else {}
+        # Службовий режим для BOM: відрізок не рахується в метраж, малюємо його чорним.
+        if bool(seg.get("bom_length_zero", False)):
+            return "#000000"
+        h = getattr(self, "trunk_irrigation_hydro_cache", None)
+        post_hydro = DripCAD._trunk_irrigation_hydro_dict_has_results(h)
+
+        if post_hydro:
+            # Після HW/оптимізації достовірне джерело — d_inner із кешу/сегмента.
+            # pipe_od/pn на сегменті можуть бути застарілими (напр., лишились "110" після
+            # оптимізації, яка перейшла на 90); тому d_inner у пріоритеті над pipe_od.
+            dmm: Optional[float] = None
+            sh = h.get("segment_hover") if isinstance(h.get("segment_hover"), dict) else {}
+            row = sh.get(str(seg_index))
+            if not isinstance(row, dict):
+                row = sh.get(int(seg_index))  # type: ignore[arg-type]
+            if isinstance(row, dict):
+                try:
+                    dmm = float(row.get("d_inner_mm", 0.0) or 0.0)
+                except (TypeError, ValueError):
+                    dmm = None
+            if dmm is None or dmm <= 1e-6:
+                try:
+                    dmm = float(seg.get("d_inner_mm", 0.0) or 0.0)
+                except (TypeError, ValueError):
+                    dmm = 0.0
+            c_inner = self._trunk_segment_pipe_color_from_catalog_inner(float(dmm)) if dmm and dmm > 1e-6 else None
+            if c_inner:
+                return c_inner
+            c_db = self._trunk_segment_pipe_color_from_db(seg)
+            if c_db:
+                return c_db
+            m = h.get("seg_dominant_slot") or {}
+            raw_si = None
+            if isinstance(m, dict):
+                raw_si = m.get(seg_index)
+                if raw_si is None:
+                    raw_si = m.get(int(seg_index))
+                if raw_si is None:
+                    raw_si = m.get(str(int(seg_index)))
+            if raw_si is not None:
+                try:
+                    return self.irrigation_slot_color_hex(int(raw_si))
+                except (TypeError, ValueError):
+                    pass
+            return "#78909C"
+
+        slot = self._trunk_topology_dominant_slot_for_segment(seg_index)
+        if slot is not None:
+            return self.irrigation_slot_color_hex(int(slot))
+        return None
+
+    def _trunk_irrigation_worst_min_consumer_head_from_cache(self, h: dict) -> Optional[float]:
+        """Мінімум по поливах від min_consumer_head_m (результат HW); не плутати з заданим H насоса."""
+        env = h.get("envelope") if isinstance(h.get("envelope"), dict) else {}
+        raw = env.get("worst_min_consumer_head_m")
+        if raw is not None:
+            try:
+                return float(raw)
+            except (TypeError, ValueError):
+                pass
+        per = h.get("per_slot") or {}
+        out: Optional[float] = None
+        for row in per.values():
+            if not isinstance(row, dict):
+                continue
+            if row.get("source_head_m") is None:
+                continue
+            mh = row.get("min_consumer_head_m")
+            if mh is None:
+                continue
+            try:
+                v = float(mh)
+            except (TypeError, ValueError):
+                continue
+            out = v if out is None else min(out, v)
+        return out
 
     def trunk_irrigation_hydro_pump_label_lines(self) -> Optional[Tuple[str, str]]:
         """Два рядки підпису насоса або None."""
@@ -7011,28 +10574,99 @@ class DripCAD:
         if not isinstance(h, dict):
             return None
         env = h.get("envelope") or {}
-        mh = float(env.get("max_source_head_m", 0.0))
         mq = float(env.get("max_total_q_m3s", 0.0))
-        if mh <= 1e-6 and mq <= 1e-12:
+        h_worst = self._trunk_irrigation_worst_min_consumer_head_from_cache(h)
+        if mq <= 1e-12 and h_worst is None:
             return None
         q_m3h = mq * 3600.0
         th = float(h.get("test_h_m", 40.0))
         tq = float(h.get("test_q_m3h", 60.0))
         lim = h.get("limits") if isinstance(h.get("limits"), dict) else {}
+        mode = h.get("mode") if isinstance(h.get("mode"), dict) else {}
         try:
             vmax = float(lim.get("max_pipe_velocity_mps", 0.0) or 0.0)
-            pump_h = float(lim.get("pump_operating_head_m", lim.get("max_pump_head_m", 0.0)) or 0.0)
+            h_zad = float(lim.get("pump_operating_head_m", lim.get("max_pump_head_m", 0.0)) or 0.0)
         except (TypeError, ValueError):
-            vmax, pump_h = 0.0, 0.0
-        if pump_h <= 1e-9:
-            pump_h = float(mh)
+            vmax, h_zad = 0.0, 0.0
+        is_required_mode = str(mode.get("pump_head_mode", "fixed")).strip().lower() == "required"
+        if is_required_mode:
+            try:
+                h_zad = float(env.get("max_source_head_m", h_zad) or h_zad)
+            except (TypeError, ValueError):
+                pass
+        if h_zad <= 1e-9:
+            try:
+                h_zad = float(self.consumer_schedule.get("max_pump_head_m", 50.0) or 50.0)
+            except (TypeError, ValueError):
+                h_zad = 50.0
         lim_s = ""
         if vmax > 1e-9:
             lim_s = f"  •  v≤{vmax:.1f} м/с"
-        return (
-            f"Насос: H баж. {pump_h:.1f} м (розр. {mh:.1f} м)  Q≥{self._fmt_flow_m3h(q_m3h)} м³/год{lim_s}",
-            f"(тест: Hспож≥{th:.0f} м, {tq:.0f} м³/год; нижчий H насоса — нижчий тиск у магістралі)",
+        head_caption = "H потрібний" if is_required_mode else "H задано"
+        h_min_src_req: Optional[float] = None
+        if not is_required_mode:
+            raw_m = env.get("min_required_source_head_m")
+            if raw_m is not None:
+                try:
+                    h_min_src_req = float(raw_m)
+                except (TypeError, ValueError):
+                    h_min_src_req = None
+                if h_min_src_req is not None and h_min_src_req <= 1e-9:
+                    h_min_src_req = None
+        req_src_frag = ""
+        if h_min_src_req is not None:
+            req_src_frag = f"  •  H на джерелі мін. (оцінка) ≈ {h_min_src_req:.1f} м"
+        if h_worst is not None:
+            line1 = (
+                f"Насос: {head_caption} {h_zad:.1f} м{req_src_frag}  •  H мін. у споживачах ≈ {h_worst:.1f} м  •  "
+                f"Q≥{self._fmt_flow_m3h(q_m3h)} м³/год{lim_s}"
+            )
+        else:
+            line1 = (
+                f"Насос: {head_caption} {h_zad:.1f} м{req_src_frag}  •  Q≥{self._fmt_flow_m3h(q_m3h)} м³/год{lim_s}"
+            )
+        line2 = (
+            "(H мін. у споживачах — найнижчий напір серед активних споживачів у розрахованих поливах; "
+            f"тест: Hспож≥{th:.0f} м, {tq:.0f} м³/год"
+            + (
+                "; H на джерелі мін. — оцінка мінімального напору на насосі за поточними діаметрами та цілями Hспож "
+                "(бінарний пошук по найгіршому слоту поливу)"
+                if req_src_frag
+                else ""
+            )
+            + ")"
         )
+        return (line1, line2)
+
+    def trunk_irrigation_hydro_pump_qp_hover_lines(self) -> Optional[Tuple[str, str]]:
+        """Два рядки для hover по насосу: Q та P (після розрахунку)."""
+        h = getattr(self, "trunk_irrigation_hydro_cache", None)
+        if not isinstance(h, dict):
+            return None
+        env = h.get("envelope") or {}
+        try:
+            q_m3h = float(env.get("max_total_q_m3s", 0.0) or 0.0) * 3600.0
+        except (TypeError, ValueError):
+            q_m3h = 0.0
+        lim = h.get("limits") if isinstance(h.get("limits"), dict) else {}
+        mode = h.get("mode") if isinstance(h.get("mode"), dict) else {}
+        try:
+            p_m = float(lim.get("pump_operating_head_m", lim.get("max_pump_head_m", 0.0)) or 0.0)
+        except (TypeError, ValueError):
+            p_m = 0.0
+        if str(mode.get("pump_head_mode", "fixed")).strip().lower() == "required":
+            try:
+                p_m = float(env.get("max_source_head_m", p_m) or p_m)
+            except (TypeError, ValueError):
+                pass
+        if p_m <= 1e-9:
+            try:
+                p_m = float(self.consumer_schedule.get("max_pump_head_m", 50.0) or 50.0)
+            except (TypeError, ValueError):
+                p_m = 50.0
+        if q_m3h <= 1e-9 and p_m <= 1e-9:
+            return None
+        return (f"Q ≈ {self._fmt_flow_m3h(q_m3h)} м³/год", f"P ≈ {p_m:.1f} м вод. ст.")
 
     def _draw_trunk_irrigation_pump_label_canvas(self) -> None:
         lines = self.trunk_irrigation_hydro_pump_label_lines()
@@ -7055,7 +10689,7 @@ class DripCAD:
                 anchor=tk.N,
                 fill="#FFE082",
                 font=("Segoe UI", 8, "bold"),
-                tags="trunk_map_canvas",
+                tags=_TRUNK_MAP_TAGS_COSMETIC,
             )
             self.canvas.create_text(
                 cx,
@@ -7064,9 +10698,163 @@ class DripCAD:
                 anchor=tk.N,
                 fill="#B0BEC5",
                 font=("Segoe UI", 7),
-                tags="trunk_map_canvas",
+                tags=_TRUNK_MAP_TAGS_COSMETIC,
             )
             return
+
+    def _trunk_caption_for_schedule_node_id(self, nid: str) -> str:
+        tid = (nid or "").strip()
+        if not tid:
+            return "—"
+        for i, node in enumerate(getattr(self, "trunk_map_nodes", []) or []):
+            if str(node.get("id", "")).strip() != tid:
+                continue
+            return self.trunk_consumer_display_caption(node, i)
+        return tid
+
+    def _slot_row_chart_focus_fallback(
+        self,
+        row: dict,
+        target_h: float,
+        *,
+        prefer_worst_deficit_vs_target: bool,
+    ) -> Optional[str]:
+        """Для старих кешів без chart_focus_consumer_id — з node_head_m і цілі test_h_m."""
+        nh = row.get("node_head_m")
+        if not isinstance(nh, dict) or not nh:
+            return None
+        allowed: Set[str] = set()
+        for node in getattr(self, "trunk_map_nodes", []) or []:
+            if str(node.get("kind", "")).lower() in ("consumption", "valve"):
+                tid = str(node.get("id", "")).strip()
+                if tid:
+                    allowed.add(tid)
+        if not allowed:
+            return None
+        th = float(target_h)
+        if prefer_worst_deficit_vs_target:
+            best_nid: Optional[str] = None
+            best_d = -1.0
+            for nid_raw, hv in nh.items():
+                sid = str(nid_raw).strip()
+                if sid not in allowed:
+                    continue
+                try:
+                    h = float(hv)
+                except (TypeError, ValueError):
+                    continue
+                d = max(0.0, th - h)
+                if d < 1e-9:
+                    continue
+                if best_nid is None or d > best_d + 1e-9:
+                    best_d = d
+                    best_nid = sid
+                elif abs(d - best_d) <= 1e-9 and best_nid is not None and sid < best_nid:
+                    best_nid = sid
+            return best_nid
+        best_h = 1e18
+        best_nid2: Optional[str] = None
+        for nid_raw, hv in nh.items():
+            sid = str(nid_raw).strip()
+            if sid not in allowed:
+                continue
+            try:
+                h = float(hv)
+            except (TypeError, ValueError):
+                continue
+            if h < best_h - 1e-9:
+                best_h = h
+                best_nid2 = sid
+        return best_nid2
+
+    def focus_trunk_consumer_from_deficit_chart(self, node_id: str) -> None:
+        """Центрувати полотно на споживачі та підсвітити його (з вікна гістограми дефіциту)."""
+        nid = (node_id or "").strip()
+        if not nid:
+            return
+        self._trunk_deficit_focus_node_id = nid
+        wx: Optional[float] = None
+        wy: Optional[float] = None
+        for node in getattr(self, "trunk_map_nodes", []) or []:
+            if str(node.get("id", "")).strip() != nid:
+                continue
+            try:
+                wx = float(node["x"])
+                wy = float(node["y"])
+            except (KeyError, TypeError, ValueError):
+                return
+            break
+        if wx is None or wy is None:
+            return
+        try:
+            self.canvas.update_idletasks()
+            cw = max(1, int(self.canvas.winfo_width()))
+            ch = max(1, int(self.canvas.winfo_height()))
+        except tk.TclError:
+            cw, ch = 800, 600
+        z = float(self.zoom)
+        self.zoom = max(1.0, min(14.0, z if z >= 1.0 else 1.4))
+        self.offset_x = cw / 2.0 - wx * self.zoom
+        self.offset_y = ch / 2.0 - wy * self.zoom
+        self.redraw()
+        try:
+            self._schedule_embedded_map_overlay_refresh()
+        except Exception:
+            pass
+
+    def _focus_trunk_node_after_insert(self, node_id: str) -> None:
+        """Після автододавання пікета: центр на вузлі на полотні та, за можливості, на карті."""
+        nid = str(node_id or "").strip()
+        if not nid:
+            return
+        wx: Optional[float] = None
+        wy: Optional[float] = None
+        for node in getattr(self, "trunk_map_nodes", []) or []:
+            if str(node.get("id", "")).strip() != nid:
+                continue
+            try:
+                wx = float(node.get("x"))
+                wy = float(node.get("y"))
+            except (TypeError, ValueError):
+                return
+            break
+        if wx is None or wy is None:
+            return
+        try:
+            self.canvas.update_idletasks()
+            cw = max(1, int(self.canvas.winfo_width()))
+            ch = max(1, int(self.canvas.winfo_height()))
+        except tk.TclError:
+            cw, ch = 800, 600
+        z = float(self.zoom)
+        self.zoom = max(1.2, min(14.0, z if z >= 1.2 else 1.6))
+        self.offset_x = cw / 2.0 - wx * self.zoom
+        self.offset_y = ch / 2.0 - wy * self.zoom
+        host = getattr(self, "_embedded_map_host", None)
+        focus_cb = getattr(host, "_focus_trunk_node_by_id", None) if host is not None else None
+        if callable(focus_cb):
+            try:
+                focus_cb(nid)
+            except Exception:
+                pass
+        self.redraw()
+        try:
+            self._schedule_embedded_map_overlay_refresh()
+        except Exception:
+            pass
+
+    def _set_trunk_profile_probe(self, wx: Optional[float], wy: Optional[float], seg_index: Optional[int]) -> None:
+        if wx is None or wy is None:
+            self._trunk_profile_probe_world = None
+            self._trunk_profile_probe_segment_idx = None
+        else:
+            self._trunk_profile_probe_world = (float(wx), float(wy))
+            self._trunk_profile_probe_segment_idx = int(seg_index) if seg_index is not None else None
+        self.redraw()
+        try:
+            self._schedule_embedded_map_overlay_refresh()
+        except Exception:
+            pass
 
     def _open_trunk_head_deficit_chart(self, cache: dict) -> None:
         """Гістограма дефіциту напору / попереджень по поливах (Canvas, без системного beep)."""
@@ -7079,7 +10867,13 @@ class DripCAD:
         except Exception:
             return
 
-        items: List[Tuple[int, str, float, str]] = []
+        # Кольори максимально розрізнювані: рожевий / пурпур / бурштин / бірюза.
+        COL_DEFICIT = "#F50057"
+        COL_DEFICIT_VEL = "#651FFF"
+        COL_VEL = "#FFD600"
+        COL_FAIL = "#00ACC1"
+
+        items: List[Tuple[int, str, float, str, Optional[str]]] = []
         for sk, row in per.items():
             if not isinstance(row, dict):
                 continue
@@ -7090,8 +10884,12 @@ class DripCAD:
                 si = int(sk)
             except (TypeError, ValueError):
                 continue
+            raw_cid = row.get("chart_focus_consumer_id")
+            cid: Optional[str] = None
+            if raw_cid is not None and str(raw_cid).strip():
+                cid = str(raw_cid).strip()
             if row.get("source_head_m") is None:
-                items.append((si, "fail", 0.0, "#C62828"))
+                items.append((si, "fail", 0.0, COL_FAIL, None))
                 continue
             deficit = 0.0
             try:
@@ -7109,16 +10907,24 @@ class DripCAD:
                         deficit = 0.0
             has_vel = any("м/с" in str(x) for x in issues)
             if deficit >= 1e-3:
-                col = "#BF360C" if has_vel else "#E53935"
-                items.append((si, "deficit", deficit, col))
+                if cid is None:
+                    cid = self._slot_row_chart_focus_fallback(
+                        row, float(target_h), prefer_worst_deficit_vs_target=True
+                    )
+                col = COL_DEFICIT_VEL if has_vel else COL_DEFICIT
+                items.append((si, "deficit", deficit, col, cid))
             elif has_vel:
-                items.append((si, "vel", 0.0, "#FB8C00"))
+                if cid is None:
+                    cid = self._slot_row_chart_focus_fallback(
+                        row, float(target_h), prefer_worst_deficit_vs_target=False
+                    )
+                items.append((si, "vel", 0.0, COL_VEL, cid))
 
         if not items:
             return
 
         items.sort(key=lambda x: x[0])
-        deficit_heights = [h for _, k, h, _ in items if k == "deficit"]
+        deficit_heights = [h for _, k, h, _, _ in items if k == "deficit"]
         ymax = 4.0
         if deficit_heights:
             ymax = max(ymax, max(deficit_heights) * 1.15)
@@ -7129,7 +10935,7 @@ class DripCAD:
         gap = 8
         bar_w = max(12, min(26, max(1, 680 // max(n, 1))))
         plot_w = max(420, min(920, n * (bar_w + gap) + 48))
-        margin_l, margin_r, margin_t, margin_b = 52, 24, 44, 72
+        margin_l, margin_r, margin_t, margin_b = 52, 24, 44, 108
         cv_w = plot_w + margin_l + margin_r
         cv_h = 300 + margin_t + margin_b
 
@@ -7145,9 +10951,10 @@ class DripCAD:
         tk.Label(
             frm,
             text=(
-                f"Ціль: мін. напір у споживачах ≥ {target_h:.1f} м вод. ст. "
-                "Червоний стовпчик — дефіцит напору (м); помаранчевий — перевищення швидкості (умовна висота); "
-                "темно-червоний — немає сталого розв’язку."
+                f"Типовий H тесту (вкладка «Розклад»): {target_h:.1f} м — лише значення за замовчуванням для споживачів без trunk_schedule_h_m на вузлі. "
+                "Фактичний дефіцит на стовпчику — до індивідуальної цілі того вузла, що підсвічено стрілкою (або до тестового H, якщо індив. не задано). "
+                "Рожевий — лише дефіцит; пурпур — дефіцит і перевищення v; бурштин — лише v; бірюза — немає сталого розв’язку. "
+                "ЛКМ по стовпцю — показати споживача на схемі магістралі."
             ),
             bg="#1a1e24",
             fg="#B0BEC5",
@@ -7166,7 +10973,25 @@ class DripCAD:
         cv.pack(fill=tk.BOTH, expand=True)
         rowb = tk.Frame(frm, bg="#1a1e24")
         rowb.pack(fill=tk.X, pady=(8, 0))
-        ttk.Button(rowb, text="Закрити", command=win.destroy).pack(side=tk.RIGHT)
+
+        pick_zones: List[Tuple[float, float, float, float, Optional[str]]] = []
+
+        def _close_chart() -> None:
+            self._trunk_deficit_focus_node_id = None
+            try:
+                self.redraw()
+            except Exception:
+                pass
+            try:
+                win.destroy()
+            except tk.TclError:
+                pass
+
+        ttk.Button(rowb, text="Закрити", command=_close_chart).pack(side=tk.RIGHT)
+        try:
+            win.protocol("WM_DELETE_WINDOW", _close_chart)
+        except tk.TclError:
+            pass
 
         plot_h = cv_h - margin_t - margin_b
         ax_y0 = margin_t + plot_h
@@ -7203,9 +11028,9 @@ class DripCAD:
 
         x0 = plot_x0 + (plot_w - n * bar_w - max(0, n - 1) * gap) // 2
         x_cursor = float(x0)
-        for si, kind, hm, color in items:
+        for si, kind, hm, color, cons_id in items:
             if kind == "fail":
-                bar_h_m = ymax * 0.38
+                bar_h_m = ymax * 0.36
             elif kind == "vel":
                 bar_h_m = stub_h
             else:
@@ -7214,43 +11039,69 @@ class DripCAD:
             x2 = x_cursor + bar_w
             y1 = y_to_px(bar_h_m)
             y2 = ax_y0
-            cv.create_rectangle(x1, y1, x2, y2, fill=color, outline="#1a1e24", width=1)
+            cv.create_rectangle(
+                x1, y1, x2, y2, fill=color, outline="#ECEFF1", width=1
+            )
+            cx = (x1 + x2) * 0.5
             cv.create_text(
-                (x1 + x2) * 0.5,
+                cx,
                 y2 + 10,
                 text=str(si + 1),
                 anchor=tk.N,
                 fill="#CFD8DC",
-                font=("Segoe UI", 8),
+                font=("Segoe UI", 8, "bold"),
             )
+            cap_bottom = y2 + 26
+            if cons_id:
+                cap = self._trunk_caption_for_schedule_node_id(cons_id)
+                if len(cap) > 22:
+                    cap = cap[:20] + "…"
+                cv.create_line(cx, y2 + 22, cx, y2 + 34, fill="#80DEEA", width=2, arrow=tk.LAST)
+                cv.create_text(cx, y2 + 42, text=cap, anchor=tk.N, fill="#B2EBF2", font=("Segoe UI", 7))
+                cap_bottom = y2 + 56
             if kind == "fail":
                 cv.create_text(
-                    (x1 + x2) * 0.5,
+                    cx,
                     y1 - 4,
                     text="×",
                     anchor=tk.S,
-                    fill="#FFCDD2",
-                    font=("Segoe UI", 8, "bold"),
+                    fill="#E0F7FA",
+                    font=("Segoe UI", 9, "bold"),
                 )
             elif kind == "deficit" and hm >= 0.05:
                 cv.create_text(
-                    (x1 + x2) * 0.5,
+                    cx,
                     y1 - 4,
                     text=f"{hm:.2f}",
                     anchor=tk.S,
                     fill="#ECEFF1",
                     font=("Segoe UI", 7),
                 )
+            pick_top = min(y1, y2) - 8
+            pick_bot = max(cap_bottom, y2 + 18)
+            if cons_id:
+                pick_zones.append((x1 - 2, x2 + 2, pick_top, pick_bot, cons_id))
             x_cursor = x2 + gap
 
-        lx = plot_x0 + plot_w - 138
+        def _on_chart_click(ev: tk.Event) -> None:
+            for x1, x2, top, bot, nid in pick_zones:
+                if not nid:
+                    continue
+                if x1 <= ev.x <= x2 and top <= ev.y <= bot:
+                    self.focus_trunk_consumer_from_deficit_chart(nid)
+                    return
+
+        cv.bind("<Button-1>", _on_chart_click)
+
+        lx = plot_x0 + plot_w - 168
         ly = margin_t + 6
         for col, lab in (
-            ("#E53935", "дефіцит H"),
-            ("#FB8C00", "v у трубі"),
-            ("#C62828", "немає H"),
+            (COL_DEFICIT, "дефіцит H"),
+            (COL_DEFICIT_VEL, "дефіцит H + v"),
+            (COL_VEL, "лише v у трубі"),
+            (COL_FAIL, "немає рішення"),
         ):
-            cv.create_rectangle(lx, ly, lx + 10, ly + 10, fill=col, outline="")
+            cv.create_rectangle(lx, ly, lx + 10, ly + 10, fill=col, outline="#ECEFF1", width=1)
             cv.create_text(lx + 14, ly + 5, text=lab, anchor=tk.W, fill="#B0BEC5", font=("Segoe UI", 8))
             ly += 16
 
@@ -7259,100 +11110,248 @@ class DripCAD:
         except tk.TclError:
             pass
 
-    def run_trunk_irrigation_schedule_hydro(self) -> None:
+    @staticmethod
+    def _trunk_eff_materials_with_nonempty_pn(eff: Any) -> Dict[str, Any]:
+        """Матеріали з хоча б одним PN і непорожнім списком зовнішніх Ø (решта — пропуск)."""
+        out: Dict[str, Any] = {}
+        if not isinstance(eff, dict):
+            return out
+        for mat, pns in eff.items():
+            if not isinstance(pns, dict):
+                continue
+            cleaned: Dict[str, Any] = {}
+            for pn, ods in pns.items():
+                if not isinstance(ods, list):
+                    continue
+                olist = [str(o).strip() for o in ods if str(o).strip()]
+                if olist:
+                    cleaned[str(pn).strip()] = olist
+            mkey = str(mat).strip()
+            if mkey and cleaned:
+                out[mkey] = cleaned
+        return out
+
+    @staticmethod
+    def _trunk_schedule_progressbar_style(master: tk.Misc) -> str:
+        """Охристий ttk.Progressbar (clam) — візуально узгоджено з вікном «Розрахунок»."""
+        style_name = "TrunkHydro.Horizontal.TProgressbar"
+        st = ttk.Style(master)
+        try:
+            st.theme_use("clam")
+        except tk.TclError:
+            pass
+        ochre = "#C4933A"
+        st.configure(
+            style_name,
+            troughcolor="#2a2520",
+            background=ochre,
+            lightcolor="#D4A85C",
+            darkcolor="#8B5E28",
+            borderwidth=0,
+        )
+        return style_name
+
+    def _run_trunk_irrigation_optimize_loop(
+        self,
+        *,
+        trunk_nodes: List[Any],
+        trunk_segments: List[Any],
+        slots: Any,
+        trunk_tree_working: dict,
+        eff_filtered: Dict[str, Any],
+        dq: float,
+        dh: float,
+        mph: float,
+        v_pipe_max: float,
+        min_seg_m: float,
+        opt_goal: str,
+        max_sections_per_edge: int,
+        pipe_db: Any,
+        cache_initial: dict,
+        max_hloss_budget_m: float,
+        progress_cb: Optional[Callable[[str], None]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Автопідбір діаметрів/телескопа (CPU). Не змінює self — працює лише з переданими копіями.
+        """
         from modules.hydraulic_module.trunk_irrigation_schedule_hydro import (
             compute_trunk_irrigation_schedule_hydro,
+            optimize_trunk_diameters_by_weight,
         )
 
-        self.normalize_consumer_schedule()
-        cp = getattr(self, "control_panel", None)
-        if cp is not None and hasattr(cp, "_schedule_apply_max_pump_head_from_entry"):
-            if not cp._schedule_apply_max_pump_head_from_entry():
-                return
-        if cp is not None and hasattr(cp, "_schedule_apply_trunk_v_max_from_entry"):
-            if not cp._schedule_apply_trunk_v_max_from_entry():
-                return
-        try:
-            mph = float(self.consumer_schedule.get("max_pump_head_m", 50.0))
-        except (TypeError, ValueError):
-            mph = 50.0
-        mph = max(1.0, min(400.0, mph))
-        self.consumer_schedule["max_pump_head_m"] = mph
-        try:
-            v_pipe_max = float(self.consumer_schedule.get("trunk_schedule_v_max_mps", 2.0))
-        except (TypeError, ValueError):
-            v_pipe_max = 2.0
-        v_pipe_max = max(0.2, min(8.0, v_pipe_max))
-        self.consumer_schedule["trunk_schedule_v_max_mps"] = v_pipe_max
-        ensure_trunk_node_ids(self.trunk_map_nodes)
-        self.sync_trunk_tree_data_from_trunk_map()
-        slots = self.consumer_schedule.get("irrigation_slots") or [[] for _ in range(48)]
-        payload = self._normalize_trunk_tree_payload(getattr(self, "trunk_tree_data", {}))
-        cache, g_issues = compute_trunk_irrigation_schedule_hydro(
-            self.trunk_map_nodes,
-            self.trunk_map_segments,
-            slots,
-            payload,
-            q_consumer_m3h=60.0,
-            target_head_m=40.0,
-            max_pipe_velocity_mps=v_pipe_max,
-            pump_operating_head_m=mph,
-        )
-        autosized_note = ""
+        def _prog(msg: str) -> None:
+            if progress_cb is not None:
+                progress_cb(msg)
+
         auto_warn_msgs: List[str] = []
+        autosized_note = ""
+        optimized_used = False
+        best_metric_val: Optional[float] = None
+        last_cache_ok: Optional[dict] = None
+        budget = float(max_hloss_budget_m)
+        n_mat = max(1, len(eff_filtered))
 
-        if g_issues:
-            self.trunk_irrigation_hydro_cache = None
-            silent_showwarning(
-                self.root,
-                "Магістраль за поливами",
-                "Не виконано розрахунок:\n- " + "\n- ".join(g_issues[:8]),
+        for _iter in range(4):
+            _prog(
+                f"Магістраль поливів: іт.{_iter + 1}/4, ΔH≤{budget:.1f} м "
+                f"({len(eff_filtered)} мат.)"
             )
-            self.notify_irrigation_schedule_ui()
-            self.redraw()
-            try:
-                self._schedule_embedded_map_overlay_refresh()
-            except Exception:
-                pass
-            return
-
-        qmax = self._aggregate_max_edge_q_m3s_from_irrigation_cache(cache)
-        if qmax:
-            tree_backup = copy.deepcopy(getattr(self, "trunk_tree_data", {}) or {})
-            auto_warn_msgs = self._auto_size_trunk_pipes_from_irrigation_cache(
-                cache, v_pipe_max
+            failed_by_mat: List[str] = []
+            best_local = None
+            for mi, (mat, pns) in enumerate(eff_filtered.items()):
+                _prog(f"Підбір: {mat} ({mi + 1}/{n_mat}), іт.{_iter + 1}/4")
+                allowed_one = {str(mat): pns} if isinstance(pns, dict) else {}
+                out_opt, issues_opt = optimize_trunk_diameters_by_weight(
+                    trunk_nodes,
+                    trunk_segments,
+                    slots,
+                    pipes_db=pipe_db,
+                    material=str(mat),
+                    allowed_pipes=allowed_one,
+                    max_head_loss_m=float(budget),
+                    max_velocity_mps=float(v_pipe_max),
+                    default_q_m3h=float(dq),
+                    min_segment_length_m=float(min_seg_m),
+                    objective=str(opt_goal),
+                    max_sections_per_edge=int(max_sections_per_edge),
+                    pump_operating_head_m=float(mph),
+                    schedule_target_head_m=float(dh),
+                )
+                if issues_opt:
+                    failed_by_mat.append(f"[{mat}] " + "; ".join(str(msg) for msg in issues_opt[:2]))
+                    continue
+                if not bool(out_opt.get("feasible")):
+                    failed_by_mat.append(
+                        f"[{mat}] {str(out_opt.get('message', 'Не знайдено допустимого рішення.'))}"
+                    )
+                    continue
+                tw = float(out_opt.get("total_weight_kg", 0.0) or 0.0)
+                metric_val = float(out_opt.get("total_objective_cost", tw) or tw)
+                if best_local is None or metric_val < float(best_local[0]) - 1e-9:
+                    best_local = (metric_val, out_opt)
+            if best_local is None:
+                auto_warn_msgs.extend(failed_by_mat[:12])
+                break
+            best_metric_val = float(best_local[0])
+            optimized = best_local[1]
+            payload_edit = self._normalize_trunk_tree_payload(trunk_tree_working)
+            by_edge = {
+                str(row.get("edge_id", "")).strip(): row
+                for row in (optimized.get("picks") or [])
+                if isinstance(row, dict)
+            }
+            for edge in payload_edit.get("edges", []):
+                if not isinstance(edge, dict):
+                    continue
+                pid = str(edge.get("parent_id", "")).strip()
+                cid = str(edge.get("child_id", "")).strip()
+                key = f"{pid}->{cid}"
+                row = by_edge.get(key)
+                if not row:
+                    continue
+                try:
+                    edge["d_inner_mm"] = float(row.get("d_inner_mm", edge.get("d_inner_mm", 0.0)))
+                except (TypeError, ValueError):
+                    pass
+                secs = row.get("sections")
+                if not isinstance(secs, list) or len(secs) == 0:
+                    alt = row.get("telescoped_sections")
+                    if isinstance(alt, list) and len(alt) > 0:
+                        secs = alt
+                if isinstance(secs, list) and len(secs) > 0:
+                    edge["sections"] = copy.deepcopy(secs)
+                    edge["telescoped_sections"] = copy.deepcopy(secs)
+            trunk_tree_working.clear()
+            trunk_tree_working.update(self._normalize_trunk_tree_payload(payload_edit))
+            self._sync_trunk_segment_hydraulic_props_from_tree(
+                trunk_nodes=trunk_nodes,
+                trunk_segments=trunk_segments,
+                trunk_tree_data=trunk_tree_working,
             )
-            self._sync_trunk_segment_hydraulic_props_from_tree()
-            payload2 = self._normalize_trunk_tree_payload(getattr(self, "trunk_tree_data", {}))
+            payload2 = self._normalize_trunk_tree_payload(trunk_tree_working)
             cache2, g2 = compute_trunk_irrigation_schedule_hydro(
-                self.trunk_map_nodes,
-                self.trunk_map_segments,
+                trunk_nodes,
+                trunk_segments,
                 slots,
                 payload2,
-                q_consumer_m3h=60.0,
-                target_head_m=40.0,
+                q_consumer_m3h=float(dq),
+                target_head_m=float(dh),
                 max_pipe_velocity_mps=v_pipe_max,
                 pump_operating_head_m=mph,
+                use_required_pump_head=False,
             )
             if g2:
-                self.trunk_tree_data = tree_backup
-                self._sync_trunk_segment_hydraulic_props_from_tree()
-                silent_showwarning(
-                    self.root,
-                    "Магістраль за поливами",
-                    "Автопідбір діаметрів виконано, але повторний розрахунок не вдався; "
-                    "відновлено попередні діаметри на магістралі.\n- "
-                    + "\n- ".join(g2[:8]),
-                )
-            else:
-                cache = cache2
-                autosized_note = (
-                    f"Діаметри магістралі підібрано автоматично з дозволеного переліку труб "
-                    f"при v ≤ {v_pipe_max:.2f} м/с.\n"
-                )
+                auto_warn_msgs.extend(g2[:4])
+                budget *= 1.18
+                continue
+            last_cache_ok = cache2
+            optimized_used = True
+            worst_def = 0.0
+            for row in (cache2.get("per_slot") or {}).values():
+                if not isinstance(row, dict):
+                    continue
+                try:
+                    worst_def = max(worst_def, float(row.get("head_deficit_m", 0.0) or 0.0))
+                except (TypeError, ValueError):
+                    continue
+            if worst_def <= 1e-3:
+                break
+            budget *= max(1.05, min(1.35, 1.0 + worst_def / max(1.0, dh)))
 
+        trunk_hydro_opt_applied = bool(optimized_used)
+        if not trunk_hydro_opt_applied:
+            return {
+                "optimized_used": False,
+                "trunk_hydro_opt_applied": False,
+                "cache": cache_initial,
+                "autosized_note": "",
+                "auto_warn_msgs": auto_warn_msgs,
+            }
+        if last_cache_ok is None:
+            return {
+                "optimized_used": False,
+                "trunk_hydro_opt_applied": False,
+                "cache": cache_initial,
+                "autosized_note": "",
+                "auto_warn_msgs": auto_warn_msgs,
+            }
+        if best_metric_val is not None:
+            v_note = (
+                f"v ≤ {v_pipe_max:.2f} м/с"
+                if v_pipe_max > 1e-12
+                else "без обмеження швидкості (підбір за ΔH та каталогом)"
+            )
+            autosized_note = (
+                f"Оптимізація магістралі ({opt_goal}) виконана: "
+                f"{'ΣC≈' if opt_goal == 'money' else 'ΣW≈'}{best_metric_val:.2f} "
+                f"{'грн' if opt_goal == 'money' else 'кг'} "
+                f"при бюджеті ΔH≤{budget:.2f} м ({v_note}), "
+                f"Lсегм≥{min_seg_m:.2f} м, секцій/ребро ≤ {max_sections_per_edge}.\n"
+            )
+        return {
+            "optimized_used": True,
+            "trunk_hydro_opt_applied": True,
+            "cache": last_cache_ok,
+            "autosized_note": autosized_note,
+            "auto_warn_msgs": auto_warn_msgs,
+            "out_nodes": trunk_nodes,
+            "out_segs": trunk_segments,
+            "out_tree": dict(trunk_tree_working),
+        }
+
+    def _finalize_run_trunk_irrigation_schedule_ui(
+        self,
+        cache: dict,
+        autosized_note: str,
+        auto_warn_msgs: List[str],
+        trunk_hydro_opt_applied: bool,
+        pipes_selected: bool,
+        mph: float,
+        _qmax: Any,
+    ) -> None:
+        """Діалоги, кеш, перемальовування після розрахунку магістралі за поливами."""
         self.trunk_irrigation_hydro_cache = cache
-        bad_slots = []
+        bad_slots: List[Tuple[Any, Any]] = []
         for sk, row in (cache.get("per_slot") or {}).items():
             if not isinstance(row, dict):
                 continue
@@ -7369,16 +11368,38 @@ class DripCAD:
                 "\n".join(auto_warn_msgs[:12])
                 + (f"\n… ще {len(auto_warn_msgs) - 12}." if len(auto_warn_msgs) > 12 else ""),
             )
+        note = autosized_note
+        try:
+            max_q_env_m3s = float(
+                ((cache.get("envelope") or {}) if isinstance(cache.get("envelope"), dict) else {}).get(
+                    "max_total_q_m3s", 0.0
+                )
+                or 0.0
+            )
+        except (TypeError, ValueError):
+            max_q_env_m3s = 0.0
+        if not trunk_hydro_opt_applied and not pipes_selected and not note:
+            if max_q_env_m3s <= 1e-12:
+                note = (
+                    "Автопідбір діаметрів і телескопа не виконувався: у слотах немає активних споживачів "
+                    "або витрата на магістралі ≈ 0.\n"
+                )
+            elif not auto_warn_msgs:
+                note = (
+                    "Автопідбір не дав допустимого рішення для жодного матеріалу з дозволених труб "
+                    "(перевірте каталог, allowed_pipes для магістралі та напір насоса / цільовий H).\n"
+                )
+
         if bad_slots:
-            parts = []
+            parts: List[str] = []
             for idx, iss in bad_slots[:6]:
                 ilist = list(iss or [])[:2]
                 parts.append(f"Полив {int(idx) + 1}: " + "; ".join(str(x) for x in ilist))
             msg = "Частина поливів з помилками:\n- " + "\n- ".join(parts)
             if len(bad_slots) > 6:
                 msg += f"\n… ще {len(bad_slots) - 6}."
-            if autosized_note:
-                msg = autosized_note + "\n" + msg
+            if note:
+                msg = note + "\n" + msg
             msg += "\n\nПісля «OK» відкриється графік дефіциту напору / попереджень по слотах."
 
             def _after_bad_slots_warning() -> None:
@@ -7401,21 +11422,360 @@ class DripCAD:
             lim_lines = ""
             if vmax > 1e-9:
                 lim_lines += f"Перевірка швидкості в трубах: v ≤ {vmax:.2f} м/с.\n"
+            tele_sum = self._trunk_telescope_summary_for_ui()
+            tele_block = (tele_sum + "\n") if tele_sum else ""
+            fixed_note = ""
+            if pipes_selected:
+                fixed_note = (
+                    "Режим фіксованих труб: діаметри не змінювались; показано гідравліку для поточних труб.\n"
+                )
             silent_showinfo(
                 self.root,
                 "Магістраль за поливами",
                 f"Готово.\n"
-                f"{autosized_note}"
+                f"{fixed_note}"
+                f"{note}"
+                f"{tele_block}"
                 f"Заданий напір на насосі: H = {mph:.2f} м вод. ст. (під цей тиск підібрана поведінка мережі).\n"
                 f"Макс. Q на насосі по поливах (оцінка): ≥ {self._fmt_flow_m3h(mq)} м³/год\n\n"
                 f"{lim_lines}"
-                f"Сегменти на полотні/карті — кольором домінантного поливу.\n"
+                f"На полотні після розрахунку з’являються підписи труби; наведіть курсор на лінію — "
+                f"деталі Q і телескоп-секцій (якщо є).\n"
                 f"Якщо є попередження по поливах — збільшіть напір насоса або дозволені діаметри труб.",
             )
         self.notify_irrigation_schedule_ui()
         self.redraw()
         try:
             self._schedule_embedded_map_overlay_refresh()
+        except Exception:
+            pass
+        try:
+            from main_app.io import file_io_impl as _file_io
+
+            _file_io.persist_project_snapshot(self, silent=True)
+        except Exception:
+            pass
+
+    def run_trunk_irrigation_schedule_hydro(self) -> None:
+        from modules.hydraulic_module.trunk_irrigation_schedule_hydro import (
+            compute_trunk_irrigation_schedule_hydro,
+        )
+
+        self.normalize_consumer_schedule()
+        cp = getattr(self, "control_panel", None)
+        if cp is not None and hasattr(cp, "_schedule_apply_max_pump_head_from_entry"):
+            if not cp._schedule_apply_max_pump_head_from_entry():
+                return
+        if cp is not None and hasattr(cp, "_schedule_apply_trunk_v_max_from_entry"):
+            if not cp._schedule_apply_trunk_v_max_from_entry():
+                return
+        if cp is not None and hasattr(cp, "_schedule_apply_trunk_min_seg_from_entry"):
+            if not cp._schedule_apply_trunk_min_seg_from_entry():
+                return
+        if cp is not None and hasattr(cp, "_schedule_apply_trunk_max_sections_from_entry"):
+            if not cp._schedule_apply_trunk_max_sections_from_entry():
+                return
+        if cp is not None and hasattr(cp, "_schedule_apply_trunk_opt_goal_from_ui"):
+            cp._schedule_apply_trunk_opt_goal_from_ui()
+        if cp is not None and hasattr(cp, "_schedule_apply_trunk_pipe_mode_from_ui"):
+            cp._schedule_apply_trunk_pipe_mode_from_ui()
+        if cp is not None and hasattr(cp, "_schedule_apply_schedule_test_qh_from_entries"):
+            if not cp._schedule_apply_schedule_test_qh_from_entries():
+                return
+        try:
+            mph = float(self.consumer_schedule.get("max_pump_head_m", 50.0))
+        except (TypeError, ValueError):
+            mph = 50.0
+        mph = max(1.0, min(400.0, mph))
+        self.consumer_schedule["max_pump_head_m"] = mph
+        # За домовленістю оптимізація магістралі й перевірка слотів виконуються
+        # без обмеження швидкості: підбір лише за напором (ΔH) і каталогом.
+        v_pipe_max = 0.0
+        self.consumer_schedule["trunk_schedule_v_max_mps"] = 0.0
+        try:
+            min_seg_m = float(self.consumer_schedule.get("trunk_schedule_min_seg_m", 0.0))
+        except (TypeError, ValueError):
+            min_seg_m = 0.0
+        min_seg_m = max(0.0, min(1000.0, min_seg_m))
+        self.consumer_schedule["trunk_schedule_min_seg_m"] = min_seg_m
+        opt_goal = str(self.consumer_schedule.get("trunk_schedule_opt_goal", "weight")).strip().lower()
+        if opt_goal not in ("weight", "money", "cost_index"):
+            opt_goal = "weight"
+        if opt_goal == "cost_index":
+            opt_goal = "money"
+        self.consumer_schedule["trunk_schedule_opt_goal"] = opt_goal
+        try:
+            max_sections_per_edge = int(self.consumer_schedule.get("trunk_schedule_max_sections_per_edge", 2))
+        except (TypeError, ValueError):
+            max_sections_per_edge = 2
+        max_sections_per_edge = max(1, min(4, max_sections_per_edge))
+        self.consumer_schedule["trunk_schedule_max_sections_per_edge"] = max_sections_per_edge
+        self.reset_trunk_irrigation_schedule_results()
+        ensure_trunk_node_ids(self.trunk_map_nodes)
+        self.sync_trunk_tree_data_from_trunk_map()
+        slots = self.consumer_schedule.get("irrigation_slots") or [[] for _ in range(48)]
+        payload = self._normalize_trunk_tree_payload(getattr(self, "trunk_tree_data", {}))
+        dq = self.trunk_schedule_test_q_m3h_effective()
+        dh = self.trunk_schedule_test_h_m_effective()
+        pipes_selected = bool(self.consumer_schedule.get("trunk_pipes_selected", False))
+        cache, g_issues = compute_trunk_irrigation_schedule_hydro(
+            self.trunk_map_nodes,
+            self.trunk_map_segments,
+            slots,
+            payload,
+            q_consumer_m3h=float(dq),
+            target_head_m=float(dh),
+            max_pipe_velocity_mps=v_pipe_max,
+            pump_operating_head_m=mph,
+            use_required_pump_head=pipes_selected,
+        )
+        autosized_note = ""
+        auto_warn_msgs: List[str] = []
+        trunk_hydro_opt_applied = False
+
+        if g_issues:
+            self.trunk_irrigation_hydro_cache = None
+            silent_showwarning(
+                self.root,
+                "Магістраль за поливами",
+                "Не виконано розрахунок:\n- " + "\n- ".join(g_issues[:8]),
+            )
+            self.notify_irrigation_schedule_ui()
+            self.redraw()
+            try:
+                self._schedule_embedded_map_overlay_refresh()
+            except Exception:
+                pass
+            try:
+                from main_app.io import file_io_impl as _file_io
+
+                _file_io.persist_project_snapshot(self, silent=True)
+            except Exception:
+                pass
+            return
+
+        qmax = self._aggregate_max_edge_q_m3s_from_irrigation_cache(cache)
+        env0 = cache.get("envelope") if isinstance(cache.get("envelope"), dict) else {}
+        try:
+            max_q_slot_m3s = float(env0.get("max_total_q_m3s", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            max_q_slot_m3s = 0.0
+        if (not pipes_selected) and max_q_slot_m3s > 1e-12:
+            if getattr(self, "_trunk_schedule_hydro_running", False):
+                silent_showinfo(
+                    self.root,
+                    "Магістраль за поливами",
+                    "Розрахунок магістралі з автопідбором труб уже виконується. Дочекайтесь завершення.",
+                )
+                return
+            tree_backup_main = copy.deepcopy(getattr(self, "trunk_tree_data", {}) or {})
+            pipe_db_ref = self.pipe_db
+            eff_all = normalize_allowed_pipes_map(
+                getattr(self, "trunk_allowed_pipes", None)
+                or getattr(self, "allowed_pipes", {})
+                or {}
+            )
+            eff_use = self._trunk_eff_materials_with_nonempty_pn(eff_all)
+            if not allowed_pipe_candidates_sorted(
+                normalize_allowed_pipes_map(eff_use), pipe_db_ref
+            ):
+                eff_fb = normalize_allowed_pipes_map(getattr(self, "allowed_pipes", {}) or {})
+                eff_fb_use = self._trunk_eff_materials_with_nonempty_pn(eff_fb)
+                if allowed_pipe_candidates_sorted(
+                    normalize_allowed_pipes_map(eff_fb_use), pipe_db_ref
+                ):
+                    eff_use = eff_fb_use
+                    auto_warn_msgs.append(
+                        "Дозволені труби магістралі не перетинаються з каталогом — для автопідбору "
+                        "використано набір дозволених труб блоку."
+                    )
+            dh_worst = float(
+                self.trunk_schedule_max_target_head_m_among_slots(slots, default_h_m=float(dh))
+            )
+            max_hloss_budget_m = max(0.1, float(mph) - dh_worst)
+            title_base = self.root.title()
+
+            def _restore_title() -> None:
+                try:
+                    self.root.title(title_base)
+                except tk.TclError:
+                    pass
+
+            def _prog_title(msg: str) -> None:
+                try:
+                    m = str(msg).replace("\n", " ")
+                    if len(m) > 72:
+                        m = m[:69] + "…"
+                    self.root.title(f"{title_base} | {m}")
+                except tk.TclError:
+                    pass
+
+            slots_bc = copy.deepcopy(slots)
+
+            prog_win = tk.Toplevel(self.root)
+            prog_win.title("Магістраль за поливами — автопідбір труб")
+            prog_win.configure(bg="#1e1e1e")
+            prog_win.transient(self.root)
+            prog_win.resizable(False, False)
+            prog_win.protocol("WM_DELETE_WINDOW", lambda: None)
+            frp = tk.Frame(prog_win, bg="#1e1e1e", padx=20, pady=16)
+            frp.pack(fill=tk.BOTH, expand=True)
+            prog_lbl = tk.Label(
+                frp,
+                text="Підготовка: копіювання даних мережі…",
+                fg="#00FFCC",
+                bg="#1e1e1e",
+                font=("Segoe UI", 10),
+                wraplength=440,
+                justify=tk.LEFT,
+            )
+            prog_lbl.pack(anchor=tk.W, pady=(0, 6))
+            tk.Label(
+                frp,
+                text=(
+                    "Розрахунок виконується у фоні — інтерфейс не завис.\n"
+                    "Зачекайте завершення; не закривайте головне вікно програми."
+                ),
+                fg="#888888",
+                bg="#1e1e1e",
+                font=("Segoe UI", 8),
+                wraplength=440,
+                justify=tk.LEFT,
+            ).pack(anchor=tk.W, pady=(0, 12))
+            _pb_style = self._trunk_schedule_progressbar_style(prog_win)
+            prog_bar = ttk.Progressbar(
+                frp,
+                length=420,
+                mode="indeterminate",
+                style=_pb_style,
+            )
+            prog_bar.pack(fill=tk.X)
+            prog_bar.start(14)
+
+            def _close_progress_window() -> None:
+                try:
+                    prog_bar.stop()
+                except tk.TclError:
+                    pass
+                try:
+                    if prog_win.winfo_exists():
+                        prog_win.destroy()
+                except tk.TclError:
+                    pass
+
+            try:
+                prog_win.lift()
+                prog_win.update_idletasks()
+            except tk.TclError:
+                pass
+
+            self._trunk_schedule_hydro_running = True
+            try:
+                self.root.title(f"{title_base} | Магістраль: підготовка…")
+            except tk.TclError:
+                pass
+
+            def _prog_ui_update(msg: str) -> None:
+                _prog_title(msg)
+                try:
+                    if prog_lbl.winfo_exists():
+                        m = str(msg).replace("\n", " ")
+                        prog_lbl.config(text=m[:220])
+                except tk.TclError:
+                    pass
+
+            def _after_worker(opt_res: dict) -> None:
+                self._trunk_schedule_hydro_running = False
+                _close_progress_window()
+                _restore_title()
+                if opt_res.get("error"):
+                    silent_showerror(
+                        self.root,
+                        "Магістраль за поливами",
+                        f"Помилка автопідбору:\n{opt_res.get('error')}",
+                    )
+                    self.notify_irrigation_schedule_ui()
+                    self.redraw()
+                    try:
+                        self._schedule_embedded_map_overlay_refresh()
+                    except Exception:
+                        pass
+                    return
+                if opt_res.get("optimized_used"):
+                    self.trunk_map_nodes = copy.deepcopy(opt_res["out_nodes"])
+                    self.trunk_map_segments = copy.deepcopy(opt_res["out_segs"])
+                    self.trunk_tree_data = copy.deepcopy(opt_res["out_tree"])
+                    self._sync_trunk_segment_hydraulic_props_from_tree()
+                else:
+                    self.trunk_tree_data = copy.deepcopy(tree_backup_main)
+                    self._sync_trunk_segment_hydraulic_props_from_tree()
+                c = opt_res["cache"]
+                note = str(opt_res.get("autosized_note") or "")
+                warns = list(opt_res.get("auto_warn_msgs") or [])
+                applied = bool(opt_res.get("trunk_hydro_opt_applied"))
+                self._finalize_run_trunk_irrigation_schedule_ui(
+                    c, note, warns, applied, pipes_selected, mph, qmax
+                )
+
+            def _worker() -> None:
+                opt_res: dict = {}
+                try:
+                    w_nodes = copy.deepcopy(self.trunk_map_nodes)
+                    w_segs = copy.deepcopy(self.trunk_map_segments)
+                    w_tree = copy.deepcopy(getattr(self, "trunk_tree_data", {}) or {})
+
+                    def _prog(m: str) -> None:
+                        self.root.after(0, lambda mm=m: _prog_ui_update(mm))
+
+                    opt_res = self._run_trunk_irrigation_optimize_loop(
+                        trunk_nodes=w_nodes,
+                        trunk_segments=w_segs,
+                        slots=slots_bc,
+                        trunk_tree_working=w_tree,
+                        eff_filtered=eff_use,
+                        dq=float(dq),
+                        dh=float(dh),
+                        mph=float(mph),
+                        v_pipe_max=float(v_pipe_max),
+                        min_seg_m=float(min_seg_m),
+                        opt_goal=str(opt_goal),
+                        max_sections_per_edge=int(max_sections_per_edge),
+                        pipe_db=pipe_db_ref,
+                        cache_initial=cache,
+                        max_hloss_budget_m=float(max_hloss_budget_m),
+                        progress_cb=_prog,
+                    )
+                except Exception as ex:
+                    opt_res = {"error": repr(ex)}
+                self.root.after(0, lambda r=opt_res: _after_worker(r))
+
+            threading.Thread(target=_worker, daemon=True).start()
+            return
+
+        self._finalize_run_trunk_irrigation_schedule_ui(
+            cache,
+            autosized_note,
+            auto_warn_msgs,
+            trunk_hydro_opt_applied,
+            pipes_selected,
+            mph,
+            qmax,
+        )
+
+    def reset_trunk_irrigation_schedule_results(self) -> None:
+        """Скинути кеш/графік результатів розрахунку розкладу без зміни труб і слотів."""
+        self.trunk_irrigation_hydro_cache = None
+        self._trunk_deficit_focus_node_id = None
+        self.notify_irrigation_schedule_ui()
+        self.redraw()
+        try:
+            self._schedule_embedded_map_overlay_refresh()
+        except Exception:
+            pass
+        try:
+            from main_app.io import file_io_impl as _file_io
+
+            _file_io.persist_project_snapshot(self, silent=True)
         except Exception:
             pass
 
@@ -7483,28 +11843,58 @@ class DripCAD:
         self._after_consumer_schedule_edit()
 
     def _draw_trunk_map_on_canvas(self) -> None:
+        hcache = getattr(self, "trunk_irrigation_hydro_cache", None)
+        show_trunk_pipe_labels = DripCAD._trunk_irrigation_hydro_dict_has_results(hcache)
         for si, seg in enumerate(getattr(self, "trunk_map_segments", []) or []):
             pl = self._trunk_segment_world_path(seg)
             if len(pl) < 2:
                 continue
-            scr = []
-            for xy in pl:
-                scr.extend(self.to_screen(float(xy[0]), float(xy[1])))
-            if len(scr) >= 4:
-                col = self.trunk_hydro_segment_line_color(si) or _TRUNK_CANVAS_PATH_COLOR
+            seg_d = seg if isinstance(seg, dict) else {}
+            chunks = self._trunk_segment_telescope_path_chunks(seg_d, pl)
+            n_chunk_labels = sum(1 for _pl, sec in chunks if isinstance(sec, dict))
+            vw = self.trunk_display_velocity_warn_mps_effective()
+            vm = self.trunk_segment_velocity_mps_from_hydro_cache(si)
+            warn_vel = vw > 1e-9 and vm is not None and vm + 1e-9 >= vw
+            for chunk_idx, (chunk_pl, sec) in enumerate(chunks):
+                if chunk_idx > 0:
+                    prev_sec = chunks[chunk_idx - 1][1]
+                    if isinstance(prev_sec, dict) and isinstance(sec, dict):
+                        self._draw_trunk_telescope_diameter_transition_marker(
+                            list(chunk_pl), prev_sec, sec
+                        )
+                scr = []
+                for xy in chunk_pl:
+                    scr.extend(self.to_screen(float(xy[0]), float(xy[1])))
+                if len(scr) < 4:
+                    continue
+                col = self._trunk_telescope_chunk_line_color(si, sec)
+                if warn_vel:
+                    self.canvas.create_line(
+                        scr,
+                        fill="#B71C1C",
+                        width=10,
+                        tags=_TRUNK_MAP_TAGS_BOM,
+                    )
                 self.canvas.create_line(
                     scr,
                     fill=col,
-                    width=6,
-                    tags="trunk_map_canvas",
+                    width=_TRUNK_MAP_SEGMENT_LINE_WIDTH_PX,
+                    tags=_TRUNK_MAP_TAGS_BOM,
                 )
+                if show_trunk_pipe_labels and isinstance(sec, dict):
+                    self._draw_trunk_telescope_chunk_label(
+                        si, chunk_idx, list(chunk_pl), sec
+                    )
+            if not show_trunk_pipe_labels:
+                continue
             mi = len(pl) // 2
             try:
                 sx, sy = self.to_screen(float(pl[mi][0]), float(pl[mi][1]))
             except (TypeError, ValueError, IndexError):
                 pass
             else:
-                cap = self.trunk_pipe_label_for_segment(seg)
+                seg_d = seg if isinstance(seg, dict) else {}
+                cap = self.trunk_pipe_label_for_segment(seg_d)
                 if len(cap) > 28:
                     cap = cap[:25] + "…"
                 self.canvas.create_text(
@@ -7514,8 +11904,21 @@ class DripCAD:
                     anchor=tk.W,
                     fill="#E1BEE7",
                     font=("Segoe UI", 8, "bold"),
-                    tags="trunk_map_canvas",
+                    tags=_TRUNK_MAP_TAGS_COSMETIC,
                 )
+                tele = self._trunk_telescope_short_label(seg_d)
+                if tele and n_chunk_labels < 2:
+                    t2 = tele if len(tele) <= 42 else tele[:39] + "…"
+                    self.canvas.create_text(
+                        sx + 8,
+                        sy + 2,
+                        text=t2,
+                        anchor=tk.W,
+                        fill="#CE93D8",
+                        font=("Segoe UI", 7, "bold"),
+                        tags=_TRUNK_MAP_TAGS_COSMETIC,
+                    )
+        self._draw_trunk_drag_edge_length_hints()
         nodes = list(getattr(self, "trunk_map_nodes", []) or [])
         g = 11.0
         for i, node in enumerate(nodes):
@@ -7537,7 +11940,7 @@ class DripCAD:
                     fill="#D32F2F",
                     outline="#FFCDD2",
                     width=2,
-                    tags="trunk_map_canvas",
+                    tags=_TRUNK_MAP_TAGS_BOM,
                 )
             elif kind == "bend":
                 self.canvas.create_oval(
@@ -7548,7 +11951,7 @@ class DripCAD:
                     fill="#1E88E5",
                     outline="#BBDEFB",
                     width=2,
-                    tags="trunk_map_canvas",
+                    tags=_TRUNK_MAP_TAGS_BOM,
                 )
             elif kind in ("consumption", "valve"):
                 nid_draw = str(node.get("id", "")).strip() or f"__{i}"
@@ -7566,12 +11969,49 @@ class DripCAD:
                     fill=_fill,
                     outline=_outline,
                     width=_w,
-                    tags="trunk_map_canvas",
+                    tags=_TRUNK_MAP_TAGS_BOM,
                 )
+                focus_id = getattr(self, "_trunk_deficit_focus_node_id", None)
+                if focus_id and nid_draw == focus_id:
+                    self.canvas.create_polygon(
+                        cx,
+                        cy - g * 1.05,
+                        cx - g * 0.92,
+                        cy + g * 0.58,
+                        cx + g * 0.92,
+                        cy + g * 0.58,
+                        outline="#00E5FF",
+                        width=4,
+                        fill="",
+                        tags=_TRUNK_MAP_TAGS_BOM,
+                    )
                 _nid_ring = str(node.get("id", "")).strip()
                 if _nid_ring:
                     self._draw_consumer_irrigation_slot_rings(
-                        self.canvas, cx, cy, _nid_ring, "trunk_map_canvas"
+                        self.canvas, cx, cy, _nid_ring, _TRUNK_MAP_TAGS_COSMETIC
+                    )
+                # Роль вузла в ланцюгу споживачів: проміжний (є нащадок) vs кінцевий (лист).
+                if self._trunk_consumption_is_terminal(i):
+                    self.canvas.create_oval(
+                        cx - 2.8,
+                        cy - 2.8,
+                        cx + 2.8,
+                        cy + 2.8,
+                        fill="#E8F5E9",
+                        outline="#2E7D32",
+                        width=1,
+                        tags=_TRUNK_MAP_TAGS_BOM,
+                    )
+                else:
+                    self.canvas.create_rectangle(
+                        cx - 3.0,
+                        cy - 3.0,
+                        cx + 3.0,
+                        cy + 3.0,
+                        fill="#B2EBF2",
+                        outline="#006064",
+                        width=1,
+                        tags=_TRUNK_MAP_TAGS_BOM,
                     )
             elif kind == "junction":
                 Ro, Ri = g * 1.05, g * 0.42
@@ -7585,7 +12025,7 @@ class DripCAD:
                     fill="#1565C0",
                     outline="#E3F2FD",
                     width=2,
-                    tags="trunk_map_canvas",
+                    tags=_TRUNK_MAP_TAGS_BOM,
                 )
             else:
                 self.canvas.create_oval(
@@ -7596,7 +12036,19 @@ class DripCAD:
                     fill="#757575",
                     outline="#FFFFFF",
                     width=1,
-                    tags="trunk_map_canvas",
+                    tags=_TRUNK_MAP_TAGS_BOM,
+                )
+            _nid_ins = str(node.get("id", "")).strip()
+            if _nid_ins and _nid_ins == str(getattr(self, "_trunk_last_inserted_node_id", "")).strip():
+                self.canvas.create_oval(
+                    cx - g - 4,
+                    cy - g - 4,
+                    cx + g + 4,
+                    cy + g + 4,
+                    outline="#00E5FF",
+                    width=3,
+                    fill="",
+                    tags=_TRUNK_MAP_TAGS_BOM,
                 )
             _ty = cy - g - 5 if kind != "junction" else cy - g * 1.35 - 4
             cap_main, cap_sub = self.trunk_consumer_caption_lines(node, i)
@@ -7608,7 +12060,7 @@ class DripCAD:
                     anchor=tk.W,
                     fill="#FFF8E1",
                     font=("Segoe UI", 9, "bold"),
-                    tags="trunk_map_canvas",
+                    tags=_TRUNK_MAP_TAGS_COSMETIC,
                 )
                 self.canvas.create_text(
                     cx + g + 5,
@@ -7617,7 +12069,7 @@ class DripCAD:
                     anchor=tk.W,
                     fill="#B0BEC5",
                     font=("Segoe UI", 7),
-                    tags="trunk_map_canvas",
+                    tags=_TRUNK_MAP_TAGS_COSMETIC,
                 )
             else:
                 self.canvas.create_text(
@@ -7627,9 +12079,51 @@ class DripCAD:
                     anchor=tk.W,
                     fill="#ECEFF1",
                     font=("Segoe UI", 8),
-                    tags="trunk_map_canvas",
+                    tags=_TRUNK_MAP_TAGS_COSMETIC,
                 )
+        self._draw_consumer_valve_snap_zones_on_canvas()
         self._draw_trunk_irrigation_pump_label_canvas()
+        try:
+            if self.canvas.find_withtag(_TRUNK_MAP_TAG_BOM):
+                self.canvas.tag_raise(_TRUNK_MAP_TAG_COSMETIC, _TRUNK_MAP_TAG_BOM)
+        except tk.TclError:
+            pass
+
+    def _draw_consumer_valve_snap_zones_on_canvas(self) -> None:
+        """Пунктирні кола навколо кранів (початок сабмейну) — зона снапу споживача."""
+        if not self._consumer_valve_snap_overlay_enabled():
+            return
+        try:
+            valves = list(self.get_valves())
+        except Exception:
+            valves = []
+        if not valves:
+            return
+        try:
+            r_m = float(self._consumer_valve_snap_radius_m())
+        except Exception:
+            r_m = 22.0
+        try:
+            zf = float(self.zoom)
+        except (TypeError, ValueError):
+            zf = 1.0
+        rad_px = max(4.0, r_m * zf)
+        for vx, vy in valves:
+            try:
+                sx, sy = self.to_screen(float(vx), float(vy))
+            except (TypeError, ValueError):
+                continue
+            self.canvas.create_oval(
+                sx - rad_px,
+                sy - rad_px,
+                sx + rad_px,
+                sy + rad_px,
+                outline="#7CB342",
+                dash=(5, 4),
+                width=2,
+                fill="",
+                tags=_TRUNK_MAP_TAGS_COSMETIC,
+            )
 
     def _draw_canvas_polyline_and_route_drafts(self) -> None:
         ct = getattr(self, "_canvas_special_tool", None)
@@ -7694,6 +12188,7 @@ class DripCAD:
         ct = getattr(self, "_canvas_special_tool", None)
         if ct in _CANVAS_TRUNK_POINT_TOOLS or ct in ("trunk_route", "scene_lines", "map_pick_info"):
             return
+        self._destroy_select_hover_pick_ui()
         self._select_marquee_active = False
         self._select_marquee_dragged = False
         self._select_marquee_start_screen = None
@@ -7701,13 +12196,28 @@ class DripCAD:
         self._select_marquee_start_world = None
         self._select_marquee_curr_world = None
         ci = self._pick_trunk_consumer_node_index_for_schedule_edit(wx, wy)
+        si = self._pick_trunk_segment_index_for_pipe_edit(wx, wy)
+        if ci is not None and si is not None:
+            d_c: Optional[float] = None
+            nodes = list(getattr(self, "trunk_map_nodes", []) or [])
+            if 0 <= int(ci) < len(nodes):
+                try:
+                    n = nodes[int(ci)]
+                    d_c = math.hypot(float(wx) - float(n["x"]), float(wy) - float(n["y"]))
+                except (KeyError, TypeError, ValueError):
+                    d_c = None
+            d_s = self._distance_m_to_trunk_segment_index(int(si), wx, wy)
+            if d_c is not None and d_s is not None and d_s + 0.05 < d_c:
+                self._open_trunk_segment_pipe_dialog(int(si))
+            else:
+                self._open_trunk_consumer_schedule_dialog(int(ci))
+            return
         if ci is not None:
             self._open_trunk_consumer_schedule_dialog(int(ci))
             return
-        si = self._pick_trunk_segment_index_for_pipe_edit(wx, wy)
-        if si is None:
+        if si is not None:
+            self._open_trunk_segment_pipe_dialog(int(si))
             return
-        self._open_trunk_segment_pipe_dialog(int(si))
 
     @staticmethod
     def _merge_pick_selection_hits(
@@ -7723,7 +12233,37 @@ class DripCAD:
         return out
 
     def handle_left_release(self, event):
+        if getattr(self, "_trunk_node_drag_idx", None) is not None:
+            self._finalize_trunk_node_drag()
+            return
         wx, wy = self.to_world(event.x, event.y)
+        if self.mode.get() == "ZOOM_BOX":
+            if self._zoom_box_start is None:
+                return
+            if self._zoom_box_end is None:
+                self._zoom_box_end = (float(wx), float(wy))
+            x1, y1 = self._zoom_box_start
+            x2, y2 = self._zoom_box_end
+            w = abs(x2 - x1)
+            h = abs(y2 - y1)
+            if w > 1e-6 and h > 1e-6:
+                self.canvas.update_idletasks()
+                cw = max(1, int(self.canvas.winfo_width()))
+                ch = max(1, int(self.canvas.winfo_height()))
+                margin = 0.08
+                use_w = max(1.0, cw * (1 - 2 * margin))
+                use_h = max(1.0, ch * (1 - 2 * margin))
+                zf = min(use_w / w, use_h / h)
+                cx = (x1 + x2) / 2.0
+                cy = (y1 + y2) / 2.0
+                self.zoom = max(0.02, min(200.0, float(zf)))
+                self.offset_x = cw / 2.0 - cx * self.zoom
+                self.offset_y = ch / 2.0 - cy * self.zoom
+            self._zoom_box_start = None
+            self._zoom_box_end = None
+            self.mode.set("VIEW")
+            self.redraw()
+            return
         ct = getattr(self, "_canvas_special_tool", None)
         if ct != "select" or not getattr(self, "_select_marquee_active", False):
             return
@@ -7775,11 +12315,40 @@ class DripCAD:
             else:
                 if not ctrl:
                     self._canvas_selection_keys = []
+        self._destroy_select_hover_pick_ui()
         self.redraw()
 
     def _canvas_b1_motion(self, event):
         if self.mode.get() == "PAN":
             self.handle_pan(event)
+            return
+        if self.mode.get() == "ZOOM_BOX" and self._zoom_box_start is not None:
+            wx, wy = self.to_world(event.x, event.y)
+            self._zoom_box_end = (float(wx), float(wy))
+            self.redraw(skip_heavy_canvas_layers=True)
+            try:
+                self.canvas.delete("preview")
+                sx1, sy1 = self.to_screen(*self._zoom_box_start)
+                sx2, sy2 = self.to_screen(*self._zoom_box_end)
+                self.canvas.create_rectangle(
+                    sx1,
+                    sy1,
+                    sx2,
+                    sy2,
+                    outline="#66CCFF",
+                    width=2,
+                    dash=(4, 3),
+                    tags="preview",
+                )
+            except Exception:
+                pass
+            return
+        drag_idx = getattr(self, "_trunk_node_drag_idx", None)
+        if drag_idx is not None and self.mode.get() in ("VIEW", "RULER"):
+            wx, wy = self.to_world(event.x, event.y)
+            self._trunk_node_drag_apply_world(int(drag_idx), float(wx), float(wy))
+            self._trunk_node_drag_moved = True
+            self.redraw(skip_heavy_canvas_layers=True)
             return
         if (
             getattr(self, "_canvas_special_tool", None) == "select"
@@ -7798,6 +12367,13 @@ class DripCAD:
         self, wx: float, wy: float, *, scr_x: Optional[int] = None, scr_y: Optional[int] = None
     ) -> None:
         """ЛКМ у світових координатах (полотно або вкладка «Карта» після geo)."""
+        m = self.mode.get()
+        self._clear_select_tool_if_blocking_draw_mode(m)
+        if m == "ZOOM_BOX":
+            self._zoom_box_start = (float(wx), float(wy))
+            self._zoom_box_end = (float(wx), float(wy))
+            self.redraw(skip_heavy_canvas_layers=True)
+            return
         if self.action.get() == "DEL":
             self.handle_erase(wx, wy)
             return
@@ -7807,7 +12383,19 @@ class DripCAD:
                 return
 
         ct = getattr(self, "_canvas_special_tool", None)
+        # Перетягування вузла магістралі має бути раніше за рамку «Вибір», інакше ЛКМ лише починає marquee.
+        # Режим лінійки (RULER) інакше лишається активним і блокує рух — виходимо у VIEW при захопленні вузла.
+        if m in ("VIEW", "RULER") and ct in (None, "select"):
+            ni, _dist = self._nearest_trunk_node_index_world(float(wx), float(wy))
+            if ni is not None:
+                self._exit_ruler_for_trunk_interaction()
+                if ct == "select":
+                    self._destroy_select_hover_pick_ui()
+                self._trunk_node_drag_idx = int(ni)
+                self._trunk_node_drag_moved = False
+                return
         if ct == "select":
+            self._destroy_select_hover_pick_ui()
             self._select_marquee_active = True
             self._select_marquee_dragged = False
             self._select_marquee_start_world = (float(wx), float(wy))
@@ -7844,53 +12432,28 @@ class DripCAD:
             self._canvas_trunk_route_left_click(float(wx), float(wy))
             return
 
-        m = self.mode.get()
         if m in ("PAN", "VIEW"):
             return
-        if m == "ZOOM_BOX":
-            if self._zoom_box_start is None:
-                self._zoom_box_start = (float(wx), float(wy))
-                self._zoom_box_end = (float(wx), float(wy))
-            else:
-                self._zoom_box_end = (float(wx), float(wy))
-                x1, y1 = self._zoom_box_start
-                x2, y2 = self._zoom_box_end
-                w = abs(x2 - x1)
-                h = abs(y2 - y1)
-                if w > 1e-6 and h > 1e-6:
-                    self.canvas.update_idletasks()
-                    cw = max(1, int(self.canvas.winfo_width()))
-                    ch = max(1, int(self.canvas.winfo_height()))
-                    margin = 0.08
-                    use_w = max(1.0, cw * (1 - 2 * margin))
-                    use_h = max(1.0, ch * (1 - 2 * margin))
-                    zf = min(use_w / w, use_h / h)
-                    cx = (x1 + x2) / 2.0
-                    cy = (y1 + y2) / 2.0
-                    self.zoom = max(0.02, min(200.0, float(zf)))
-                    self.offset_x = cw / 2.0 - cx * self.zoom
-                    self.offset_y = ch / 2.0 - cy * self.zoom
-                self._zoom_box_start = None
-                self._zoom_box_end = None
-                self.mode.set("VIEW")
-            self.redraw()
-            return
-        if m == "SUB_LABEL" and self.calc_results.get("sections"):
-            # 1-й ЛКМ: вибрати підпис секції; 2-й ЛКМ: зафіксувати нову позицію.
-            if self._moving_section_label_key is None:
-                picked = self._pick_section_label_for_move(wx, wy)
-                if picked is not None:
-                    (
-                        self._moving_section_label_key,
-                        self._moving_section_label_sub_idx,
-                        self._moving_section_label_sm_idx,
-                    ) = picked
-                    self._moving_section_label_preview = (float(wx), float(wy))
-            else:
+        if m == "SUB_LABEL":
+            # Підписи секцій сабмейну та телескопа магістралі: 1-й ЛКМ — взяти, рух миші, 2-й ЛКМ — зафіксувати.
+            if self._moving_trunk_tel_seg_idx is not None:
+                self.consumer_schedule.setdefault("trunk_telescope_label_pos", {})
+                k = self._trunk_telescope_label_pos_key(
+                    int(self._moving_trunk_tel_seg_idx),
+                    int(self._moving_trunk_tel_chunk_idx or 0),
+                )
+                self.consumer_schedule["trunk_telescope_label_pos"][k] = [float(wx), float(wy)]
+                self._moving_trunk_tel_seg_idx = None
+                self._moving_trunk_tel_chunk_idx = None
+                self._moving_trunk_tel_preview = None
+                self._after_consumer_schedule_edit()
+                self.redraw()
+                return
+            if self._moving_section_label_key is not None:
                 key = self._section_label_storage_key(
                     int(self._moving_section_label_key),
                     int(self._moving_section_label_sub_idx),
-                    int(self._moving_section_label_sm_idx)
+                    int(self._moving_section_label_sm_idx),
                 )
                 self.calc_results.setdefault("section_label_pos", {})[key] = (
                     float(wx),
@@ -7900,6 +12463,51 @@ class DripCAD:
                 self._moving_section_label_sub_idx = None
                 self._moving_section_label_sm_idx = None
                 self._moving_section_label_preview = None
+                self.redraw()
+                return
+            cand: List[Tuple[float, str, object]] = []
+            if self.calc_results.get("sections"):
+                picked_sm = self._pick_section_label_for_move(wx, wy)
+                if picked_sm is not None:
+                    aw = self._anchor_world_for_submain_section_pick(picked_sm)
+                    if aw is not None:
+                        d0 = math.hypot(aw[0] - wx, aw[1] - wy)
+                        cand.append((d0, "sm", picked_sm))
+            picked_tr = self._pick_trunk_telescope_label_for_move(wx, wy)
+            if picked_tr is not None:
+                si, ci = int(picked_tr[0]), int(picked_tr[1])
+                segs = getattr(self, "trunk_map_segments", []) or []
+                if 0 <= si < len(segs):
+                    seg = segs[si]
+                    if isinstance(seg, dict):
+                        pl = self._trunk_segment_world_path(seg)
+                        if len(pl) >= 2:
+                            chunks = self._trunk_segment_telescope_path_chunks(seg, pl)
+                            if 0 <= ci < len(chunks):
+                                chunk_pl, sec = chunks[ci]
+                                if isinstance(sec, dict):
+                                    aw = self._trunk_telescope_label_anchor_world(
+                                        si, ci, list(chunk_pl), sec
+                                    )
+                                    if aw is not None:
+                                        d1 = math.hypot(aw[0] - wx, aw[1] - wy)
+                                        cand.append((d1, "tr", picked_tr))
+            if not cand:
+                self.redraw()
+                return
+            cand.sort(key=lambda x: x[0])
+            _, kind, payload = cand[0]
+            if kind == "sm":
+                lk, sidx, smid = payload  # type: ignore[misc]
+                self._moving_section_label_key = int(lk)
+                self._moving_section_label_sub_idx = int(sidx)
+                self._moving_section_label_sm_idx = int(smid)
+                self._moving_section_label_preview = (float(wx), float(wy))
+            else:
+                si2, ci2 = payload  # type: ignore[misc]
+                self._moving_trunk_tel_seg_idx = int(si2)
+                self._moving_trunk_tel_chunk_idx = int(ci2)
+                self._moving_trunk_tel_preview = (float(wx), float(wy))
             self.redraw()
             return
 
@@ -8068,9 +12676,11 @@ class DripCAD:
         if self.action.get() == "DEL":
             return
         wx, wy = self.to_world(event.x, event.y)
-        self._handle_right_click_world(wx, wy)
+        self._handle_right_click_world(wx, wy, menu_anchor=(int(event.x_root), int(event.y_root)))
 
-    def _handle_right_click_world(self, wx: float, wy: float) -> None:
+    def _handle_right_click_world(
+        self, wx: float, wy: float, menu_anchor: Optional[Tuple[int, int]] = None
+    ) -> None:
         if self.action.get() == "DEL":
             return
         if self._irrigation_schedule_canvas_pick_active():
@@ -8078,8 +12688,58 @@ class DripCAD:
                 return
         ct = getattr(self, "_canvas_special_tool", None)
         if ct == "select":
+            if self._trunk_interaction_priority_active():
+                if self._open_trunk_graph_context_menu(wx, wy, menu_anchor=menu_anchor):
+                    return
             keys = list(getattr(self, "_canvas_selection_keys", []) or [])
             if keys:
+                block_indices = sorted(
+                    {
+                        int(h[1])
+                        for h in keys
+                        if h[0] == "block" and isinstance(h[1], int) and int(h[1]) >= 0
+                    }
+                )
+                block_indices = [i for i in block_indices if i < len(self.field_blocks)]
+                mx = int(menu_anchor[0]) if menu_anchor else int(self.root.winfo_pointerx())
+                my = int(menu_anchor[1]) if menu_anchor else int(self.root.winfo_pointery())
+                if block_indices:
+                    m = tk.Menu(self.root, tearoff=0)
+                    for bi in block_indices:
+                        m.add_command(
+                            label=f"Властивості блоку {bi + 1}…",
+                            command=lambda b=bi: self.open_block_irrigation_scheme_dialog(int(b)),
+                        )
+                    m.add_separator()
+
+                    def _show_pick_list() -> None:
+                        lines = [h[2] for h in keys]
+                        n = len(lines)
+                        head = min(n, 50)
+                        msg = "\n".join(f"{i + 1}. {lines[i]}" for i in range(head))
+                        if n > head:
+                            msg += f"\n… ще {n - head}."
+                        silent_showinfo(
+                            self.root,
+                            "Вибір — обрані об'єкти",
+                            f"Усього: {n}\n\n{msg}",
+                        )
+
+                    m.add_command(label="Показати список обраного…", command=_show_pick_list)
+
+                    def _clear_sel() -> None:
+                        self._canvas_selection_keys = []
+                        self.redraw()
+
+                    m.add_command(label="Зняти виділення", command=_clear_sel)
+                    try:
+                        m.tk_popup(mx, my)
+                    finally:
+                        try:
+                            m.grab_release()
+                        except Exception:
+                            pass
+                    return
                 lines = [h[2] for h in keys]
                 n = len(lines)
                 head = min(n, 50)
@@ -8136,10 +12796,17 @@ class DripCAD:
                 self._canvas_special_tool = None
                 self.redraw()
                 return
-            self._finish_canvas_trunk_route_segment()
+            exit_tool = self.handle_trunk_route_right_click_world(float(wx), float(wy))
+            if exit_tool:
+                self._canvas_special_tool = None
+                self._refresh_canvas_cursor_for_special_tool()
+            self.redraw()
             return
 
         m = self.mode.get()
+        if m in ("VIEW", "PAN") and ct is None and self._trunk_interaction_priority_active():
+            if self._open_trunk_graph_context_menu(wx, wy, menu_anchor=menu_anchor):
+                return
 
         if m == "TOPO":
             if self.topo.elevation_points:
@@ -8296,6 +12963,8 @@ class DripCAD:
         m = self.mode.get()
         if m == "SUB_LABEL" and self._moving_section_label_key is not None:
             self._moving_section_label_preview = (float(wx), float(wy))
+        if m == "SUB_LABEL" and self._moving_trunk_tel_seg_idx is not None:
+            self._moving_trunk_tel_preview = (float(wx), float(wy))
         if m == "ZOOM_BOX" and self._zoom_box_start is not None:
             self._zoom_box_end = (float(wx), float(wy))
         zoom_rubber = m == "ZOOM_BOX" and self._zoom_box_start is not None
@@ -8406,10 +13075,8 @@ class DripCAD:
                             )
                             if snap_ok:
                                 hint = "Прив'язка: ЛКМ додасть вузол"
-                            elif draft_i and ni_vis == draft_i[-1]:
-                                hint = "Оберіть інший вузол по трасі"
                             else:
-                                hint = "Потрібен насос / кінець гілки / кран чи розгалуження"
+                                hint = "Оберіть інший вузол (не дублюйте попередній у чернетці)"
                             self.canvas.create_text(
                                 sx + rad + 8,
                                 sy,
@@ -8448,6 +13115,8 @@ class DripCAD:
                         tags="preview",
                     )
             elif ct_pv in _CANVAS_PASSIVE_PICK_TOOLS:
+                if ct_pv != "select":
+                    self._destroy_select_hover_pick_ui()
                 skip_footer = (
                     ct_pv == "select"
                     and getattr(self, "_select_marquee_active", False)
@@ -8527,6 +13196,10 @@ class DripCAD:
                         font=("Segoe UI", 8),
                         tags="preview",
                     )
+                if ct_pv == "select" and not skip_footer:
+                    self._schedule_select_hover_pick_after_motion(event)
+                elif ct_pv == "select":
+                    self._destroy_select_hover_pick_ui()
 
         if self.action.get() == "DEL":
             p_mouse = Point(wx, wy)
@@ -8718,7 +13391,46 @@ class DripCAD:
             if sm:
                 unique_valves.add((sm[0][0], sm[0][1]))
         return unique_valves
-        
+
+    def _snap_world_xy_to_nearest_field_valve(self, wx: float, wy: float) -> Tuple[float, float]:
+        """Якщо поруч кран (початок відрізка сабмейну) — координати крана; інакше (wx, wy) без змін."""
+        best: Optional[Tuple[float, float]] = None
+        best_d: Optional[float] = None
+        tol = self._pick_tolerance_m(_PICK_FIELD_VALVE_R_M, 22.0)
+        try:
+            for vx, vy in self.get_valves():
+                d = math.hypot(float(wx) - float(vx), float(wy) - float(vy))
+                if d > tol:
+                    continue
+                if best_d is None or d < best_d:
+                    best_d = d
+                    best = (float(vx), float(vy))
+        except Exception:
+            pass
+        if best is not None:
+            return best
+        return (float(wx), float(wy))
+
+    def _consumer_valve_snap_radius_m(self) -> float:
+        """Радіус снапу споживача до крана (м) — збігає з _snap_world_xy_to_nearest_field_valve."""
+        return self._pick_tolerance_m(_PICK_FIELD_VALVE_R_M, 22.0)
+
+    def _consumer_valve_snap_overlay_enabled(self) -> bool:
+        """Чи показувати пунктирні зони снапу до кранів на полотні та карті."""
+        if getattr(self, "_canvas_special_tool", None) == "trunk_consumer":
+            return True
+        di = getattr(self, "_trunk_node_drag_idx", None)
+        if di is not None:
+            nodes = getattr(self, "trunk_map_nodes", []) or []
+            try:
+                ii = int(di)
+            except (TypeError, ValueError):
+                ii = -1
+            if 0 <= ii < len(nodes):
+                if str(nodes[ii].get("kind", "")).lower() == "consumption":
+                    return True
+        return bool(self._trunk_interaction_priority_active())
+
     def clear_topo(self):
         self.topo.clear()
         self.cached_contours = []
@@ -8799,6 +13511,9 @@ class DripCAD:
                 points_to_check.append((float(node["x"]), float(node["y"])))
             except (KeyError, TypeError, ValueError):
                 pass
+        pz_fit = self.project_zone_display_ring_local()
+        if pz_fit:
+            points_to_check.extend(pz_fit)
         if self.topo.elevation_points:
             points_to_check.extend([(p[0], p[1]) for p in self.topo.elevation_points])
         if self.topo.srtm_boundary_pts_local:
@@ -8907,9 +13622,61 @@ class DripCAD:
             tags="workspace_bg",
         )
 
+    def _draw_canvas_scale_bar(self) -> None:
+        """Масштабна лінійка 100 м у правому нижньому куті полотна «Без карти» (локальні м, як сітка)."""
+        tag = "scale_bar_overlay"
+        try:
+            if not self.canvas.winfo_exists():
+                return
+            cw = max(1, int(self.canvas.winfo_width()))
+            ch = max(1, int(self.canvas.winfo_height()))
+        except tk.TclError:
+            return
+        if cw < 100 or ch < 48:
+            return
+        zm = max(float(self.zoom), 0.01)
+        px_100 = 100.0 * zm
+        px_len = int(max(28, min(cw // 3, px_100)))
+        pad_r, pad_b = 16, 18
+        y_line = ch - pad_b
+        x1 = cw - pad_r
+        x0 = x1 - px_len
+        if x0 < 10:
+            return
+        bg_pad_x, bg_pad_t, bg_pad_b = 6, 20, 10
+        self.canvas.create_rectangle(
+            x0 - bg_pad_x,
+            y_line - bg_pad_t,
+            x1 + bg_pad_x,
+            y_line + bg_pad_b,
+            fill="#101418",
+            outline="#F5F5F5",
+            width=1,
+            tags=tag,
+        )
+        self.canvas.create_line(x0, y_line, x1, y_line, fill="#FFD54A", width=4, tags=tag)
+        self.canvas.create_line(x0, y_line - 6, x0, y_line + 6, fill="#FFFFFF", width=2, tags=tag)
+        self.canvas.create_line(x1, y_line - 6, x1, y_line + 6, fill="#FFFFFF", width=2, tags=tag)
+        self.canvas.create_text(
+            (x0 + x1) * 0.5,
+            y_line - 12,
+            text="100 м",
+            fill="#FFFFFF",
+            font=("Segoe UI", 9, "bold"),
+            tags=tag,
+        )
+
     def enable_zoom_box_mode(self):
         self.mode.set("ZOOM_BOX")
         self.action.set("ADD")
+        self._destroy_select_hover_pick_ui()
+        self._canvas_special_tool = None
+        self._select_marquee_active = False
+        self._select_marquee_dragged = False
+        self._select_marquee_start_screen = None
+        self._select_marquee_curr_screen = None
+        self._select_marquee_start_world = None
+        self._select_marquee_curr_world = None
         self._zoom_box_start = None
         self._zoom_box_end = None
         self.redraw()
@@ -8958,6 +13725,12 @@ class DripCAD:
             self.redraw()
 
     def redraw(self, skip_heavy_canvas_layers: bool = False):
+        """
+        Повне перемальовування робочого полотна. ``skip_heavy_canvas_layers`` — легший кадр
+        (дебаунс під пан/зум); повне очищення ``delete('all')`` потрібне, бо світові координати
+        всіх шарів змінюються при ``to_screen`` — часткове оновлення лише за тегами можливе
+        лише для окремих діалогів (див. профіль сегмента магістралі).
+        """
         if not hasattr(self, "canvas") or not self.canvas.winfo_exists():
             return
         if not skip_heavy_canvas_layers:
@@ -9007,6 +13780,27 @@ class DripCAD:
                 for sx, sy in scr:
                     self.canvas.create_oval(sx-3, sy-3, sx+3, sy+3, fill="#00FFCC")
 
+        pz_ring_draw = self.project_zone_display_ring_local()
+        if pz_ring_draw and len(pz_ring_draw) > 1:
+            scr_pz = [self.to_screen(float(p[0]), float(p[1])) for p in pz_ring_draw]
+            if len(scr_pz) >= 4:
+                self.canvas.create_line(
+                    scr_pz + [scr_pz[0]],
+                    fill="#FF9800",
+                    dash=(6, 4),
+                    width=2,
+                    tags="project_zone_overlay",
+                )
+                self.canvas.create_text(
+                    scr_pz[0][0] + 6,
+                    scr_pz[0][1] - 8,
+                    text="Майданчик проєкту",
+                    fill="#FF9800",
+                    font=("Arial", 9, "bold"),
+                    anchor=tk.W,
+                    tags="project_zone_overlay",
+                )
+
         if self.show_srtm_boundary_overlay.get() and getattr(self.topo, 'srtm_boundary_pts_local', None):
             scr_srtm = [self.to_screen(*p) for p in self.topo.srtm_boundary_pts_local]
             if len(scr_srtm)>1: 
@@ -9043,7 +13837,13 @@ class DripCAD:
                 sx1, sy1 = self.to_screen(minx - grid_size, miny - grid_size)
                 sx2, sy2 = self.to_screen(maxx + grid_size, maxy + grid_size)
                 self.canvas.create_rectangle(sx1, sy1, sx2, sy2, outline="#888888", dash=(4,4), width=2, tags="topo_bounds")
-                self.canvas.create_text(sx1, sy1-10, text="Зона обчислення рельєфу", fill="#888888", font=("Arial", 9, "bold"), anchor=tk.SW, tags="topo_bounds")
+                _pz_clip = self._project_zone_polygon_local()
+                _topo_lbl = (
+                    "Майданчик проєкту — обрізання DEM / ізоліній"
+                    if _pz_clip is not None and not _pz_clip.is_empty
+                    else "Зона обчислення рельєфу (KML / поле / точки)"
+                )
+                self.canvas.create_text(sx1, sy1-10, text=_topo_lbl, fill="#888888", font=("Arial", 9, "bold"), anchor=tk.SW, tags="topo_bounds")
             except Exception as e: 
                 self.canvas.create_text(100, 100, text=f"TOPO Bounds Error: {e}", fill="red", font=("Arial", 12, "bold"))
             
@@ -9409,6 +14209,7 @@ class DripCAD:
                     self._emit_isolines_cache = {
                         "sig": sig,
                         "contours": contours,
+                        "contours_by_cls": {},
                     }
 
                 def _palette(cls_name: str, t: float) -> str:
@@ -9523,19 +14324,47 @@ class DripCAD:
                             else:
                                 n_un += 1
                             col = _palette(cls_name, t)
+                            scr_ln = [self.to_screen(*pt) for pt in g_draw.coords]
                             self.canvas.create_line(
-                                [self.to_screen(*pt) for pt in g_draw.coords],
+                                scr_ln,
                                 fill=col,
                                 width=1,
                                 dash=(2, 2),
+                                tags="emit_flow_iso",
                             )
+                            try:
+                                mx, my = self.to_screen(float(mid.x), float(mid.y))
+                                if abs(z) >= 100.0:
+                                    q_txt = f"{z:.0f} л/г"
+                                elif abs(z) >= 10.0:
+                                    q_txt = f"{z:.1f} л/г"
+                                else:
+                                    q_txt = f"{z:.2f} л/г"
+                                self.canvas.create_text(
+                                    mx + 1,
+                                    my + 1,
+                                    text=q_txt,
+                                    fill="#101010",
+                                    font=("Segoe UI", 8, "bold"),
+                                    tags="emit_flow_iso",
+                                )
+                                self.canvas.create_text(
+                                    mx,
+                                    my,
+                                    text=q_txt,
+                                    fill="#F5F5F5",
+                                    font=("Segoe UI", 8, "bold"),
+                                    tags="emit_flow_iso",
+                                )
+                            except Exception:
+                                pass
                 try:
                     _ch = max(100, int(self.canvas.winfo_height()))
                 except tk.TclError:
                     _ch = 600
                 if band_on:
                     _leg = (
-                        "Ізолінії виливу (6 рівнів, IDW, спрощені лінії; усі блоки; колір за тиском як у латералів): "
+                        "Ізолінії виливу (6 рівнів, IDW; підпис — Q, л/г; колір за тиском як у латералів): "
                         "норма — світло-блакитні, перелив — гаряча помаранчева гама, "
                         "недолив — жовто-охряна гама"
                     )
@@ -9729,8 +14558,44 @@ class DripCAD:
                     )
 
         self._draw_trunk_map_on_canvas()
+        if (
+            isinstance(getattr(self, "_trunk_profile_probe_world", None), tuple)
+            and len(self._trunk_profile_probe_world) >= 2
+        ):
+            try:
+                px, py = self._trunk_profile_probe_world
+                sx, sy = self.to_screen(float(px), float(py))
+                self.canvas.create_oval(
+                    sx - 6,
+                    sy - 6,
+                    sx + 6,
+                    sy + 6,
+                    fill="#00E5FF",
+                    outline="#E0F7FA",
+                    width=2,
+                    tags=_TRUNK_MAP_TAGS_BOM,
+                )
+                self.canvas.create_line(
+                    sx - 10, sy, sx + 10, sy, fill="#00E5FF", width=2, tags=_TRUNK_MAP_TAGS_BOM
+                )
+                self.canvas.create_line(
+                    sx, sy - 10, sx, sy + 10, fill="#00E5FF", width=2, tags=_TRUNK_MAP_TAGS_BOM
+                )
+            except Exception:
+                pass
         self._draw_canvas_selection_layer()
         self._draw_canvas_polyline_and_route_drafts()
+        # Магістраль завжди у верхньому шарі полотна (не перекривати іншими елементами).
+        try:
+            self.canvas.tag_raise("trunk_map_canvas")
+        except Exception:
+            pass
+
+        self._draw_canvas_scale_bar()
+        try:
+            self.canvas.tag_raise("scale_bar_overlay")
+        except Exception:
+            pass
 
         try:
             e_step = max(0.01, float(self.var_emit_step.get().replace(',','.')))
@@ -9757,6 +14622,8 @@ class DripCAD:
             pass
 
     def run_calculation(self):
+        if not self._ensure_emitter_kx_ready():
+            return
         if not self._all_submain_lines():
             silent_showwarning(self.root, "Увага", "Намалюйте хоча б один сабмейн!")
             return
@@ -9801,6 +14668,7 @@ class DripCAD:
                 "lateral_inner_d_mm": float(
                     (self.var_lat_inner_d_mm.get().strip() or "13.6").replace(",", ".")
                 ),
+                "lateral_inner_d_mm_list": self._per_lateral_inner_d_mm(),
                 "emitter_h_press_min_m": float(
                     self.var_emit_h_press_min.get().replace(",", ".")
                 ),
@@ -9867,6 +14735,9 @@ class DripCAD:
         self._moving_section_label_sub_idx = None
         self._moving_section_label_sm_idx = None
         self._moving_section_label_preview = None
+        self._moving_trunk_tel_seg_idx = None
+        self._moving_trunk_tel_chunk_idx = None
+        self._moving_trunk_tel_preview = None
         self.redraw()
 
     def clear_all(self):
@@ -9876,6 +14747,7 @@ class DripCAD:
         self.points = []
         self.is_closed, self.ruler_start, self.geo_ref = False, None, None
         self.project_zone_bounds_local = None
+        self.project_zone_ring_local = None
         self.scene_lines = []
         self.trunk_map_nodes = []
         self.trunk_map_segments = []
@@ -9884,20 +14756,30 @@ class DripCAD:
             "groups": [],
             "irrigation_slots": [[] for _ in range(48)],
             "max_pump_head_m": 50.0,
-            "trunk_schedule_v_max_mps": 2.0,
+            "trunk_schedule_v_max_mps": 0.0,
+            "trunk_schedule_min_seg_m": 0.0,
+            "trunk_schedule_opt_goal": "weight",
+            "trunk_schedule_test_q_m3h": 60.0,
+            "trunk_schedule_test_h_m": 40.0,
+            "trunk_display_velocity_warn_mps": 0.0,
+            "trunk_pipes_selected": False,
         }
         self._rozklad_staging_ids = []
         self._canvas_special_tool = None
         self._canvas_trunk_draft_world = None
         self._canvas_polyline_draft = []
         self._canvas_trunk_route_draft_indices = []
+        self._trunk_route_endpoint_pending_idx = None
+        self._trunk_route_edge_end_idx = None
+        if hasattr(self, "var_trunk_display_velocity_warn_mps"):
+            self.var_trunk_display_velocity_warn_mps.set("0")
         self.is_georeferenced = False
         self.mode.set("VIEW")
         self.zoom, self.offset_x, self.offset_y = 0.7, 425, 375
         self.topo.clear()
         self.topo.clear_srtm_boundary()
-        self.cached_contours = []
-        
+        self.release_geo_hydro_workspace_caches(clear_cached_contours=True)
+
         try:
             with open(PIPES_DB_PATH, "r", encoding="utf-8") as f:
                 self.pipe_db = json.load(f)
@@ -9908,7 +14790,7 @@ class DripCAD:
             self.allowed_pipes[mat] = {}
             for pn, ods in pns.items():
                 self.allowed_pipes[mat][pn] = list(ods.keys())
-        self.trunk_allowed_pipes = copy.deepcopy(self.allowed_pipes)
+        self.trunk_allowed_pipes = _copy_allowed_pipes_shallow(self.allowed_pipes)
 
         avail = list(self.pipe_db.keys())
         if hasattr(self, "cb_mat"):
@@ -9921,7 +14803,7 @@ class DripCAD:
         self.var_proj_name.set("Project_01")
         self.trunk_tree_data = self._default_trunk_tree_payload()
         self.trunk_tree_results = {}
-        self.trunk_irrigation_hydro_cache = None
+        self._project_json_filepath = None
         self.var_active_block_idx.set(0)
         self._refresh_active_block_combo()
         self.redraw()
@@ -9945,6 +14827,320 @@ class DripCAD:
             subprocess.Popen([sys.executable, str(script)], cwd=str(PROJECT_ROOT))
         except OSError as e:
             silent_showerror(self.root, "Помилка", str(e))
+
+    def _block_param_display_str(
+        self, block: dict, key: str, fallback_var: tk.Variable, default: str
+    ) -> str:
+        """Рядок для поля форми: з params блоку або з глобальної змінної панелі."""
+        p = block.get("params") or {}
+        raw = p.get(key)
+        if raw is not None and str(raw).strip():
+            return str(raw).strip()
+        try:
+            v = fallback_var.get()
+            if v is not None and str(v).strip():
+                return str(v).strip()
+        except Exception:
+            pass
+        return default
+
+    def open_block_irrigation_scheme_dialog(self, block_index: int) -> None:
+        """
+        Властивості блоку: сітка поливу, модель крапельниці / Q ном, внутрішній Ø латераля.
+        Зберігається в field_blocks[i]['params'] (JSON проєкту).
+        """
+        bi = int(block_index)
+        if bi < 0 or bi >= len(self.field_blocks):
+            return
+        block = self.field_blocks[bi]
+        dlg = tk.Toplevel(self.root)
+        dlg.title(f"Властивості блоку {bi + 1}")
+        dlg.geometry("520x520")
+        dlg.minsize(480, 460)
+        dlg.configure(bg="#1e1e1e")
+        try:
+            dlg.transient(self.root)
+        except tk.TclError:
+            pass
+
+        self.var_active_block_idx.set(bi)
+        self._refresh_active_block_combo()
+
+        v_lat = tk.StringVar(
+            value=self._block_param_display_str(block, "lat", self.var_lat_step, "0.9")
+        )
+        v_emit = tk.StringVar(
+            value=self._block_param_display_str(block, "emit", self.var_emit_step, "0.3")
+        )
+        v_max = tk.StringVar(
+            value=self._block_param_display_str(block, "max_len", self.var_max_lat_len, "0")
+        )
+        v_blocks = tk.StringVar(
+            value=self._block_param_display_str(block, "blocks", self.var_lat_block_count, "0")
+        )
+        v_emit_model = tk.StringVar(
+            value=self._block_param_display_str(block, "emit_model", self.var_emit_model, "")
+        )
+        v_emit_nominal = tk.StringVar(
+            value=self._block_param_display_str(
+                block, "emit_nominal_flow", self.var_emit_nominal_flow, ""
+            )
+        )
+        if not str(v_emit_nominal.get()).strip():
+            v_emit_nominal.set(
+                self._block_param_display_str(block, "flow", self.var_emit_flow, "1.05")
+            )
+        v_lat_inner = tk.StringVar(
+            value=self._block_param_display_str(
+                block, "lateral_inner_d_mm", self.var_lat_inner_d_mm, "13.6"
+            )
+        )
+        v_lat_model = tk.StringVar(
+            value=self._block_param_display_str(block, "lateral_model", self.var_lateral_model, "")
+        )
+
+        top = tk.Frame(dlg, bg="#1e1e1e")
+        top.pack(fill=tk.BOTH, expand=True, padx=14, pady=12)
+        tk.Label(
+            top,
+            text="Параметри блоку зберігаються в проєкті. «Застосувати» перебудовує авто-латералі та скидає гідравліку.",
+            bg="#1e1e1e",
+            fg="#AAAAAA",
+            font=("Segoe UI", 9),
+            wraplength=480,
+            justify=tk.LEFT,
+        ).pack(anchor=tk.W, pady=(0, 8))
+
+        def _row(parent, caption: str, var: tk.StringVar, hint: str) -> None:
+            fr = tk.Frame(parent, bg="#1e1e1e")
+            fr.pack(fill=tk.X, pady=4)
+            tk.Label(fr, text=caption, bg="#1e1e1e", fg="#E0E0E0", font=("Segoe UI", 9)).pack(
+                side=tk.LEFT, anchor=tk.W
+            )
+            e = tk.Entry(
+                fr,
+                textvariable=var,
+                bg="#2a2a2a",
+                fg="white",
+                width=14,
+                justify="center",
+                insertbackground="white",
+                font=("Consolas", 10),
+            )
+            e.pack(side=tk.RIGHT)
+            attach_tooltip(e, hint)
+
+        def _section_title(text: str) -> None:
+            tk.Label(
+                top,
+                text=text,
+                bg="#1e1e1e",
+                fg="#88DDFF",
+                font=("Segoe UI", 9, "bold"),
+            ).pack(anchor=tk.W, pady=(10, 4))
+
+        _section_title("Схема поливу (сітка)")
+        _row(
+            top,
+            "Крок між лініями латералів (м):",
+            v_lat,
+            "Відстань між паралельними лініями сітки вздовж поля.",
+        )
+        _row(
+            top,
+            "Крок між емітерами вздовж латераля (м):",
+            v_emit,
+            "Крок емітера для сітки та гідравліки (разом із Q ном нижче).",
+        )
+        _row(
+            top,
+            "Макс. довж. латералі (м), 0 = вимк:",
+            v_max,
+            "Розбиття довгих авто-латералів; 0 — без обмеження.",
+        )
+        _row(
+            top,
+            "Пропуск рядів кожні N, 0 = вимк:",
+            v_blocks,
+            "Кожен (N+1)-й ряд сітки пропускається.",
+        )
+
+        _section_title("Крапельниця (емітер)")
+        em_fr = tk.Frame(top, bg="#1e1e1e")
+        em_fr.pack(fill=tk.X, pady=4)
+        tk.Label(em_fr, text="Модель:", bg="#1e1e1e", fg="#E0E0E0", font=("Segoe UI", 9)).pack(
+            side=tk.LEFT
+        )
+        _drip_names = self._dripper_model_names()
+        cb_emit_m = ttk.Combobox(
+            em_fr,
+            textvariable=v_emit_model,
+            values=_drip_names,
+            width=28,
+            state="readonly" if _drip_names else "normal",
+        )
+        cb_emit_m.pack(side=tk.RIGHT)
+        attach_tooltip(cb_emit_m, "Модель з бази крапельниць (як на вкладці «Блок»).")
+
+        em_fr2 = tk.Frame(top, bg="#1e1e1e")
+        em_fr2.pack(fill=tk.X, pady=4)
+        tk.Label(
+            em_fr2, text="Q номінал (л/г):", bg="#1e1e1e", fg="#E0E0E0", font=("Segoe UI", 9)
+        ).pack(side=tk.LEFT)
+        cb_emit_q = ttk.Combobox(
+            em_fr2,
+            textvariable=v_emit_nominal,
+            width=14,
+            state="readonly",
+        )
+        cb_emit_q.pack(side=tk.RIGHT)
+        attach_tooltip(cb_emit_q, "Номінальний вилив; у params також зберігається як «flow» для гідравліки.")
+
+        def _sync_emit_nominal_choices(*_a):
+            vals = self._dripper_nominal_values(v_emit_model.get())
+            cb_emit_q.configure(values=vals)
+            if vals:
+                cur = str(v_emit_nominal.get()).strip()
+                if cur not in vals:
+                    v_emit_nominal.set(vals[0])
+            else:
+                v_emit_nominal.set("")
+
+        v_emit_model.trace_add("write", _sync_emit_nominal_choices)
+        _sync_emit_nominal_choices()
+
+        def _on_lat_model_pick(*_a):
+            rec = self._lateral_record_by_model(v_lat_model.get())
+            if rec and rec.get("inside_diameter_mm") is not None:
+                try:
+                    v_lat_inner.set(str(float(rec.get("inside_diameter_mm"))))
+                except (TypeError, ValueError):
+                    pass
+
+        v_lat_model.trace_add("write", _on_lat_model_pick)
+
+        _section_title("Латераль (труба)")
+        _row(
+            top,
+            "Внутрішній Ø латераля (мм):",
+            v_lat_inner,
+            "Діаметр для гідравліки латералів цього блоку (окремо від інших блоків).",
+        )
+        lat_fr = tk.Frame(top, bg="#1e1e1e")
+        lat_fr.pack(fill=tk.X, pady=4)
+        tk.Label(
+            lat_fr, text="Модель труби (довідник):", bg="#1e1e1e", fg="#E0E0E0", font=("Segoe UI", 9)
+        ).pack(side=tk.LEFT)
+        cb_lat_m = ttk.Combobox(
+            lat_fr,
+            textvariable=v_lat_model,
+            values=[""] + self._lateral_model_names(),
+            width=28,
+        )
+        cb_lat_m.pack(side=tk.RIGHT)
+        attach_tooltip(
+            cb_lat_m,
+            "Необов’язково: вибір з бази латералів; можна лише задати Ø вручну вище.",
+        )
+
+        status = tk.Label(top, text="", bg="#1e1e1e", fg="#FFAB40", font=("Segoe UI", 9))
+        status.pack(anchor=tk.W, pady=(10, 0))
+
+        def _apply(*, close: bool) -> None:
+            try:
+                lat_f = float(str(v_lat.get()).replace(",", ".").strip())
+                emit_f = float(str(v_emit.get()).replace(",", ".").strip())
+                max_f = float(str(v_max.get()).replace(",", ".").strip())
+                blk_i = int(float(str(v_blocks.get()).replace(",", ".").strip()))
+            except (TypeError, ValueError):
+                status.config(text="Помилка: поля сітки мають бути числами.")
+                return
+            try:
+                d_mm = float(str(v_lat_inner.get()).replace(",", ".").strip())
+            except (TypeError, ValueError):
+                status.config(text="Некоректний внутрішній Ø латераля (мм).")
+                return
+            d_mm = max(0.5, min(200.0, d_mm))
+            try:
+                q_nom = float(str(v_emit_nominal.get()).replace(",", ".").strip())
+            except (TypeError, ValueError):
+                status.config(text="Некоректний Q номінал (л/г).")
+                return
+            if lat_f < 0.1:
+                status.config(text="Крок між лініями латералів має бути ≥ 0.1 м.")
+                return
+            if emit_f <= 0:
+                status.config(text="Крок між емітерами має бути > 0.")
+                return
+            if max_f < 0:
+                status.config(text="Макс. довжина латералі не може бути від’ємною.")
+                return
+            if blk_i < 0:
+                status.config(text="Пропуск рядів не може бути від’ємним.")
+                return
+            p = block.setdefault("params", {})
+            p["lat"] = str(v_lat.get()).strip()
+            p["emit"] = str(v_emit.get()).strip()
+            p["max_len"] = str(v_max.get()).strip()
+            p["blocks"] = str(v_blocks.get()).strip()
+            p["emit_model"] = str(v_emit_model.get()).strip()
+            p["emit_nominal_flow"] = str(v_emit_nominal.get()).strip()
+            p["flow"] = str(q_nom)
+            p["lateral_inner_d_mm"] = str(d_mm)
+            lm = str(v_lat_model.get()).strip()
+            if lm:
+                p["lateral_model"] = lm
+            else:
+                p.pop("lateral_model", None)
+            abi = self._safe_active_block_idx()
+            if abi is not None and int(abi) == int(bi):
+                try:
+                    self.var_lat_step.set(p["lat"])
+                    self.var_emit_step.set(p["emit"])
+                    self.var_max_lat_len.set(p["max_len"])
+                    self.var_lat_block_count.set(p["blocks"])
+                    self.var_emit_model.set(p["emit_model"])
+                    self.var_emit_nominal_flow.set(p["emit_nominal_flow"])
+                    self.var_emit_flow.set(p["flow"])
+                    self.var_lat_inner_d_mm.set(str(d_mm))
+                    self.var_lateral_model.set(lm)
+                except Exception:
+                    pass
+            status.config(text="")
+            self._regenerate_block_grid(bi, redraw=False)
+            self.reset_calc()
+            self.redraw()
+            if close:
+                dlg.destroy()
+
+        btn_fr = tk.Frame(dlg, bg="#1e1e1e")
+        btn_fr.pack(fill=tk.X, padx=14, pady=(0, 12))
+        tk.Button(
+            btn_fr,
+            text="Застосувати",
+            command=lambda: _apply(close=False),
+            bg="#0066FF",
+            fg="white",
+            font=("Segoe UI", 9, "bold"),
+        ).pack(side=tk.LEFT, padx=(0, 8))
+        tk.Button(
+            btn_fr,
+            text="OK",
+            command=lambda: _apply(close=True),
+            bg="#2e7d32",
+            fg="white",
+            font=("Segoe UI", 9, "bold"),
+        ).pack(side=tk.LEFT, padx=(0, 8))
+        tk.Button(
+            btn_fr,
+            text="Скасувати",
+            command=dlg.destroy,
+            bg="#444444",
+            fg="white",
+            font=("Segoe UI", 9),
+        ).pack(side=tk.LEFT)
+
+        dlg.after_idle(lambda: (dlg.lift(), dlg.focus_force()))
 
     def open_export_settings(self):
         dlg = tk.Toplevel(self.root)

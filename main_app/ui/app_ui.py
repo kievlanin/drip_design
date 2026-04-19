@@ -491,6 +491,8 @@ class DripCADUI(DripCAD):
             e_steps_full, e_flows_full = self._per_lateral_emit_steps_flows()
             e_steps = e_steps_full[lat_lo:lat_hi]
             e_flows = e_flows_full[lat_lo:lat_hi]
+            d_inner_full = self._per_lateral_inner_d_mm()
+            lateral_inner_slice = d_inner_full[lat_lo:lat_hi]
             blk = self.field_blocks[abi]
             all_lats = list(blk.get("auto_laterals") or []) + list(blk.get("manual_laterals") or [])
             lateral_block_idx = [abi] * len(all_lats)
@@ -503,6 +505,7 @@ class DripCADUI(DripCAD):
         else:
             submain_lines, submain_block_idx = self._all_submain_lines_with_block_indices()
             e_steps, e_flows = self._per_lateral_emit_steps_flows()
+            lateral_inner_slice = self._per_lateral_inner_d_mm()
             all_lats = self._flatten_all_lats()
             lateral_block_idx = self._lateral_block_indices()
             section_lengths_by_sm = self._all_submain_section_lengths_by_sm()
@@ -539,6 +542,7 @@ class DripCADUI(DripCAD):
             "lateral_inner_d_mm": float(
                 (self.var_lat_inner_d_mm.get().strip() or "13.6").replace(",", ".")
             ),
+            "lateral_inner_d_mm_list": lateral_inner_slice,
             "emitter_h_press_min_m": float(
                 self.var_emit_h_press_min.get().replace(",", ".")
             ),
@@ -562,6 +566,8 @@ class DripCADUI(DripCAD):
         return dto
 
     def run_calculation(self):
+        if not self._ensure_emitter_kx_ready():
+            return
         abi = self._safe_active_block_idx()
         if abi is None or not self.field_blocks:
             silent_showwarning(self.root, "Увага", "Немає блоку поля для розрахунку.")

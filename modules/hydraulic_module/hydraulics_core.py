@@ -637,11 +637,9 @@ class HydraulicEngine:
             "x_exp": emitter_x_exp if emitter_x_exp > 1e-12 else None,
             "kd_coeff": emitter_kd_coeff if emitter_kd_coeff > 1e-12 else 1.0,
         }
-        try:
-            emitter_h_ref = float(str(data.get("emitter_h_ref_m", 10.0)).replace(",", "."))
-        except Exception:
-            emitter_h_ref = 10.0
-        h_ref_m = max(0.05, emitter_h_ref)
+        # Історичний параметр H_ref більше не використовується у фізичній моделі:
+        # некомпенсовані емітери рахуються через k*x (q = k * H^x).
+        h_ref_m = 10.0
         try:
             lateral_inner_d_mm = float(str(data.get("lateral_inner_d_mm", 13.6)).replace(",", "."))
         except Exception:
@@ -708,6 +706,22 @@ class HydraulicEngine:
                     except (TypeError, ValueError):
                         per_e_flows.append(1.05)
 
+        _ld_mm_list = data.get("lateral_inner_d_mm_list")
+        per_d_in_m = None
+        if (
+            isinstance(_ld_mm_list, list)
+            and len(_ld_mm_list) == n_lat_all
+            and n_lat_all > 0
+        ):
+            per_d_in_m = []
+            for i in range(n_lat_all):
+                try:
+                    dmm = float(str(_ld_mm_list[i]).replace(",", "."))
+                except (TypeError, ValueError):
+                    dmm = lateral_inner_d_mm
+                dmm = max(0.5, min(200.0, dmm))
+                per_d_in_m.append(max(1e-6, dmm / 1000.0))
+
         total_drip_len = sum([lat.length for lat in all_lats])
         if per_e_steps is not None:
             total_q_m3h = 0.0
@@ -734,9 +748,14 @@ class HydraulicEngine:
                 f"Емітери: компенсовані — поле «Q» = номінал л/год при H ≥ {emitter_opts['h_min_m']:.2f} м вод. ст.; нижче — пропорційне зниження."
             )
         else:
-            report_lines.append(
-                f"Емітери: турбулентні — вилив ∝ √(H/{h_ref_m:.2f} м вод. ст.)."
-            )
+            if emitter_opts.get("k_coeff") is not None and emitter_opts.get("x_exp") is not None:
+                report_lines.append(
+                    f"Емітери: некомпенсовані — закон q = k·H^x (k={float(emitter_opts['k_coeff']):.5g}, x={float(emitter_opts['x_exp']):.4g})."
+                )
+            else:
+                report_lines.append(
+                    "Емітери: некомпенсовані — закон q = k·H^x; k/x не задані явно, застосовано сумісний fallback (x=0.5, k з Qном@10м)."
+                )
         if h_press_min_m > 1e-9 or h_press_max_m > 1e-9:
             lo_s = f"{h_press_min_m:.2f}" if h_press_min_m > 1e-9 else "—"
             hi_s = f"{h_press_max_m:.2f}" if h_press_max_m > 1e-9 else "—"
@@ -856,10 +875,13 @@ class HydraulicEngine:
             """collect_loads=True: лише накопичити lateral_loads_for_sm; інакше — зібрати emitters."""
             nonlocal max_dH_tip, max_dQ_m3s, max_dQ_rel, wing_solves, sum_it_bi, sum_it_nr
             out_emitters = {}
-            d_in = lateral_inner_d_m
             c_hw = float(DEFAULT_HAZEN_WILLIAMS_C)
 
             for idx, gl in enumerate(lat_geom):
+                if per_d_in_m is not None:
+                    d_in = per_d_in_m[idx]
+                else:
+                    d_in = lateral_inner_d_m
                 lat = gl["lat"]
                 conn_dist = gl["conn_dist"]
                 cx, cy = gl["cx"], gl["cy"]
@@ -1787,7 +1809,6 @@ class HydraulicEngine:
                 return 0.0
             return float(topo.get_z(float(px), float(py)))
 
-        d_in_audit = lateral_inner_d_m
         c_hw_audit = float(DEFAULT_HAZEN_WILLIAMS_C)
         band_active = (h_press_min_m > 1e-9) or (h_press_max_m > 1e-9)
 
@@ -1804,6 +1825,7 @@ class HydraulicEngine:
                     ef_a = float(e_flow)
                 except (TypeError, ValueError):
                     ef_a = 1.05
+            d_use = per_d_in_m[lat_idx] if per_d_in_m is not None else lateral_inner_d_m
             return lat_sol.emitter_head_min_max_for_h_sub(
                 gl["lat"],
                 gl["conn_dist"],
@@ -1811,7 +1833,7 @@ class HydraulicEngine:
                 es_a,
                 ef_a,
                 _topo_xy,
-                d_inner_m=d_in_audit,
+                d_inner_m=d_use,
                 C_hw=c_hw_audit,
                 h_ref_m=h_ref_m,
                 emitter_opts=emitter_opts,

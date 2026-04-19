@@ -3,6 +3,7 @@ import os
 import json
 import math
 import re
+import tempfile
 from tkinter import filedialog
 
 from main_app.ui.silent_messagebox import silent_showerror, silent_showinfo, silent_showwarning
@@ -15,6 +16,137 @@ from modules.hydraulic_module.trunk_map_graph import (
     ensure_trunk_node_ids,
     normalize_legacy_trunk_valve_kinds,
 )
+
+
+def _json_dict_key_str(k) -> str:
+    """Ключі JSON-об'єкта мають бути рядками (tuple тощо — у стабільний рядок)."""
+    if isinstance(k, str):
+        return k
+    if isinstance(k, bool):
+        return "true" if k else "false"
+    if isinstance(k, int):
+        return str(int(k))
+    if isinstance(k, float):
+        if math.isnan(k) or math.isinf(k):
+            return "_invalid_numeric_key_"
+        if abs(k - round(k)) < 1e-9:
+            return str(int(round(k)))
+        return str(k)
+    if isinstance(k, tuple) and len(k) == 2:
+        return f"{str(k[0]).strip()}->{str(k[1]).strip()}"
+    return str(k)
+
+
+def _sanitize_for_json_export(obj, *, _depth: int = 0):
+    """
+    Рекурсивно приводить структуру до типів, безпечних для json.dumps(allow_nan=False).
+    Усі ключі словників — str (tuple-ключі з кешів тощо не ламають серіалізацію).
+    """
+    if _depth > 120:
+        return None
+    if obj is None:
+        return None
+    if isinstance(obj, bool):
+        return obj
+    if isinstance(obj, int) and not isinstance(obj, bool):
+        return int(obj)
+    if isinstance(obj, float):
+        if math.isnan(obj) or math.isinf(obj):
+            return None
+        return float(obj)
+    if isinstance(obj, str):
+        return obj
+    if isinstance(obj, (bytes, bytearray)):
+        try:
+            return obj.decode("utf-8", errors="replace")
+        except Exception:
+            return str(obj)
+    if isinstance(obj, dict):
+        out: dict = {}
+        for k, v in obj.items():
+            out[_json_dict_key_str(k)] = _sanitize_for_json_export(v, _depth=_depth + 1)
+        return out
+    if isinstance(obj, (list, tuple)):
+        return [_sanitize_for_json_export(x, _depth=_depth + 1) for x in obj]
+    if isinstance(obj, (set, frozenset)):
+        return [_sanitize_for_json_export(x, _depth=_depth + 1) for x in obj]
+    return str(obj)
+
+
+def _atomic_write_text(filepath: str, text: str) -> None:
+    """Атомарний запис UTF-8 (temp у тій самій теці + os.replace), щоб не залишати обірваний JSON."""
+    filepath = os.path.abspath(filepath)
+    d = os.path.dirname(filepath)
+    os.makedirs(d, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix=".drdproj_", suffix=".tmp", dir=d)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as wf:
+            wf.write(text)
+        os.replace(tmp_path, filepath)
+    except Exception:
+        try:
+            if os.path.isfile(tmp_path):
+                os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+
+
+def _format_json_decode_error(filepath: str, err: json.JSONDecodeError) -> str:
+    """Контекст рядка з файлу для діагностики пошкодженого JSON."""
+    fp = os.path.abspath(filepath)
+    lines: list = []
+    try:
+        with open(fp, "r", encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except Exception:
+        return f"{fp}\n{err}"
+    ln = int(getattr(err, "lineno", 1) or 1)
+    col = int(getattr(err, "colno", 1) or 1)
+    i0 = max(0, ln - 4)
+    i1 = min(len(lines), ln + 3)
+    parts = [f"Файл: {fp}", f"Помилка JSON: {err}", f"Рядок {ln}, колонка {col}:", ""]
+    for i in range(i0, i1):
+        prefix = ">" if i + 1 == ln else " "
+        parts.append(f"{prefix} {i + 1:5d}: {lines[i]}")
+    return "\n".join(parts)
+
+
+def _normalize_trunk_irrigation_hydro_cache_from_json(cache: dict) -> dict:
+    """Після json.load ключі слотів/ребер стають str — відновлюємо int-ключі сегментів у seg_dominant_slot."""
+    if not isinstance(cache, dict):
+        return cache
+    out = copy.deepcopy(cache)
+    m = out.get("seg_dominant_slot")
+    if isinstance(m, dict):
+        new_m: dict = {}
+        for k, v in m.items():
+            try:
+                ik = int(k)
+            except (TypeError, ValueError):
+                continue
+            if v is None:
+                new_m[ik] = None
+            else:
+                try:
+                    new_m[ik] = int(v)
+                except (TypeError, ValueError):
+                    try:
+                        new_m[ik] = int(float(v))
+                    except (TypeError, ValueError):
+                        new_m[ik] = v
+        out["seg_dominant_slot"] = new_m
+    return out
+
+
+def _trim_orchestrator_after_persist(app) -> None:
+    orch = getattr(app, "orchestrator", None)
+    trim = getattr(orch, "trim_auxiliary_results_after_persist", None) if orch is not None else None
+    if callable(trim):
+        try:
+            trim()
+        except Exception:
+            pass
 
 
 def _normalize_consumer_schedule_payload(raw) -> dict:
@@ -69,10 +201,48 @@ def _normalize_consumer_schedule_payload(raw) -> dict:
             vm = raw.get("trunk_schedule_v_max_mps")
             if vm is not None and str(vm).strip() != "":
                 fvm = float(vm)
-                if fvm > 0.0:
-                    out["trunk_schedule_v_max_mps"] = max(0.2, min(8.0, float(fvm)))
+                if fvm >= 0.0:
+                    out["trunk_schedule_v_max_mps"] = max(0.0, min(8.0, float(fvm)))
         except (TypeError, ValueError):
             pass
+        try:
+            tq = raw.get("trunk_schedule_test_q_m3h")
+            if tq is not None and str(tq).strip() != "":
+                ftq = float(tq)
+                if ftq >= 0.0:
+                    out["trunk_schedule_test_q_m3h"] = max(0.0, min(10000.0, float(ftq)))
+        except (TypeError, ValueError):
+            pass
+        try:
+            th = raw.get("trunk_schedule_test_h_m")
+            if th is not None and str(th).strip() != "":
+                fth = float(th)
+                if fth >= 0.0:
+                    out["trunk_schedule_test_h_m"] = max(0.0, min(400.0, float(fth)))
+        except (TypeError, ValueError):
+            pass
+        try:
+            ms = raw.get("trunk_schedule_max_sections_per_edge")
+            if ms is not None and str(ms).strip() != "":
+                fms = int(float(ms))
+                out["trunk_schedule_max_sections_per_edge"] = max(1, min(4, int(fms)))
+        except (TypeError, ValueError):
+            pass
+        try:
+            vw = raw.get("trunk_display_velocity_warn_mps")
+            if vw is not None and str(vw).strip() != "":
+                fvw = float(vw)
+                if fvw >= 0.0:
+                    out["trunk_display_velocity_warn_mps"] = max(0.0, min(8.0, float(fvw)))
+        except (TypeError, ValueError):
+            pass
+        goal = str(raw.get("trunk_schedule_opt_goal", "weight")).strip().lower()
+        if goal not in ("weight", "money", "cost_index"):
+            goal = "weight"
+        if goal == "cost_index":
+            goal = "money"
+        out["trunk_schedule_opt_goal"] = goal
+        out["trunk_pipes_selected"] = bool(raw.get("trunk_pipes_selected", False))
     return out
 
 
@@ -168,18 +338,68 @@ def _collect_project_data(app, force_georeferenced=False):
             cp._flush_schedule_trunk_v_max_to_app()
         except Exception:
             pass
+    if cp is not None and hasattr(cp, "_flush_schedule_trunk_min_seg_to_app"):
+        try:
+            cp._flush_schedule_trunk_min_seg_to_app()
+        except Exception:
+            pass
+    if cp is not None and hasattr(cp, "_flush_schedule_trunk_max_sections_to_app"):
+        try:
+            cp._flush_schedule_trunk_max_sections_to_app()
+        except Exception:
+            pass
+    if cp is not None and hasattr(cp, "_flush_schedule_trunk_opt_goal_to_app"):
+        try:
+            cp._flush_schedule_trunk_opt_goal_to_app()
+        except Exception:
+            pass
+    if cp is not None and hasattr(cp, "_flush_schedule_trunk_pipe_mode_to_app"):
+        try:
+            cp._flush_schedule_trunk_pipe_mode_to_app()
+        except Exception:
+            pass
+    if cp is not None and hasattr(cp, "_flush_schedule_test_qh_to_app"):
+        try:
+            cp._flush_schedule_test_qh_to_app()
+        except Exception:
+            pass
+    # Магістраль у JSON: спочатку trunk_tree → сегменти (результат оптимізації/телескоп у відрізках),
+    # потім синхронізація дерева з карти, знову дерево → сегменти — щоб довжини/секції узгодились перед записом.
+    if hasattr(app, "_sync_trunk_segment_hydraulic_props_from_tree"):
+        try:
+            app._sync_trunk_segment_hydraulic_props_from_tree()
+        except Exception:
+            pass
     if hasattr(app, "sync_trunk_tree_data_from_trunk_map"):
         try:
             app.sync_trunk_tree_data_from_trunk_map()
         except Exception:
             pass
+    if hasattr(app, "_sync_trunk_segment_hydraulic_props_from_tree"):
+        try:
+            app._sync_trunk_segment_hydraulic_props_from_tree()
+        except Exception:
+            pass
     trunk_nodes = getattr(app, "trunk_map_nodes", None) or []
     if trunk_nodes:
         ensure_trunk_node_ids(trunk_nodes)
-    trunk_segments = list(getattr(app, "trunk_map_segments", []) or [])
+    trunk_segments = []
+    for seg in list(getattr(app, "trunk_map_segments", []) or []):
+        if not isinstance(seg, dict):
+            continue
+        rec = dict(seg)
+        raw_secs = rec.get("sections")
+        if not isinstance(raw_secs, list):
+            raw_secs = rec.get("telescoped_sections")
+        if isinstance(raw_secs, list):
+            rec["sections"] = copy.deepcopy(raw_secs)
+            rec["telescoped_sections"] = copy.deepcopy(raw_secs)
+        trunk_segments.append(rec)
     _tap = getattr(app, "trunk_allowed_pipes", None)
     if not isinstance(_tap, dict):
         _tap = {}
+    _thc = getattr(app, "trunk_irrigation_hydro_cache", None)
+    trunk_hydro_json = copy.deepcopy(_thc) if isinstance(_thc, dict) else None
     trunk_payload = {
         "nodes": list(trunk_nodes),
         "segments": trunk_segments,
@@ -217,9 +437,15 @@ def _collect_project_data(app, force_georeferenced=False):
         "consumer_schedule": copy.deepcopy(
             _normalize_consumer_schedule_payload(getattr(app, "consumer_schedule", None))
         ),
+        "trunk_irrigation_hydro_cache": trunk_hydro_json,
         "project_zone_bounds_local": (
             list(app.project_zone_bounds_local)
             if getattr(app, "project_zone_bounds_local", None) is not None
+            else None
+        ),
+        "project_zone_ring_local": (
+            [list(p) for p in (getattr(app, "project_zone_ring_local", None) or [])]
+            if getattr(app, "project_zone_ring_local", None)
             else None
         ),
         "srtm_zone_ring_local": list(getattr(app.topo, "srtm_boundary_pts_local", []) or []),
@@ -290,11 +516,60 @@ def _write_project_to_disk(app, filepath, data):
     filepath = os.path.abspath(filepath)
     proj_dir = os.path.dirname(filepath)
     os.makedirs(proj_dir, exist_ok=True)
-    with open(filepath, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=4)
+    clean = _sanitize_for_json_export(data)
+    text = json.dumps(
+        clean,
+        indent=4,
+        ensure_ascii=False,
+        allow_nan=False,
+        default=str,
+    )
+    _atomic_write_text(filepath, text)
     project_db_path = os.path.join(proj_dir, "pipes_db.json")
-    with open(project_db_path, "w", encoding="utf-8") as f:
-        json.dump(app.pipe_db, f, indent=4)
+    clean_pipes = _sanitize_for_json_export(app.pipe_db)
+    text_pipes = json.dumps(
+        clean_pipes,
+        indent=4,
+        ensure_ascii=False,
+        allow_nan=False,
+        default=str,
+    )
+    _atomic_write_text(project_db_path, text_pipes)
+
+
+def persist_project_snapshot(app, *, silent: bool = True) -> bool:
+    """
+    Записати поточний стан у JSON проєкту (як «Зберегти»), без діалогу вибору файлу.
+    Використовує останній шлях відкриття/збереження або designs/<ім'я>/<ім'я>.json.
+    """
+    try:
+        proj_dir = ensure_project_dir(app)
+        fp = getattr(app, "_project_json_filepath", None)
+        if fp:
+            fp = os.path.abspath(fp)
+        else:
+            name = (app.var_proj_name.get() or "").strip() or "Untitled_Project"
+            fp = os.path.join(proj_dir, f"{name}.json")
+        data = _collect_project_data(app, force_georeferenced=False)
+        _write_project_to_disk(app, fp, data)
+        app._project_json_filepath = fp
+        if not silent:
+            silent_showinfo(app.root, "Збережено", f"Проект успішно збережено в:\n{fp}")
+        _trim_orchestrator_after_persist(app)
+        return True
+    except Exception as e:
+        if silent:
+            try:
+                silent_showwarning(
+                    app.root,
+                    "Автозбереження проєкту",
+                    f"Не вдалося записати JSON (результати магістралі лишились лише в пам’яті):\n{e}",
+                )
+            except Exception:
+                pass
+        else:
+            silent_showerror(app.root, "Помилка", f"Не вдалося зберегти проект:\n{e}")
+        return False
 
 
 def save_project(app, force_georeferenced=False):
@@ -310,7 +585,9 @@ def save_project(app, force_georeferenced=False):
     data = _collect_project_data(app, force_georeferenced)
     try:
         _write_project_to_disk(app, filepath, data)
+        app._project_json_filepath = os.path.abspath(filepath)
         silent_showinfo(app.root, "Збережено", f"Проект успішно збережено в:\n{filepath}")
+        _trim_orchestrator_after_persist(app)
     except Exception as e:
         silent_showerror(app.root, "Помилка", f"Не вдалося зберегти проект:\n{e}")
 
@@ -348,10 +625,12 @@ def save_project_as(app, force_georeferenced=False):
     data["proj_name"] = app.var_proj_name.get()
     try:
         _write_project_to_disk(app, filepath, data)
+        app._project_json_filepath = os.path.abspath(filepath)
         silent_showinfo(app.root, 
             "Збережено",
             f"Проект збережено:\n{filepath}\n\nТека проєкту:\n{proj_dir}",
         )
+        _trim_orchestrator_after_persist(app)
     except Exception as e:
         silent_showerror(app.root, "Помилка", f"Не вдалося зберегти проект:\n{e}")
 
@@ -369,7 +648,7 @@ def load_project(app):
     try:
         with open(filepath, "r", encoding="utf-8") as f:
             data = json.load(f)
-            
+
         app.clear_all()
         
         # ЗАВАНТАЖУЄМО БАЗУ ТРУБ ПРОЕКТУ (якщо вона є)
@@ -441,6 +720,18 @@ def load_project(app):
                 app.project_zone_bounds_local = None
         else:
             app.project_zone_bounds_local = None
+        pzr = data.get("project_zone_ring_local")
+        app.project_zone_ring_local = None
+        if isinstance(pzr, list) and len(pzr) >= 3:
+            ring_pz = []
+            for p in pzr:
+                if isinstance(p, (list, tuple)) and len(p) >= 2:
+                    try:
+                        ring_pz.append((float(p[0]), float(p[1])))
+                    except (TypeError, ValueError):
+                        continue
+            if len(ring_pz) >= 3:
+                app.project_zone_ring_local = ring_pz
         szr = data.get("srtm_zone_ring_local")
         if isinstance(szr, list) and len(szr) >= 3:
             ring = []
@@ -449,14 +740,6 @@ def load_project(app):
                     ring.append((float(p[0]), float(p[1])))
             if len(ring) >= 3:
                 app.topo.srtm_boundary_pts_local = ring
-        elif getattr(app, "project_zone_bounds_local", None) is not None:
-            minx, miny, maxx, maxy = app.project_zone_bounds_local
-            app.topo.srtm_boundary_pts_local = [
-                (minx, miny),
-                (maxx, miny),
-                (maxx, maxy),
-                (minx, maxy),
-            ]
         if hasattr(app, "_normalize_trunk_tree_payload"):
             app.trunk_tree_data = app._normalize_trunk_tree_payload(
                 data.get("trunk_tree", getattr(app, "trunk_tree_data", {}))
@@ -527,6 +810,15 @@ def load_project(app):
                     rec["q_demand_m3s"] = float(qm)
                 except (TypeError, ValueError):
                     pass
+            for _sq in ("trunk_schedule_q_m3h", "trunk_schedule_h_m"):
+                if _sq not in row:
+                    continue
+                try:
+                    fv = float(row[_sq])
+                    if math.isfinite(fv):
+                        rec[_sq] = fv
+                except (TypeError, ValueError):
+                    pass
             app.trunk_map_nodes.append(rec)
         ensure_trunk_node_ids(app.trunk_map_nodes)
         app.trunk_map_segments = []
@@ -558,7 +850,59 @@ def load_project(app):
                             break
             if len(path) < 2:
                 continue
-            app.trunk_map_segments.append({"node_indices": idxs, "path_local": path})
+            seg_rec: dict = {"node_indices": idxs, "path_local": path}
+            for dk in ("d_inner_mm", "c_hw"):
+                if dk not in seg:
+                    continue
+                try:
+                    fv = float(seg[dk])
+                    if math.isfinite(fv):
+                        seg_rec[dk] = fv
+                except (TypeError, ValueError):
+                    pass
+            for sk in ("pipe_material", "pipe_pn", "pipe_od"):
+                if sk not in seg or seg[sk] is None:
+                    continue
+                s = str(seg[sk]).strip()
+                if s:
+                    seg_rec[sk] = s
+            # Телескоп магістралі: сумісність ключів sections / telescoped_sections.
+            raw_secs = seg.get("sections")
+            if not isinstance(raw_secs, list):
+                raw_secs = seg.get("telescoped_sections")
+            if isinstance(raw_secs, list):
+                secs = []
+                for row in raw_secs:
+                    if not isinstance(row, dict):
+                        continue
+                    try:
+                        sl = float(row.get("length_m", 0.0))
+                        sd = float(row.get("d_inner_mm", 0.0))
+                        sc = float(row.get("c_hw", 140.0))
+                    except (TypeError, ValueError):
+                        continue
+                    if sl <= 1e-9 or sd <= 1e-9:
+                        continue
+                    sec_row = {
+                        "length_m": float(sl),
+                        "d_inner_mm": float(sd),
+                        "c_hw": float(sc),
+                    }
+                    for ek in ("d_nom_mm", "material", "pn", "head_loss_m", "weight_kg", "objective_cost"):
+                        if ek not in row:
+                            continue
+                        try:
+                            sec_row[ek] = float(row[ek]) if ek in ("d_nom_mm", "head_loss_m", "weight_kg", "objective_cost") else str(row[ek])
+                        except (TypeError, ValueError):
+                            if ek in ("material", "pn"):
+                                sec_row[ek] = str(row[ek])
+                    secs.append(sec_row)
+                if secs:
+                    seg_rec["sections"] = secs
+                    seg_rec["telescoped_sections"] = copy.deepcopy(secs)
+            if "bom_length_zero" in seg:
+                seg_rec["bom_length_zero"] = bool(seg.get("bom_length_zero"))
+            app.trunk_map_segments.append(seg_rec)
         if hasattr(app, "normalize_trunk_segments_to_graph_edges"):
             try:
                 app.normalize_trunk_segments_to_graph_edges()
@@ -605,6 +949,36 @@ def load_project(app):
         if cp is not None and hasattr(cp, "_sync_schedule_trunk_v_max_ui"):
             try:
                 cp._sync_schedule_trunk_v_max_ui()
+            except Exception:
+                pass
+        if cp is not None and hasattr(cp, "_sync_schedule_trunk_min_seg_ui"):
+            try:
+                cp._sync_schedule_trunk_min_seg_ui()
+            except Exception:
+                pass
+        if cp is not None and hasattr(cp, "_sync_schedule_trunk_opt_goal_ui"):
+            try:
+                cp._sync_schedule_trunk_opt_goal_ui()
+            except Exception:
+                pass
+        if cp is not None and hasattr(cp, "_sync_schedule_trunk_max_sections_ui"):
+            try:
+                cp._sync_schedule_trunk_max_sections_ui()
+            except Exception:
+                pass
+        if cp is not None and hasattr(cp, "_sync_schedule_trunk_pipe_mode_ui"):
+            try:
+                cp._sync_schedule_trunk_pipe_mode_ui()
+            except Exception:
+                pass
+        if hasattr(app, "sync_trunk_display_velocity_warn_var_from_schedule"):
+            try:
+                app.sync_trunk_display_velocity_warn_var_from_schedule()
+            except Exception:
+                pass
+        if cp is not None and hasattr(cp, "_sync_schedule_test_qh_ui"):
+            try:
+                cp._sync_schedule_test_qh_ui()
             except Exception:
                 pass
 
@@ -743,7 +1117,22 @@ def load_project(app):
             app.var_lat_disp_use_step.set(bool(p.get("lat_disp_use_step", True)))
             app.var_lat_disp_use_start.set(bool(p.get("lat_disp_use_start", False)))
             app.var_lat_disp_use_end.set(bool(p.get("lat_disp_use_end", False)))
-        
+
+        raw_thc = data.get("trunk_irrigation_hydro_cache")
+        if isinstance(raw_thc, dict) and raw_thc:
+            app.trunk_irrigation_hydro_cache = _normalize_trunk_irrigation_hydro_cache_from_json(
+                raw_thc
+            )
+        else:
+            app.trunk_irrigation_hydro_cache = None
+        if hasattr(app, "notify_irrigation_schedule_ui"):
+            try:
+                app.notify_irrigation_schedule_ui()
+            except Exception:
+                pass
+
+        app._project_json_filepath = os.path.abspath(filepath)
+
         app.regenerate_grid()
         
         if "calc_results" in data:
@@ -760,6 +1149,12 @@ def load_project(app):
             app.sync_srtm_model_status()
         if hasattr(app, "refresh_map_after_project_load"):
             app.refresh_map_after_project_load()
+    except json.JSONDecodeError as e:
+        silent_showerror(
+            app.root,
+            "Помилка JSON",
+            _format_json_decode_error(filepath, e),
+        )
     except Exception as e:
         silent_showerror(app.root, "Помилка", f"Не вдалося завантажити проект:\n{e}")
 
@@ -892,7 +1287,7 @@ def export_dxf(app):
         from modules.geo_module.dem_contours.dxf_export import write_contours_dxf
 
         features = [(item["geom"], float(item["z"])) for item in cached]
-        n = write_contours_dxf(features, filepath, layer_name="ISOLINES")
+        n = write_contours_dxf(features, filepath, layer_name="c-1")
         silent_showinfo(app.root, "Експорт", f"Збережено {n} поліліній ізоліній (DXF R12):\n{filepath}")
     except Exception as e:
         silent_showerror(app.root, "Помилка", f"Не вдалося експортувати DXF:\n{e}")
@@ -1078,6 +1473,7 @@ def export_pdf(app):
             
         pdf.output(filepath)
         silent_showinfo(app.root, "Експорт", f"PDF звіт успішно збережено:\n{filepath}")
+        _trim_orchestrator_after_persist(app)
     except Exception as e: 
         silent_showerror(app.root, "Помилка", f"Не вдалося експортувати PDF:\n{e}")
     finally:

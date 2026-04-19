@@ -4,6 +4,8 @@
 Приклад: біля насоса 30 м вод. ст., біля дальнього поля потрібно ≥ 20 м —
 на лінійні втрати + різницю рельєфу лишається бюджет ≈ 10 м (якщо dz задані окремо).
 
+Параметр v_max_m_s <= 0 — обмеження швидкості не застосовується (лише бюджет ΔH і каталог).
+
 Вартість у базі труб немає — використовується індекс вартості (монотонний по DN і PN)
 для «не дорого»: спершу мінімальні прийнятні діаметри, потім локальне потовщення там,
 де найбільше знімає втрати на одиницю індексу.
@@ -18,6 +20,12 @@ from typing import Dict, List, Optional, Sequence
 
 from . import lateral_drip_core as lat
 from .hydraulics_constants import DEFAULT_HAZEN_WILLIAMS_C
+from .pipe_weight_optimizer import (
+    OptimizationConstraints,
+    SegmentDemand,
+    build_pipe_options_from_db,
+    optimize_fixed_topology_by_weight,
+)
 
 
 def _default_pipes_db_path() -> Path:
@@ -84,10 +92,15 @@ def build_sku_list(
         if not isinstance(by_nom, dict):
             continue
         allow_dns = None
+        allow_set = None
         if allowed_pipes and material in allowed_pipes:
             allow_dns = allowed_pipes[material].get(str(pn_str))
+        if allow_dns is not None:
+            allow_set = {str(x).strip() for x in allow_dns if str(x).strip()}
+            if not allow_set:
+                continue
         for d_key, pdata in by_nom.items():
-            if allow_dns is not None and str(d_key) not in [str(x) for x in allow_dns]:
+            if allow_set is not None and str(d_key).strip() not in allow_set:
                 continue
             d_nom = float(d_key)
             if isinstance(pdata, dict):
@@ -119,13 +132,15 @@ def _choices_for_segment(
     all_skus: Sequence[PipeSKU],
     v_max_m_s: float,
 ) -> List[PipeSKU]:
-    """Допустимі SKU з v ≤ v_max; унікалізуємо по d_inner (беремо найдешевший індекс на розмір)."""
+    """Допустимі SKU: при v_max>0 — лише з v ≤ v_max; при v_max≤0 — усі (швидкість не обмежуємо). Унікалізуємо по d_inner."""
     by_inner: Dict[float, PipeSKU] = {}
+    v_lim = float(v_max_m_s)
     for sku in all_skus:
         d_m = sku.d_inner_mm / 1000.0
-        v = _velocity_m_s(q_m3s, d_m)
-        if v > v_max_m_s + 1e-4:
-            continue
+        if v_lim > 1e-12:
+            v = _velocity_m_s(q_m3s, d_m)
+            if v > v_lim + 1e-4:
+                continue
         prev = by_inner.get(sku.d_inner_mm)
         if prev is None or sku.cost_index_per_m < prev.cost_index_per_m:
             by_inner[sku.d_inner_mm] = sku
@@ -157,7 +172,8 @@ def optimize_submain_telescope(
     material: str = "PVC",
     allowed_pipes: Optional[dict] = None,
     c_hw: float = DEFAULT_HAZEN_WILLIAMS_C,
-    v_max_m_s: float = 2.5,
+    v_max_m_s: float = 0.0,
+    min_segment_length_m: float = 0.0,
     pipes_db_path: Optional[Path] = None,
 ) -> TelescopeOptimizeResult:
     """
@@ -176,9 +192,14 @@ def optimize_submain_telescope(
             feasible=True,
             message="Немає сегментів.",
         )
+    min_seg = max(0.0, float(min_segment_length_m))
     for s in segments:
         if s.length_m < 0 or s.q_m3s < 0:
             raise ValueError("Довжина та витрата сегмента не можуть бути від'ємними.")
+        if s.length_m > 1e-9 and s.length_m + 1e-9 < min_seg:
+            raise ValueError(
+                f"Довжина сегмента {s.length_m:.3f} м менша за мінімально допустиму {min_seg:.3f} м."
+            )
 
     db = pipes_db if pipes_db is not None else load_pipes_db(pipes_db_path)
     all_skus = build_sku_list(db, material, allowed_pipes)
@@ -248,7 +269,11 @@ def optimize_submain_telescope(
                 feasible=False,
                 message=(
                     f"Не вистачає бюджету втрат: потрібно зняти ΔH_friction ≈ {cur_hf:.2f} м при бюджеті {friction_budget:.2f} м. "
-                    "Збільшіть діаметри в каталозі, v_max або тиск біля насоса."
+                    + (
+                        "Збільшіть діаметри в каталозі або тиск біля насоса."
+                        if v_max_m_s <= 1e-12
+                        else "Збільшіть діаметри в каталозі, v_max або тиск біля насоса."
+                    )
                 ),
             )
         n_up += 1
@@ -283,6 +308,117 @@ def optimize_submain_telescope(
     )
 
 
+def optimize_submain_telescope_by_weight(
+    segments: List[TelescopeSegment],
+    h_inlet_m: float,
+    h_end_min_m: float,
+    *,
+    pipes_db: Optional[dict] = None,
+    material: str = "PVC",
+    allowed_pipes: Optional[dict] = None,
+    c_hw: float = DEFAULT_HAZEN_WILLIAMS_C,
+    v_max_m_s: float = 0.0,
+    min_segment_length_m: float = 0.0,
+    pipes_db_path: Optional[Path] = None,
+) -> TelescopeOptimizeResult:
+    """
+    Альтернатива optimize_submain_telescope:
+    мінімізує сумарну вагу труб при тому ж бюджеті втрат і обмеженні швидкості.
+    """
+    if not segments:
+        return TelescopeOptimizeResult(
+            picks=[],
+            total_hf_m=0.0,
+            total_dz_m=0.0,
+            friction_budget_m=0.0,
+            cost_index_total=0.0,
+            feasible=True,
+            message="Немає сегментів.",
+        )
+    db = pipes_db if pipes_db is not None else load_pipes_db(pipes_db_path)
+    options = build_pipe_options_from_db(
+        db,
+        material=material,
+        allowed_pipes=allowed_pipes,
+        c_hw=float(c_hw),
+    )
+    sum_dz = sum(float(s.dz_m) for s in segments)
+    friction_budget = float(h_inlet_m) - float(h_end_min_m) - sum_dz
+    if friction_budget <= 0:
+        return TelescopeOptimizeResult(
+            picks=[],
+            total_hf_m=0.0,
+            total_dz_m=sum_dz,
+            friction_budget_m=friction_budget,
+            cost_index_total=0.0,
+            feasible=False,
+            message="Бюджет втрат напору ≤ 0: збільшіть тиск біля насоса, зменшите вимогу в кінці або рельєф.",
+        )
+    demands = [
+        SegmentDemand(
+            id=f"S{i+1}",
+            length_m=float(s.length_m),
+            q_m3s=float(s.q_m3s),
+            dz_m=float(s.dz_m),
+            min_length_m=max(0.0, float(min_segment_length_m)),
+        )
+        for i, s in enumerate(segments)
+    ]
+    res = optimize_fixed_topology_by_weight(
+        demands,
+        options,
+        OptimizationConstraints(
+            max_head_loss_m=float(friction_budget),
+            max_velocity_m_s=float(v_max_m_s),
+            min_segment_length_m=max(0.0, float(min_segment_length_m)),
+        ),
+    )
+    if not res.feasible:
+        return TelescopeOptimizeResult(
+            picks=[],
+            total_hf_m=float(res.total_head_loss_m),
+            total_dz_m=sum_dz,
+            friction_budget_m=friction_budget,
+            cost_index_total=0.0,
+            feasible=False,
+            message=res.message,
+        )
+    by_id = {c.segment_id: c for c in res.choices}
+    picks: List[SegmentPick] = []
+    for i, seg in enumerate(segments):
+        ch = by_id.get(f"S{i+1}")
+        if ch is None:
+            continue
+        sku = PipeSKU(
+            material=ch.material,
+            pn=ch.pn,
+            d_nom_mm=ch.d_nom_mm,
+            d_inner_mm=ch.d_inner_mm,
+            # Для сумісності поля: у цьому сценарії повертаємо вагу, не індекс.
+            cost_index_per_m=(ch.weight_kg / max(1e-9, float(seg.length_m))),
+        )
+        picks.append(
+            SegmentPick(
+                segment_index=i,
+                sku=sku,
+                hf_m=float(ch.head_loss_m),
+                v_m_s=float(ch.velocity_m_s),
+            )
+        )
+    return TelescopeOptimizeResult(
+        picks=picks,
+        total_hf_m=float(res.total_head_loss_m),
+        total_dz_m=sum_dz,
+        friction_budget_m=friction_budget,
+        cost_index_total=float(res.total_weight_kg),
+        feasible=True,
+        message=(
+            f"Сумарні втрати HW: {res.total_head_loss_m:.3f} м при бюджеті {friction_budget:.3f} м. "
+            f"Сумарна вага труб: {res.total_weight_kg:.2f} кг."
+        ),
+    )
+
+
 __all__ = [
     "PipeSKU",
     "SegmentPick",
@@ -291,4 +427,5 @@ __all__ = [
     "build_sku_list",
     "load_pipes_db",
     "optimize_submain_telescope",
+    "optimize_submain_telescope_by_weight",
 ]

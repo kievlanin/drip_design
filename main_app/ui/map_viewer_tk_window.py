@@ -23,11 +23,7 @@ except Exception as ex:  # pragma: no cover - runtime dependency check
 else:
     _IMPORT_ERR = None
 from modules.geo_module import srtm_tiles
-from modules.hydraulic_module.trunk_map_graph import (
-    ensure_trunk_node_ids,
-    is_trunk_root_kind,
-    validate_trunk_map_graph,
-)
+from modules.hydraulic_module.trunk_map_graph import ensure_trunk_node_ids
 from main_app.paths import SRTM_DIR
 from main_app.ui.map_left_draw_widgets import build_draw_modes_tab, build_trunk_tools_tab
 from main_app.ui.silent_messagebox import (
@@ -38,7 +34,6 @@ from main_app.ui.silent_messagebox import (
 )
 from main_app.ui.tooltips import attach_tooltip_dark as _attach_dark_tooltip
 
-DARK_TILE_URL = "https://a.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png"
 LIGHT_TILE_URL = "https://a.tile.openstreetmap.org/{z}/{x}/{y}.png"
 SAT_TILE_URL = (
     "https://server.arcgisonline.com/ArcGIS/rest/services/"
@@ -48,7 +43,24 @@ TERRAIN_TILE_URL = (
     "https://server.arcgisonline.com/ArcGIS/rest/services/"
     "World_Topo_Map/MapServer/tile/{z}/{y}/{x}"
 )
+# Мозаїка Sentinel-2 без хмар (Copernicus / ESA) — тайли EOX WMTS; умови та атрибуція: https://s2maps.eu/
+COPERNICUS_S2_CLOUDLESS_TILE_URL = (
+    "https://c.tiles.maps.eox.at/wmts/1.0.0/s2cloudless_3857/default/GoogleMapsCompatible/{z}/{y}/{x}.jpg"
+)
+# Раніше було 13 — тайли EOX для цього шару віддаються принаймні до z=18 (z=19 — 404).
+COPERNICUS_S2_CLOUDLESS_MAX_ZOOM = 18
+# (підпис у UI, url, max_zoom)
+MAP_BASEMAP_PRESETS = (
+    ("Esri: супутник", SAT_TILE_URL, 19),
+    ("Copernicus: Sentinel-2 cloudless", COPERNICUS_S2_CLOUDLESS_TILE_URL, COPERNICUS_S2_CLOUDLESS_MAX_ZOOM),
+    ("Esri: рельєф", TERRAIN_TILE_URL, 19),
+    ("OSM світла", LIGHT_TILE_URL, 19),
+)
 MAP_BG_DARK = "#0b0f14"
+# Рамка «Зум рамкою» (виділення на canvas тайлів)
+ZOOM_BOX_OUTLINE = "#FF1744"
+ZOOM_BOX_WIDTH = 4
+ZOOM_BOX_DASH = (5, 4)
 
 # Спецінструменти карти: полілінії (ЛКМ — вершини, ПКМ — завершити) та одна точка (ЛКМ — позиція, ПКМ — зафіксувати).
 _MAP_TOOLS_POLYLINE = frozenset({"capture_tiles", "block_contour", "trunk_route", "scene_lines"})
@@ -85,6 +97,9 @@ def create_embedded_map_panel(parent: tk.Misc, app=None):
         return host
 
     host.pack(fill="both", expand=True)
+    host._map_bg_suspended = False
+    host._scale_bar_after_id = None
+    host._init_geo_after_id = None
 
     top_bar = tk.Frame(host, bg="#1e1e1e", height=34)
     top_bar.pack(side=tk.TOP, fill=tk.X)
@@ -165,6 +180,8 @@ def create_embedded_map_panel(parent: tk.Misc, app=None):
     map_widget.manage_z_order = _manage_z_order_overlay_paths
 
     def _draw_scale_bar_100m():
+        if getattr(host, "_map_bg_suspended", False):
+            return
         try:
             mc = map_widget.canvas
             w = int(mc.winfo_width())
@@ -202,10 +219,14 @@ def create_embedded_map_panel(parent: tk.Misc, app=None):
         except Exception:
             pass
         finally:
-            host.after(600, _draw_scale_bar_100m)
+            if not getattr(host, "_map_bg_suspended", False):
+                try:
+                    host._scale_bar_after_id = host.after(600, _draw_scale_bar_100m)
+                except tk.TclError:
+                    host._scale_bar_after_id = None
 
     view_state = {
-        "active_tool": None,
+        "active_tool": "select",
         "draft_points": [],
         "draft_path": None,
         "kml_paths": [],
@@ -225,6 +246,7 @@ def create_embedded_map_panel(parent: tk.Misc, app=None):
         "trunk_segment_paths": [],
         "trunk_draft_indices": [],
     }
+
     hint = tk.StringVar(value="Інструмент: навігація")
     dl_status = tk.StringVar(value="SRTM: очікування")
     show_blocks_var = tk.BooleanVar(value=True)
@@ -340,6 +362,13 @@ def create_embedded_map_panel(parent: tk.Misc, app=None):
                     best_trunk = best_n
                 else:
                     best_trunk = best_n if dn <= ds else best_s
+            trunk_priority = bool(
+                app is not None
+                and hasattr(app, "_trunk_interaction_priority_active")
+                and app._trunk_interaction_priority_active()
+            )
+            if trunk_priority and best_trunk is not None:
+                return best_trunk[2]
             hits = ([best_trunk] if best_trunk is not None else []) + other_hits
         hits.sort(key=lambda t: (t[1], t[0]))
         return hits[0][2]
@@ -352,25 +381,57 @@ def create_embedded_map_panel(parent: tk.Misc, app=None):
         nodes = list(getattr(app, "trunk_map_nodes", []) or [])
         for i, node in enumerate(nodes):
             try:
-                lat = float(node.get("lat"))
-                lon = float(node.get("lon"))
                 wx = float(node["x"])
                 wy = float(node["y"])
             except (TypeError, ValueError, KeyError):
+                continue
+            lat = None
+            lon = None
+            try:
+                lat = float(node.get("lat"))
+                lon = float(node.get("lon"))
+            except (TypeError, ValueError):
+                ll = _project_local_to_latlon(wx, wy)
+                if ll is not None:
+                    lat, lon = float(ll[0]), float(ll[1])
+                    # Підлікуємо координати для наступних оновлень/збереження.
+                    try:
+                        node["lat"] = float(lat)
+                        node["lon"] = float(lon)
+                    except Exception:
+                        pass
+            if lat is None or lon is None:
                 continue
             kind = str(node.get("kind", "")).lower()
             nid = str(node.get("id", "")).strip() or f"#{i}"
             if kind == "source":
                 label = f"Насос (витік), {nid}"
+                show_pipes = True
+                if hasattr(app, "_trunk_map_hover_show_pipes_detail"):
+                    show_pipes = app._trunk_map_hover_show_pipes_detail()
+                if show_pipes and hasattr(app, "trunk_irrigation_hydro_pump_qp_hover_lines"):
+                    qp = app.trunk_irrigation_hydro_pump_qp_hover_lines()
+                    if qp:
+                        label = f"{label}\n{qp[0]}\n{qp[1]}"
+                elif not show_pipes:
+                    label = f"{label}\nТопологія вузла (без Q/P з розрахунку)"
             elif kind == "bend":
                 label = f"Пікет, {nid}"
             elif kind == "junction":
                 label = f"Розгалуження (сумматор), {nid}"
             elif kind in ("consumption", "valve"):
                 if hasattr(app, "trunk_consumer_display_caption"):
-                    label = app.trunk_consumer_display_caption(node, i)
+                    cap = app.trunk_consumer_display_caption(node, i)
                 else:
-                    label = f"Споживач (сток), {nid}"
+                    cap = f"Споживач, {nid}"
+                if hasattr(app, "_trunk_map_hover_show_pipes_detail") and app._trunk_map_hover_show_pipes_detail():
+                    label = cap
+                else:
+                    if hasattr(app, "_trunk_consumption_is_terminal"):
+                        role = "кінцевий" if app._trunk_consumption_is_terminal(i) else "проміжний"
+                    else:
+                        role = "—"
+                    label = f"{cap}\nСпоживач ({role}) — топологія"
             else:
                 label = f"Вузол магістралі, {nid}"
             _register_pick_disc(
@@ -451,6 +512,34 @@ def create_embedded_map_panel(parent: tk.Misc, app=None):
                 _nid_r = str(node.get("id", "")).strip()
                 if _nid_r and hasattr(app, "_draw_consumer_irrigation_slot_rings"):
                     app._draw_consumer_irrigation_slot_rings(c, cx, cy, _nid_r, "trunk_map_glyph")
+                is_terminal = True
+                if hasattr(app, "_trunk_consumption_is_terminal"):
+                    try:
+                        is_terminal = bool(app._trunk_consumption_is_terminal(i))
+                    except Exception:
+                        is_terminal = True
+                if is_terminal:
+                    c.create_oval(
+                        cx - 2.8,
+                        cy - 2.8,
+                        cx + 2.8,
+                        cy + 2.8,
+                        fill="#E8F5E9",
+                        outline="#2E7D32",
+                        width=1,
+                        tags="trunk_map_glyph",
+                    )
+                else:
+                    c.create_rectangle(
+                        cx - 3.0,
+                        cy - 3.0,
+                        cx + 3.0,
+                        cy + 3.0,
+                        fill="#B2EBF2",
+                        outline="#006064",
+                        width=1,
+                        tags="trunk_map_glyph",
+                    )
             elif kind == "junction":
                 Ro, Ri = g * 1.05, g * 0.42
                 coords: list[float] = []
@@ -474,6 +563,22 @@ def create_embedded_map_panel(parent: tk.Misc, app=None):
                     fill="#757575",
                     outline="#FFFFFF",
                     width=1,
+                    tags="trunk_map_glyph",
+                )
+            _nid_ins = str(node.get("id", "")).strip()
+            if (
+                _nid_ins
+                and app is not None
+                and _nid_ins == str(getattr(app, "_trunk_last_inserted_node_id", "")).strip()
+            ):
+                c.create_oval(
+                    cx - g - 4,
+                    cy - g - 4,
+                    cx + g + 4,
+                    cy + g + 4,
+                    outline="#00E5FF",
+                    width=3,
+                    fill="",
                     tags="trunk_map_glyph",
                 )
             if hasattr(app, "trunk_consumer_caption_lines"):
@@ -538,14 +643,17 @@ def create_embedded_map_panel(parent: tk.Misc, app=None):
             tcx, tcy = float(pseg[0]), float(pseg[1])
             if not (-80 < tcx < float(map_widget.width) + 80 and -80 < tcy < float(map_widget.height) + 80):
                 continue
-            try:
-                dmm = float(seg.get("d_inner_mm", 90.0) or 90.0)
-            except (TypeError, ValueError):
-                dmm = 90.0
-            if hasattr(app, "trunk_pipe_label_for_inner_mm"):
-                cap = app.trunk_pipe_label_for_inner_mm(dmm)
+            if hasattr(app, "trunk_pipe_label_for_segment") and isinstance(seg, dict):
+                cap = str(app.trunk_pipe_label_for_segment(seg))
             else:
-                cap = f"М{si + 1}"
+                try:
+                    dmm = float(seg.get("d_inner_mm", 90.0) or 90.0)
+                except (TypeError, ValueError):
+                    dmm = 90.0
+                if hasattr(app, "trunk_pipe_label_for_inner_mm"):
+                    cap = app.trunk_pipe_label_for_inner_mm(dmm)
+                else:
+                    cap = f"М{si + 1}"
             if len(cap) > 26:
                 cap = cap[:23] + "…"
             c.create_text(
@@ -556,6 +664,129 @@ def create_embedded_map_panel(parent: tk.Misc, app=None):
                 font=("Segoe UI", 8, "bold"),
                 tags="trunk_map_glyph",
             )
+
+        drag_idx = getattr(app, "_trunk_node_drag_idx", None) if app is not None else None
+        if (
+            drag_idx is not None
+            and hasattr(app, "_trunk_segment_world_path")
+            and hasattr(app, "_polyline_length_m")
+            and hasattr(app, "_polyline_point_at_dist")
+        ):
+            try:
+                di_i = int(drag_idx)
+            except (TypeError, ValueError):
+                di_i = None
+            if di_i is not None:
+                for seg in list(getattr(app, "trunk_map_segments", []) or []):
+                    if not isinstance(seg, dict):
+                        continue
+                    ni = seg.get("node_indices")
+                    if not isinstance(ni, list):
+                        continue
+                    idxs: list[int] = []
+                    for x in ni:
+                        try:
+                            idxs.append(int(x))
+                        except (TypeError, ValueError):
+                            idxs = []
+                            break
+                    if di_i not in idxs:
+                        continue
+                    plw = app._trunk_segment_world_path(seg)
+                    if len(plw) < 2:
+                        continue
+                    try:
+                        lm = float(app._polyline_length_m(plw))
+                    except Exception:
+                        continue
+                    if lm <= 1e-6:
+                        continue
+                    try:
+                        mx, my = app._polyline_point_at_dist(plw, lm * 0.5)
+                    except ValueError:
+                        continue
+                    llm = _project_local_to_latlon(float(mx), float(my))
+                    if not llm:
+                        continue
+                    pxy = _latlon_to_canvas_xy(float(llm[0]), float(llm[1]))
+                    if pxy is None:
+                        continue
+                    tcx, tcy = float(pxy[0]), float(pxy[1])
+                    if not (-80 < tcx < float(map_widget.width) + 80 and -80 < tcy < float(map_widget.height) + 80):
+                        continue
+                    c.create_text(
+                        tcx,
+                        tcy - 16,
+                        text=f"{lm:.1f} м",
+                        fill="#FFF59D",
+                        font=("Segoe UI", 9, "bold"),
+                        anchor=tk.S,
+                        tags="trunk_map_glyph",
+                    )
+
+        probe = getattr(app, "_trunk_profile_probe_world", None) if app is not None else None
+        if isinstance(probe, tuple) and len(probe) >= 2:
+            try:
+                llp = _project_local_to_latlon(float(probe[0]), float(probe[1]))
+            except Exception:
+                llp = None
+            if llp:
+                pxy = _latlon_to_canvas_xy(float(llp[0]), float(llp[1]))
+                if pxy is not None:
+                    px, py = float(pxy[0]), float(pxy[1])
+                    c.create_oval(
+                        px - 6,
+                        py - 6,
+                        px + 6,
+                        py + 6,
+                        fill="#00E5FF",
+                        outline="#E0F7FA",
+                        width=2,
+                        tags="trunk_map_glyph",
+                    )
+                    c.create_line(px - 10, py, px + 10, py, fill="#00E5FF", width=2, tags="trunk_map_glyph")
+                    c.create_line(px, py - 10, px, py + 10, fill="#00E5FF", width=2, tags="trunk_map_glyph")
+
+        if hasattr(app, "_consumer_valve_snap_overlay_enabled") and app._consumer_valve_snap_overlay_enabled():
+            try:
+                r_m = float(app._consumer_valve_snap_radius_m())
+            except Exception:
+                r_m = 22.0
+            try:
+                for vx, vy in app.get_valves():
+                    ll0 = _project_local_to_latlon(float(vx), float(vy))
+                    ll1 = _project_local_to_latlon(float(vx) + r_m, float(vy))
+                    if not ll0 or not ll1:
+                        continue
+                    p0 = _latlon_to_canvas_xy(float(ll0[0]), float(ll0[1]))
+                    p1 = _latlon_to_canvas_xy(float(ll1[0]), float(ll1[1]))
+                    if p0 is None or p1 is None:
+                        continue
+                    rad = max(3.0, math.hypot(float(p1[0]) - float(p0[0]), float(p1[1]) - float(p0[1])))
+                    cx, cy = float(p0[0]), float(p0[1])
+                    if not (-80 < cx < float(map_widget.width) + 80 and -80 < cy < float(map_widget.height) + 80):
+                        continue
+                    c.create_oval(
+                        cx - rad,
+                        cy - rad,
+                        cx + rad,
+                        cy + rad,
+                        outline="#7CB342",
+                        dash=(5, 4),
+                        width=2,
+                        fill="",
+                        tags="trunk_map_glyph",
+                    )
+            except Exception:
+                pass
+
+    def _refresh_trunk_map_glyphs() -> None:
+        """Перемалювати canvas-гліфи магістралі (вузли/підписи) після пану/масштабу."""
+        try:
+            map_widget.canvas.delete("trunk_map_glyph")
+        except Exception:
+            pass
+        _draw_trunk_map_node_glyphs()
 
     def _safe_delete(path_obj):
         if not path_obj:
@@ -660,15 +891,30 @@ def create_embedded_map_panel(parent: tk.Misc, app=None):
             return
         if not getattr(app, "geo_ref", None):
             return
-        minx, miny, maxx, maxy = app.project_zone_bounds_local
         ring_ll = []
-        for x, y in ((minx, miny), (maxx, miny), (maxx, maxy), (minx, maxy), (minx, miny)):
-            ll = _project_local_to_latlon(x, y)
-            if ll:
-                ring_ll.append(ll)
+        ring_local = (
+            app.project_zone_display_ring_local()
+            if hasattr(app, "project_zone_display_ring_local")
+            else None
+        )
+        if ring_local and len(ring_local) >= 3:
+            for x, y in ring_local:
+                ll = _project_local_to_latlon(float(x), float(y))
+                if ll:
+                    ring_ll.append(ll)
+            if ring_ll:
+                ring_ll.append(ring_ll[0])
+        else:
+            minx, miny, maxx, maxy = app.project_zone_bounds_local
+            for x, y in ((minx, miny), (maxx, miny), (maxx, maxy), (minx, maxy), (minx, miny)):
+                ll = _project_local_to_latlon(x, y)
+                if ll:
+                    ring_ll.append(ll)
         if len(ring_ll) >= 4:
             try:
-                view_state["project_zone_map_path"] = map_widget.set_path(ring_ll, color="#FF55AA", width=3)
+                view_state["project_zone_map_path"] = map_widget.set_path(
+                    ring_ll, color="#FF9800", width=3
+                )
             except Exception:
                 pass
 
@@ -735,16 +981,13 @@ def create_embedded_map_panel(parent: tk.Misc, app=None):
             return None, best_d
         return best_i, best_d
 
-    def _first_trunk_source_index() -> int | None:
-        nodes = list(getattr(app, "trunk_map_nodes", []) or []) if app else []
-        for i, node in enumerate(nodes):
-            if is_trunk_root_kind(str(node.get("kind", ""))):
-                return i
-        return None
-
     def _rebuild_trunk_route_draft_visual() -> None:
         nodes = list(getattr(app, "trunk_map_nodes", []) or []) if app else []
-        idxs = list(view_state.get("trunk_draft_indices") or [])
+        idxs = (
+            list(getattr(app, "_canvas_trunk_route_draft_indices", []) or [])
+            if app is not None
+            else []
+        )
         view_state["draft_points"] = []
         for ii in idxs:
             if 0 <= ii < len(nodes):
@@ -834,6 +1077,48 @@ def create_embedded_map_panel(parent: tk.Misc, app=None):
             return
         if tool not in _MAP_TOOLS_POLYLINE and tool not in _MAP_TOOLS_TRUNK_POINT:
             return
+        if tool == "trunk_route" and app is not None and len(getattr(app, "trunk_map_nodes", []) or []) > 0:
+            nodes = list(getattr(app, "trunk_map_nodes", []) or [])
+            draft_i = list(getattr(app, "_canvas_trunk_route_draft_indices", []) or [])
+            if not draft_i or not getattr(app, "geo_ref", None):
+                return
+            last = int(draft_i[-1])
+            if not (0 <= last < len(nodes)):
+                return
+            try:
+                la0, lo0 = float(nodes[last]["lat"]), float(nodes[last]["lon"])
+            except (KeyError, TypeError, ValueError):
+                return
+            try:
+                ex = int(getattr(event, "x", 0))
+                ey = int(getattr(event, "y", 0))
+                lat_e, lon_e = map_widget.convert_canvas_coords_to_decimal_coords(ex, ey)
+            except Exception:
+                return
+            p0 = _latlon_to_canvas_xy(la0, lo0)
+            p1 = _latlon_to_canvas_xy(float(lat_e), float(lon_e))
+            if p0 is None or p1 is None:
+                return
+            c.create_line(
+                p0[0],
+                p0[1],
+                p1[0],
+                p1[1],
+                fill=TRUNK_PATH_COLOR,
+                dash=(6, 4),
+                width=2,
+                tags="map_draft_rubber",
+            )
+            try:
+                if c.find_withtag("map_draft_rubber"):
+                    c.lift("map_draft_rubber")
+                if c.find_withtag("map_live_preview"):
+                    c.lift("map_live_preview")
+                if c.find_withtag("trunk_map_glyph"):
+                    c.lift("trunk_map_glyph")
+            except Exception:
+                pass
+            return
         pts = list(view_state.get("draft_points") or [])
         if not pts:
             return
@@ -879,6 +1164,8 @@ def create_embedded_map_panel(parent: tk.Misc, app=None):
                 c.lift("map_draft_rubber")
             if c.find_withtag("map_live_preview"):
                 c.lift("map_live_preview")
+            if c.find_withtag("trunk_map_glyph"):
+                c.lift("trunk_map_glyph")
         except Exception:
             pass
 
@@ -1043,6 +1330,8 @@ def create_embedded_map_panel(parent: tk.Misc, app=None):
             try:
                 if c.find_withtag("map_live_preview"):
                     c.lift("map_live_preview")
+                if c.find_withtag("trunk_map_glyph"):
+                    c.lift("trunk_map_glyph")
             except Exception:
                 pass
         except Exception:
@@ -1084,6 +1373,18 @@ def create_embedded_map_panel(parent: tk.Misc, app=None):
                         )
                         all_geo.extend(rg)
                         _register_pick_ring(ring, f"Блок поля {bi + 1}", 4)
+
+            pz_ring_pick = (
+                app.project_zone_display_ring_local()
+                if hasattr(app, "project_zone_display_ring_local")
+                else None
+            )
+            if pz_ring_pick and len(pz_ring_pick) >= 3:
+                _register_pick_ring(
+                    list(pz_ring_pick),
+                    "Майданчик проєкту (місце роботи, не блок поля)",
+                    50,
+                )
 
             if show_submains_var.get():
                 if is_calculated and hasattr(app, "_sections_for_canvas_draw"):
@@ -1189,32 +1490,63 @@ def create_embedded_map_panel(parent: tk.Misc, app=None):
                     pl = seg.get("path_local") or []
                 if len(pl) < 2:
                     continue
-                lg = []
-                for xy in pl:
-                    if isinstance(xy, (list, tuple)) and len(xy) >= 2:
-                        ll = _project_local_to_latlon(float(xy[0]), float(xy[1]))
-                        if ll:
-                            lg.append(ll)
-                if len(lg) >= 2:
+                seg_d = seg if isinstance(seg, dict) else {}
+                if hasattr(app, "_trunk_segment_telescope_path_chunks"):
+                    chunks = app._trunk_segment_telescope_path_chunks(seg_d, pl)
+                else:
+                    chunks = [(pl, None)]
+                vw = 0.0
+                if hasattr(app, "trunk_display_velocity_warn_mps_effective"):
+                    vw = float(app.trunk_display_velocity_warn_mps_effective())
+                vm = None
+                if hasattr(app, "trunk_segment_velocity_mps_from_hydro_cache"):
+                    vm = app.trunk_segment_velocity_mps_from_hydro_cache(si)
+                warn_vel = vw > 1e-9 and vm is not None and vm + 1e-9 >= vw
+                for chunk_pl, sec in chunks:
+                    lg = []
+                    for xy in chunk_pl:
+                        if isinstance(xy, (list, tuple)) and len(xy) >= 2:
+                            ll = _project_local_to_latlon(float(xy[0]), float(xy[1]))
+                            if ll:
+                                lg.append(ll)
+                    if len(lg) < 2:
+                        continue
                     try:
                         col = TRUNK_PATH_COLOR
-                        if hasattr(app, "trunk_hydro_segment_line_color"):
+                        if hasattr(app, "_trunk_telescope_chunk_line_color"):
+                            col = app._trunk_telescope_chunk_line_color(si, sec)
+                        elif hasattr(app, "trunk_hydro_segment_line_color"):
                             hc = app.trunk_hydro_segment_line_color(si)
                             if hc:
                                 col = hc
+                        if warn_vel:
+                            seg_draw.append(
+                                map_widget.set_path(lg, color="#B71C1C", width=10)
+                            )
                         seg_draw.append(
                             map_widget.set_path(lg, color=col, width=6)
                         )
                     except Exception:
                         pass
                     all_geo.extend(lg)
-                    _register_pick_polyline(
-                        pl,
-                        TRUNK_PICK_LINE_R_M,
-                        f"Магістраль, відрізок {si + 1}",
-                        2,
-                        trunk_geom=True,
-                    )
+                label = f"Магістраль, відрізок {si + 1}"
+                if hasattr(app, "trunk_map_pick_label_for_segment"):
+                    try:
+                        label = str(app.trunk_map_pick_label_for_segment(si))
+                    except Exception:
+                        pass
+                elif hasattr(app, "trunk_segment_display_caption"):
+                    try:
+                        label = str(app.trunk_segment_display_caption(si))
+                    except Exception:
+                        pass
+                _register_pick_polyline(
+                    pl,
+                    TRUNK_PICK_LINE_R_M,
+                    label,
+                    2,
+                    trunk_geom=True,
+                )
             _draw_trunk_map_node_glyphs()
         except Exception:
             return
@@ -1226,7 +1558,13 @@ def create_embedded_map_panel(parent: tk.Misc, app=None):
         _draw_project_zone_on_map()
         _paint_map_live_preview()
 
+    _MAP_TRUNK_CHAIN = frozenset(
+        {"trunk_route", "trunk_pump", "trunk_picket", "trunk_junction", "trunk_consumer"}
+    )
+
     def _set_tool(name):
+        if name is None:
+            name = "select"
         pd = view_state.get("pz_drag")
         if pd and pd.get("rect") is not None:
             try:
@@ -1238,9 +1576,25 @@ def create_embedded_map_panel(parent: tk.Misc, app=None):
             map_widget.canvas.delete("map_draft_rubber")
         except Exception:
             pass
+        prev_active = view_state.get("active_tool")
+        draft_snapshot = list(view_state.get("trunk_draft_indices") or [])
+        app_draft_len = (
+            len(getattr(app, "_canvas_trunk_route_draft_indices", []) or [])
+            if app is not None
+            else 0
+        )
         view_state["active_tool"] = name
         view_state["draft_points"] = []
-        view_state["trunk_draft_indices"] = []
+        preserve_trunk_draft = name is not None and (
+            (prev_active in _MAP_TRUNK_CHAIN and name in _MAP_TRUNK_CHAIN)
+            or (name == "trunk_route" and (len(draft_snapshot) > 0 or app_draft_len > 0))
+        )
+        if not preserve_trunk_draft:
+            view_state["trunk_draft_indices"] = []
+            if app is not None:
+                app._canvas_trunk_route_draft_indices = []
+                app._trunk_route_endpoint_pending_idx = None
+                app._trunk_route_edge_end_idx = None
         _safe_delete(view_state.get("draft_path"))
         view_state["draft_path"] = None
         if name == "capture_tiles":
@@ -1250,8 +1604,9 @@ def create_embedded_map_panel(parent: tk.Misc, app=None):
         elif name == "trunk_route":
             if app is not None and len(getattr(app, "trunk_map_nodes", []) or []) > 0:
                 hint.set(
-                    f"Магістраль по вузлах (~{int(TRUNK_NODE_SNAP_M)} м): ЛКМ — вузли відрізка по трасі, ПКМ — кінець відрізка; "
-                    "далі з кінця попереднього вузла або з розгалуження (нова гілка)."
+                    f"Труба магістралі: ЛКМ+ПКМ на вузлі — кінець ребра; далі ЛКМ — початок і трасувальні точки "
+                    f"(вільне поле — пікет); ПКМ — з’єднати з кінцем. Прив’язка ~{int(TRUNK_NODE_SNAP_M)} м. "
+                    f"Топологія — «Зберегти граф магістралі»."
                 )
             else:
                 hint.set("Траса в блок (без вузлів на карті): ЛКМ вершини, ПКМ завершити → сабмейн активного блоку")
@@ -1286,6 +1641,14 @@ def create_embedded_map_panel(parent: tk.Misc, app=None):
             )
         except Exception:
             pass
+        if (
+            name == "trunk_route"
+            and app is not None
+            and len(getattr(app, "trunk_map_nodes", []) or []) > 0
+            and app is not None
+            and len(getattr(app, "_canvas_trunk_route_draft_indices", []) or []) > 0
+        ):
+            _rebuild_trunk_route_draft_visual()
 
     def _draw_draft(color, width, close_ring=False):
         _safe_delete(view_state.get("draft_path"))
@@ -1298,7 +1661,7 @@ def create_embedded_map_panel(parent: tk.Misc, app=None):
         except Exception:
             view_state["draft_path"] = None
 
-    def _finish_shape():
+    def _finish_shape(event=None):
         tool = view_state.get("active_tool")
         pts = list(view_state.get("draft_points") or [])
         keep_tool_active = False
@@ -1355,78 +1718,29 @@ def create_embedded_map_panel(parent: tk.Misc, app=None):
         elif tool == "trunk_route":
             nodes = list(getattr(app, "trunk_map_nodes", []) or []) if app else []
             if app is not None and len(nodes) > 0:
-                idxs = list(view_state.get("trunk_draft_indices") or [])
-                if len(idxs) >= 2:
-                    path_local = []
-                    ok = True
-                    for ii in idxs:
-                        if not (0 <= ii < len(nodes)):
-                            silent_showerror(_map_silent_parent(), "Магістраль", "Некоректні індекси вузлів.")
-                            ok = False
-                            break
-                        try:
-                            path_local.append((float(nodes[ii]["x"]), float(nodes[ii]["y"])))
-                        except (KeyError, TypeError, ValueError):
-                            silent_showerror(_map_silent_parent(), "Магістраль", "Не вдалося прочитати координати вузла.")
-                            ok = False
-                            break
-                    if ok:
-                        segs = getattr(app, "trunk_map_segments", None)
-                        if segs is None:
-                            app.trunk_map_segments = []
-                            segs = app.trunk_map_segments
-                        proposed = {"node_indices": list(idxs), "path_local": path_local}
-                        trial = list(segs) + [proposed]
-                        ensure_trunk_node_ids(nodes)
-                        graph_errs = validate_trunk_map_graph(
-                            nodes, trial, complete_only=False
+                wx: float | None = None
+                wy: float | None = None
+                if event is not None and getattr(app, "geo_ref", None):
+                    try:
+                        lat, lon = map_widget.convert_canvas_coords_to_decimal_coords(
+                            int(event.x), int(event.y)
                         )
-                        if graph_errs:
-                            msg = "\n".join(graph_errs[:10])
-                            if len(graph_errs) > 10:
-                                msg += f"\n… ще {len(graph_errs) - 10}."
-                            silent_showwarning(_map_silent_parent(), "Граф магістралі", msg)
-                            view_state["trunk_draft_indices"] = []
-                            view_state["draft_points"] = []
-                            _safe_delete(view_state.get("draft_path"))
-                            _safe_delete(view_state.get("trunk_path"))
-                            try:
-                                map_widget.canvas.delete("map_draft_rubber")
-                            except Exception:
-                                pass
-                            keep_tool_active = True
-                        else:
-                            segs.append(proposed)
-                            app._trunk_route_last_node_idx = idxs[-1]
-                            view_state["trunk_draft_indices"] = []
-                            view_state["draft_points"] = []
-                            _safe_delete(view_state.get("draft_path"))
-                            _safe_delete(view_state.get("trunk_path"))
-                            try:
-                                map_widget.canvas.delete("map_draft_rubber")
-                            except Exception:
-                                pass
-                            if hasattr(app, "normalize_trunk_segments_to_graph_edges"):
-                                try:
-                                    app.normalize_trunk_segments_to_graph_edges()
-                                except Exception:
-                                    pass
-                            elif hasattr(app, "sync_trunk_segment_paths_from_nodes"):
-                                try:
-                                    app.sync_trunk_segment_paths_from_nodes()
-                                except Exception:
-                                    pass
-                            if hasattr(app, "_schedule_embedded_map_overlay_refresh"):
-                                app._schedule_embedded_map_overlay_refresh()
-                            else:
-                                _show_project_overlay(False)
-                            keep_tool_active = True
+                        ref_lon, ref_lat = app.geo_ref
+                        wx, wy = srtm_tiles.lat_lon_to_local_xy(
+                            float(lat), float(lon), float(ref_lon), float(ref_lat)
+                        )
+                    except Exception:
+                        pass
+                if wx is None or wy is None:
+                    silent_showwarning(
+                        _map_silent_parent(),
+                        "Магістраль",
+                        "Для ПКМ потрібна геоприв’язка проєкту та коректний клік на карті.",
+                    )
+                    keep_tool_active = True
                 else:
-                    if len(idxs) == 1:
-                        silent_showinfo(_map_silent_parent(), 
-                            "Магістраль",
-                            "Для відрізка потрібні щонайменше два вузли. Додайте ще один ЛКМ або почніть спочатку.",
-                        )
+                    exit_tool = app.handle_trunk_route_right_click_world(float(wx), float(wy))
+                    keep_tool_active = not exit_tool
                     view_state["trunk_draft_indices"] = []
                     view_state["draft_points"] = []
                     _safe_delete(view_state.get("draft_path"))
@@ -1435,7 +1749,11 @@ def create_embedded_map_panel(parent: tk.Misc, app=None):
                         map_widget.canvas.delete("map_draft_rubber")
                     except Exception:
                         pass
-                    keep_tool_active = True
+                    if hasattr(app, "_schedule_embedded_map_overlay_refresh"):
+                        app._schedule_embedded_map_overlay_refresh()
+                    else:
+                        _show_project_overlay(False)
+                    _rebuild_trunk_route_draft_visual()
             elif len(pts) >= 2:
                 _safe_delete(view_state.get("trunk_path"))
                 view_state["trunk_path"] = map_widget.set_path(pts, color=TRUNK_PATH_COLOR, width=4)
@@ -1670,7 +1988,13 @@ def create_embedded_map_panel(parent: tk.Misc, app=None):
                 except Exception:
                     pass
             zoom_box_state["rect"] = map_widget.canvas.create_rectangle(
-                event.x, event.y, event.x, event.y, outline="#66D9FF", width=2, dash=(4, 2)
+                event.x,
+                event.y,
+                event.x,
+                event.y,
+                outline=ZOOM_BOX_OUTLINE,
+                width=ZOOM_BOX_WIDTH,
+                dash=ZOOM_BOX_DASH,
             )
             return "break"
         if view_state.get("active_tool") == "project_zone_rect":
@@ -1705,66 +2029,80 @@ def create_embedded_map_panel(parent: tk.Misc, app=None):
                 )
             except Exception:
                 return "break"
+            if (
+                tool == "select"
+                and app is not None
+                and app.mode.get() in ("VIEW", "RULER")
+                and hasattr(app, "_nearest_trunk_node_index_world")
+            ):
+                try:
+                    ni, _dist = app._nearest_trunk_node_index_world(float(wx), float(wy))
+                except Exception:
+                    ni = None
+                if ni is not None:
+                    if getattr(app, "mode", None) is not None and app.mode.get() == "RULER":
+                        if hasattr(app, "_exit_ruler_for_trunk_interaction"):
+                            app._exit_ruler_for_trunk_interaction()
+                    app._trunk_node_drag_idx = int(ni)
+                    app._trunk_node_drag_moved = False
+                    if hasattr(app, "_schedule_embedded_map_overlay_refresh"):
+                        app._schedule_embedded_map_overlay_refresh()
+                    _paint_map_live_preview()
+                    return "break"
             if not view_state.get("map_pick_regions"):
                 _show_project_overlay(False)
-            label = _pick_map_object_at_world(wx, wy)
-            title = "Вибір" if tool == "select" else "Інфо"
-            if label:
-                silent_showinfo(_map_silent_parent(), title, label)
+            if tool == "select" and hasattr(app, "_collect_world_pick_hits"):
+                ctrl = bool(int(getattr(event, "state", 0)) & 0x0004)
+                hits = app._collect_world_pick_hits(float(wx), float(wy))
+                if hits:
+                    _pri, _d, cat, payload, label = hits[0]
+                    prev = list(getattr(app, "_canvas_selection_keys", []) or [])
+                    key = (cat, payload)
+                    if ctrl:
+                        idx = next((i for i, e in enumerate(prev) if (e[0], e[1]) == key), None)
+                        if idx is not None:
+                            prev.pop(idx)
+                        else:
+                            prev.append((cat, payload, label))
+                        app._canvas_selection_keys = prev
+                    else:
+                        app._canvas_selection_keys = [(cat, payload, label)]
+                else:
+                    if not ctrl:
+                        app._canvas_selection_keys = []
+                app.redraw()
+                if hasattr(app, "_schedule_embedded_map_overlay_refresh"):
+                    app._schedule_embedded_map_overlay_refresh()
+                else:
+                    _show_project_overlay(False)
             else:
-                silent_showinfo(_map_silent_parent(), 
-                    title,
-                    "Об'єкт не знайдено. Увімкніть шари «Блоки» / «Сабмейни», оновіть накладення або наблизьте карту.",
-                )
+                label = _pick_map_object_at_world(wx, wy)
+                title = "Вибір" if tool == "select" else "Інфо"
+                if label:
+                    silent_showinfo(_map_silent_parent(), title, label)
+                else:
+                    silent_showinfo(_map_silent_parent(), 
+                        title,
+                        "Об'єкт не знайдено. Увімкніть шари «Блоки» / «Сабмейни», оновіть накладення або наблизьте карту.",
+                    )
             return "break"
         if tool == "trunk_route" and app is not None and len(getattr(app, "trunk_map_nodes", []) or []) > 0:
             try:
                 lat, lon = map_widget.convert_canvas_coords_to_decimal_coords(int(event.x), int(event.y))
-            except Exception:
-                return "break"
-            ni, _dist = _nearest_trunk_node_index(lat, lon)
-            if ni is None:
-                silent_showinfo(_map_silent_parent(), 
-                    "Магістраль",
-                    f"Немає вузла в радіусі {int(TRUNK_NODE_SNAP_M)} м. Наведіть курсор на насос, пікет, розгалуження або споживача.",
-                )
-                return "break"
-            nodes = list(app.trunk_map_nodes)
-            draft_i = list(view_state.get("trunk_draft_indices") or [])
-            if not draft_i:
-                last_end = getattr(app, "_trunk_route_last_node_idx", None)
-                if last_end is None:
-                    src_ix = _first_trunk_source_index()
-                    if src_ix is None:
-                        silent_showwarning(_map_silent_parent(), 
-                            "Магістраль",
-                            "Спочатку задайте на карті вузол витоку — «Насос».",
-                        )
-                        return "break"
-                    if ni != src_ix:
-                        silent_showwarning(_map_silent_parent(), 
-                            "Магістраль",
-                            "Перший клік першого відрізка має бути на насосі (витік).",
-                        )
-                        return "break"
-                else:
-                    knd = str(nodes[ni].get("kind", "")).lower()
-                    start_ok = ni == last_end or knd == "junction"
-                    if not start_ok:
-                        silent_showwarning(_map_silent_parent(), 
-                            "Магістраль",
-                            "Початок нового відрізка: кінець попереднього вузла або вузол «Розгалуження» (нова гілка).",
-                        )
-                        return "break"
-            else:
-                if ni == draft_i[-1]:
-                    silent_showinfo(_map_silent_parent(), 
+                if not getattr(app, "geo_ref", None):
+                    silent_showinfo(
+                        _map_silent_parent(),
                         "Магістраль",
-                        "Оберіть наступний вузол по трасі (не дублюйте попередній).",
+                        "Потрібна геоприв’язка проєкту (geo_ref), щоб трасувати магістраль на карті.",
                     )
                     return "break"
-            draft_i.append(ni)
-            view_state["trunk_draft_indices"] = draft_i
+                ref_lon, ref_lat = app.geo_ref
+                wx, wy = srtm_tiles.lat_lon_to_local_xy(
+                    float(lat), float(lon), float(ref_lon), float(ref_lat)
+                )
+            except Exception:
+                return "break"
+            app._canvas_trunk_route_left_click(float(wx), float(wy))
             _rebuild_trunk_route_draft_visual()
             _paint_map_draft_rubber(event)
             return "break"
@@ -1820,6 +2158,26 @@ def create_embedded_map_panel(parent: tk.Misc, app=None):
             except Exception:
                 pass
             return "break"
+        if (
+            app is not None
+            and getattr(app, "geo_ref", None)
+            and app.mode.get() == "VIEW"
+            and tool is None
+            and getattr(app, "_canvas_special_tool", None) is None
+        ):
+            try:
+                lat, lon = map_widget.convert_canvas_coords_to_decimal_coords(int(event.x), int(event.y))
+                ref_lon, ref_lat = app.geo_ref
+                wx, wy = srtm_tiles.lat_lon_to_local_xy(float(lat), float(lon), float(ref_lon), float(ref_lat))
+                app.feed_map_pointer_world(wx, wy)
+                app._handle_left_click_world(float(wx), float(wy), scr_x=int(event.x), scr_y=int(event.y))
+                if getattr(app, "_trunk_node_drag_idx", None) is not None:
+                    if hasattr(app, "_schedule_embedded_map_overlay_refresh"):
+                        app._schedule_embedded_map_overlay_refresh()
+                    _paint_map_live_preview()
+                    return "break"
+            except Exception:
+                pass
         return map_widget.mouse_click(event)
 
     def _map_canvas_motion(event):
@@ -1894,6 +2252,9 @@ def create_embedded_map_panel(parent: tk.Misc, app=None):
         return "break"
 
     def _release(event):
+        if app is not None and getattr(app, "_trunk_node_drag_idx", None) is not None:
+            app._finalize_trunk_node_drag()
+            return "break"
         pd = view_state.get("pz_drag")
         if pd:
             view_state["pz_drag"] = None
@@ -1940,15 +2301,63 @@ def create_embedded_map_panel(parent: tk.Misc, app=None):
 
     _orig_mouse_move = map_widget.mouse_move
     _orig_mouse_right_click = map_widget.mouse_right_click
+    _trunk_glyph_refresh_job = {"id": None}
+
+    def _schedule_trunk_glyph_refresh(delay_ms: int = 16) -> None:
+        """Throttled refresh, щоб гліфи не відставали при drag-пані."""
+        if app is None:
+            return
+        if not getattr(app, "geo_ref", None):
+            return
+        try:
+            old = _trunk_glyph_refresh_job.get("id")
+            if old is not None:
+                map_widget.canvas.after_cancel(old)
+        except Exception:
+            pass
+
+        def _run():
+            _trunk_glyph_refresh_job["id"] = None
+            _refresh_trunk_map_glyphs()
+
+        try:
+            _trunk_glyph_refresh_job["id"] = map_widget.canvas.after(max(1, int(delay_ms)), _run)
+        except Exception:
+            _refresh_trunk_map_glyphs()
 
     def _b1_motion_chain(event):
         if view_state.get("pz_drag"):
             return _drag(event)
         if zoom_box_state["on"]:
             return _drag(event)
+        if (
+            app is not None
+            and getattr(app, "_trunk_node_drag_idx", None) is not None
+            and app.mode.get() in ("VIEW", "RULER")
+            and getattr(app, "geo_ref", None)
+        ):
+            try:
+                lat, lon = map_widget.convert_canvas_coords_to_decimal_coords(int(event.x), int(event.y))
+                ref_lon, ref_lat = app.geo_ref
+                wx, wy = srtm_tiles.lat_lon_to_local_xy(float(lat), float(lon), float(ref_lon), float(ref_lat))
+                app._trunk_node_drag_apply_world(int(app._trunk_node_drag_idx), float(wx), float(wy))
+                app._trunk_node_drag_moved = True
+                _schedule_trunk_glyph_refresh(0)
+            except Exception:
+                pass
+            return "break"
+        if (
+            view_state.get("active_tool") == "trunk_route"
+            and app is not None
+            and len(getattr(app, "trunk_map_nodes", []) or []) > 0
+            and list(getattr(app, "_canvas_trunk_route_draft_indices", []) or [])
+        ):
+            _paint_map_draft_rubber(event)
         if _map_tool_or_draw_blocks_pan():
             return
-        return _orig_mouse_move(event)
+        out = _orig_mouse_move(event)
+        _schedule_trunk_glyph_refresh()
+        return out
 
     def _canvas_right_button(event):
         if zoom_box_state["on"]:
@@ -1963,16 +2372,69 @@ def create_embedded_map_panel(parent: tk.Misc, app=None):
                 pass
             return "break"
         if view_state.get("active_tool") in _MAP_TOOLS_PASSIVE:
+            if (
+                app is not None
+                and getattr(app, "geo_ref", None)
+                and app.mode.get() in ("VIEW", "PAN")
+                and hasattr(app, "_trunk_interaction_priority_active")
+                and app._trunk_interaction_priority_active()
+                and hasattr(app, "_open_trunk_graph_context_menu")
+            ):
+                try:
+                    lat, lon = map_widget.convert_canvas_coords_to_decimal_coords(int(event.x), int(event.y))
+                    ref_lon, ref_lat = app.geo_ref
+                    wx, wy = srtm_tiles.lat_lon_to_local_xy(
+                        float(lat), float(lon), float(ref_lon), float(ref_lat)
+                    )
+                    anchor = (int(getattr(event, "x_root", 0)), int(getattr(event, "y_root", 0)))
+                    if app._open_trunk_graph_context_menu(float(wx), float(wy), menu_anchor=anchor):
+                        return "break"
+                except Exception:
+                    pass
             _set_tool(None)
             return "break"
         if view_state.get("active_tool") in _MAP_TOOLS_TRUNK_POINT:
             _set_tool(None)
             return "break"
         if view_state.get("active_tool") in _MAP_TOOLS_POLYLINE:
-            _finish_shape()
+            _finish_shape(event)
             return "break"
         if app is not None and getattr(app, "geo_ref", None):
             m = app.mode.get()
+            if m in ("VIEW", "PAN"):
+                if hasattr(app, "_irrigation_schedule_canvas_pick_active") and app._irrigation_schedule_canvas_pick_active():
+                    try:
+                        lat, lon = map_widget.convert_canvas_coords_to_decimal_coords(int(event.x), int(event.y))
+                        ref_lon, ref_lat = app.geo_ref
+                        wx, wy = srtm_tiles.lat_lon_to_local_xy(
+                            float(lat), float(lon), float(ref_lon), float(ref_lat)
+                        )
+                        app._handle_right_click_world(float(wx), float(wy))
+                        if hasattr(app, "_schedule_embedded_map_overlay_refresh"):
+                            app._schedule_embedded_map_overlay_refresh()
+                        _paint_map_live_preview()
+                    except Exception:
+                        pass
+                    return "break"
+                if (
+                    hasattr(app, "_trunk_interaction_priority_active")
+                    and app._trunk_interaction_priority_active()
+                    and hasattr(app, "_open_trunk_graph_context_menu")
+                ):
+                    try:
+                        lat, lon = map_widget.convert_canvas_coords_to_decimal_coords(int(event.x), int(event.y))
+                        ref_lon, ref_lat = app.geo_ref
+                        wx, wy = srtm_tiles.lat_lon_to_local_xy(
+                            float(lat), float(lon), float(ref_lon), float(ref_lat)
+                        )
+                        anchor = (int(getattr(event, "x_root", 0)), int(getattr(event, "y_root", 0)))
+                        if app._open_trunk_graph_context_menu(float(wx), float(wy), menu_anchor=anchor):
+                            if hasattr(app, "_schedule_embedded_map_overlay_refresh"):
+                                app._schedule_embedded_map_overlay_refresh()
+                            _paint_map_live_preview()
+                            return "break"
+                    except Exception:
+                        pass
             if m in ("DRAW", "SUBMAIN", "DRAW_LAT", "RULER", "CUT_LATS", "TOPO"):
                 try:
                     lat, lon = map_widget.convert_canvas_coords_to_decimal_coords(int(event.x), int(event.y))
@@ -2026,18 +2488,84 @@ def create_embedded_map_panel(parent: tk.Misc, app=None):
 
     map_widget.canvas.bind("<Double-Button-1>", _map_double_b1, add="+")
     map_widget.canvas.bind("<Motion>", _map_canvas_motion, add="+")
-    map_widget.canvas.bind("<MouseWheel>", lambda _e: _schedule_cached_tiles_overlay_refresh(), add="+")
-    map_widget.canvas.bind("<Button-4>", lambda _e: _schedule_cached_tiles_overlay_refresh(), add="+")
-    map_widget.canvas.bind("<Button-5>", lambda _e: _schedule_cached_tiles_overlay_refresh(), add="+")
+    map_widget.canvas.bind(
+        "<MouseWheel>",
+        lambda _e: (_schedule_cached_tiles_overlay_refresh(), _schedule_trunk_glyph_refresh()),
+        add="+",
+    )
+    map_widget.canvas.bind(
+        "<Button-4>",
+        lambda _e: (_schedule_cached_tiles_overlay_refresh(), _schedule_trunk_glyph_refresh()),
+        add="+",
+    )
+    map_widget.canvas.bind(
+        "<Button-5>",
+        lambda _e: (_schedule_cached_tiles_overlay_refresh(), _schedule_trunk_glyph_refresh()),
+        add="+",
+    )
 
-    # Always satellite view in embedded panel.
+    _basemap_choice_labels = [p[0] for p in MAP_BASEMAP_PRESETS]
+    basemap_var = tk.StringVar(value=_basemap_choice_labels[0])
+
+    def _apply_embedded_basemap(_evt=None) -> None:
+        lab = basemap_var.get()
+        try:
+            _emb_lbl_osm_attr.pack_forget()
+        except Exception:
+            pass
+        for name, url, mz in MAP_BASEMAP_PRESETS:
+            if name == lab:
+                try:
+                    map_widget.set_tile_server(url, max_zoom=int(mz))
+                except Exception:
+                    pass
+                try:
+                    _schedule_cached_tiles_overlay_refresh()
+                except Exception:
+                    pass
+                if name.startswith("OSM"):
+                    try:
+                        _emb_lbl_osm_attr.config(
+                            text="© OpenStreetMap contributors",
+                            font=("Segoe UI", 7),
+                        )
+                        _emb_lbl_osm_attr.pack(side=tk.LEFT, padx=(0, 6), pady=4)
+                    except Exception:
+                        pass
+                return
+
     tk.Label(
         top_bar,
-        text="Режим карти: Супутник",
+        text="Географічна основа:",
         bg="#1e1e1e",
         fg="#d0d0d0",
         font=("Segoe UI", 9, "bold"),
-    ).pack(side=tk.LEFT, padx=(8, 12), pady=4)
+    ).pack(side=tk.LEFT, padx=(8, 4), pady=4)
+    _emb_lbl_osm_attr = tk.Label(
+        top_bar,
+        text="© OpenStreetMap contributors",
+        bg="#1e1e1e",
+        fg="#757575",
+        font=("Segoe UI", 7),
+    )
+    _emb_cb_basemap = ttk.Combobox(
+        top_bar,
+        textvariable=basemap_var,
+        values=_basemap_choice_labels,
+        state="readonly",
+        width=34,
+        font=("Segoe UI", 9),
+    )
+    _emb_cb_basemap.pack(side=tk.LEFT, padx=(0, 10), pady=2)
+    _emb_cb_basemap.bind("<<ComboboxSelected>>", _apply_embedded_basemap)
+    _attach_dark_tooltip(
+        _emb_cb_basemap,
+        "Підложка карти: супутник, рельєф Esri, світла OSM, Copernicus Sentinel-2 cloudless. "
+        "Тло віджета між тайлами — темне (MAP_BG_DARK). "
+        "Copernicus / Sentinel-2 cloudless — глобальна мозаїка Sentinel-2 (програма Copernicus), без хмар; сервіс EOX. "
+        "Ліцензія та атрибуція: https://s2maps.eu/ . "
+        f"У додатку дозволено зум до {COPERNICUS_S2_CLOUDLESS_MAX_ZOOM} (перевірено HEAD по тайлах EOX; вище — 404).",
+    )
     _emb_btn_kml = tk.Button(
         top_bar,
         text="📂 Відкрити .kml",
@@ -2136,6 +2664,16 @@ def create_embedded_map_panel(parent: tk.Misc, app=None):
     tab_trunk = tk.Frame(draw_nb, bg="#181818")
     draw_nb.add(tab_draw, text="Малювання")
     draw_nb.add(tab_trunk, text="Магістраль")
+    if app is not None and hasattr(app, "_set_trunk_panel_active_map"):
+        def _sync_map_trunk_tab_state(_event=None) -> None:
+            try:
+                tab_id = str(draw_nb.select())
+                tab_txt = str(draw_nb.tab(tab_id, "text")).strip().lower()
+                app._set_trunk_panel_active_map(tab_txt == "магістраль")
+            except Exception:
+                app._set_trunk_panel_active_map(False)
+        draw_nb.bind("<<NotebookTabChanged>>", _sync_map_trunk_tab_state, add="+")
+        _sync_map_trunk_tab_state()
 
     # --- Інструментальна панель: зона / тайли / шари та overlay ---
     tk.Label(
@@ -2323,6 +2861,37 @@ def create_embedded_map_panel(parent: tk.Misc, app=None):
     def _zoom_extents_project():
         _show_project_overlay(True)
 
+    def _focus_trunk_node_by_id(node_id: str, zoom_min: int = 15) -> bool:
+        if app is None:
+            return False
+        nid = str(node_id or "").strip()
+        if not nid:
+            return False
+        for node in list(getattr(app, "trunk_map_nodes", []) or []):
+            if str(node.get("id", "")).strip() != nid:
+                continue
+            try:
+                lat = float(node.get("lat"))
+                lon = float(node.get("lon"))
+            except (TypeError, ValueError):
+                return False
+            try:
+                map_widget.set_position(lat, lon)
+                z_now = int(map_widget.get_zoom())
+            except Exception:
+                return False
+            try:
+                if z_now < int(zoom_min):
+                    map_widget.set_zoom(int(zoom_min))
+            except Exception:
+                pass
+            try:
+                _show_project_overlay(False)
+            except Exception:
+                pass
+            return True
+        return False
+
     build_draw_modes_tab(tab_draw, app, _attach_dark_tooltip)
 
     try:
@@ -2332,9 +2901,14 @@ def create_embedded_map_panel(parent: tk.Misc, app=None):
     _draw_scale_bar_100m()
     host._refresh_project_overlay = _show_project_overlay
     host._set_map_tool = _set_tool
+    try:
+        _set_tool("select")
+    except Exception:
+        view_state["active_tool"] = "select"
     host._map_hint_var = hint
     host._zoom_box_on = _zoom_box_on
     host._zoom_extents_project = _zoom_extents_project
+    host._focus_trunk_node_by_id = _focus_trunk_node_by_id
 
     def _init_geo_ref_from_map_center() -> None:
         """Відкрита карта задає геоприв’язку: початок локальної СК — центр поточного виду."""
@@ -2350,7 +2924,51 @@ def create_embedded_map_panel(parent: tk.Misc, app=None):
         except Exception:
             pass
 
-    host.after(200, _init_geo_ref_from_map_center)
+    def _run_init_geo_wrap() -> None:
+        host._init_geo_after_id = None
+        _init_geo_ref_from_map_center()
+
+    host._init_geo_after_id = host.after(200, _run_init_geo_wrap)
+
+    def _suspend_background_jobs() -> None:
+        host._map_bg_suspended = True
+        jid = getattr(host, "_scale_bar_after_id", None)
+        if jid is not None:
+            try:
+                host.after_cancel(jid)
+            except Exception:
+                pass
+            host._scale_bar_after_id = None
+        jid2 = getattr(host, "_init_geo_after_id", None)
+        if jid2 is not None:
+            try:
+                host.after_cancel(jid2)
+            except Exception:
+                pass
+            host._init_geo_after_id = None
+        ctj = view_state.get("cached_tile_refresh_job")
+        if ctj is not None:
+            try:
+                host.after_cancel(ctj)
+            except Exception:
+                pass
+            view_state["cached_tile_refresh_job"] = None
+        tg = _trunk_glyph_refresh_job.get("id")
+        if tg is not None:
+            try:
+                map_widget.canvas.after_cancel(tg)
+            except Exception:
+                pass
+            _trunk_glyph_refresh_job["id"] = None
+
+    def _resume_background_jobs() -> None:
+        if not getattr(host, "_map_bg_suspended", False):
+            return
+        host._map_bg_suspended = False
+        _draw_scale_bar_100m()
+
+    host._suspend_background_jobs = _suspend_background_jobs
+    host._resume_background_jobs = _resume_background_jobs
 
     return host
 
@@ -2378,8 +2996,8 @@ def main() -> None:
     def _standalone_save_trunk_graph() -> None:
         silent_showinfo(root, 
             "Магістраль",
-            "Зберегти граф магістралі можна у головному вікні DripCAD: вкладка «Карта» → «Магістраль», "
-            "або меню «Інструменти» → «Зберегти граф магістралі».",
+            "Зберегти граф магістралі можна у головному вікні DripCAD: зліва вкладка «Магістраль» або меню "
+            "«Інструменти» → «Зберегти граф магістралі».",
         )
 
     top_bar = tk.Frame(root, bg="#1e1e1e", height=34)
@@ -2422,16 +3040,40 @@ def main() -> None:
     tool_hint_var = tk.StringVar(value="Інструмент: навігація")
     download_status_var = tk.StringVar(value="SRTM: очікування")
 
-    def _set_dark() -> None:
-        map_widget.set_tile_server(DARK_TILE_URL, max_zoom=20)
+    _standalone_osm_lbl = tk.Label(
+        top_bar,
+        text="© OpenStreetMap contributors",
+        bg="#1e1e1e",
+        fg="#757575",
+        font=("Segoe UI", 7),
+    )
+
+    def _standalone_hide_osm_label() -> None:
+        try:
+            _standalone_osm_lbl.pack_forget()
+        except Exception:
+            pass
 
     def _set_light() -> None:
+        try:
+            _standalone_osm_lbl.config(text="© OpenStreetMap contributors", font=("Segoe UI", 7))
+            _standalone_osm_lbl.pack(side=tk.LEFT, padx=(6, 2), pady=4)
+        except Exception:
+            pass
         map_widget.set_tile_server(LIGHT_TILE_URL, max_zoom=19)
 
     def _set_satellite() -> None:
+        _standalone_hide_osm_label()
         map_widget.set_tile_server(SAT_TILE_URL, max_zoom=19)
 
+    def _set_copernicus() -> None:
+        _standalone_hide_osm_label()
+        map_widget.set_tile_server(
+            COPERNICUS_S2_CLOUDLESS_TILE_URL, max_zoom=COPERNICUS_S2_CLOUDLESS_MAX_ZOOM
+        )
+
     def _set_terrain() -> None:
+        _standalone_hide_osm_label()
         map_widget.set_tile_server(TERRAIN_TILE_URL, max_zoom=19)
 
     def _safe_delete_path(path_obj) -> None:
@@ -2710,6 +3352,8 @@ def main() -> None:
     def _canvas_press(event) -> None:
         tool = view_state.get("active_tool")
         if tool in ("capture_tiles", "block_contour", "trunk_route"):
+            if tool == "trunk_route" and app is not None and len(getattr(app, "trunk_map_nodes", []) or []) > 0:
+                return "break"
             try:
                 lat, lon = map_widget.convert_canvas_coords_to_decimal_coords(int(event.x), int(event.y))
                 view_state["draft_points"].append((lat, lon))
@@ -2736,9 +3380,9 @@ def main() -> None:
             event.y,
             event.x,
             event.y,
-            outline="#66D9FF",
-            width=2,
-            dash=(4, 2),
+            outline=ZOOM_BOX_OUTLINE,
+            width=ZOOM_BOX_WIDTH,
+            dash=ZOOM_BOX_DASH,
         )
         return "break"
 
@@ -2791,7 +3435,13 @@ def main() -> None:
         return "break"
 
     def _canvas_right_click(_event):
-        if view_state.get("active_tool") in ("capture_tiles", "block_contour", "trunk_route"):
+        tool = view_state.get("active_tool")
+        if tool in ("capture_tiles", "block_contour"):
+            _finalize_tool_shape()
+            return "break"
+        if tool == "trunk_route":
+            if app is not None and len(getattr(app, "trunk_map_nodes", []) or []) > 0:
+                return None
             _finalize_tool_shape()
             return "break"
         return None
@@ -2847,7 +3497,12 @@ def main() -> None:
         pady=6,
     )
     _main_btn_trunk.pack(fill=tk.X, padx=8, pady=3)
-    _attach_dark_tooltip(_main_btn_trunk, "Намалювати ламану траси магістралі на карті.")
+    _attach_dark_tooltip(
+        _main_btn_trunk,
+        "Труба: ЛКМ+ПКМ на вузлі — кінець ребра; ЛКМ — початок і трасувальні точки (вільне поле — пікет); "
+        "ПКМ — з’єднати з кінцем. Чернетка зберігається при перемиканні на вузли магістралі. "
+        "Топологія — «Зберегти граф магістралі».",
+    )
     _btn_trunk_save = tk.Button(
         left_toolbar,
         text="💾 Зберегти граф магістралі",
@@ -2920,6 +3575,24 @@ def main() -> None:
     )
     _main_top_sat.pack(side=tk.LEFT, padx=(8, 6), pady=4)
     _attach_dark_tooltip(_main_top_sat, "Підложка супутникових знімків (як у Google Earth).")
+    _main_top_cop = tk.Button(
+        top_bar,
+        text="🛰 Copernicus S2",
+        command=_set_copernicus,
+        bg="#2a2a2a",
+        fg="#e8e8e8",
+        activebackground="#353535",
+        activeforeground="#ffffff",
+        relief=tk.FLAT,
+        padx=10,
+        pady=4,
+    )
+    _main_top_cop.pack(side=tk.LEFT, padx=2, pady=4)
+    _attach_dark_tooltip(
+        _main_top_cop,
+        "Мозаїка Sentinel-2 без хмар (програма Copernicus, дані ESA). Тайли EOX; атрибуція та умови: https://s2maps.eu/ . "
+        f"Максимальний зум у карті — {COPERNICUS_S2_CLOUDLESS_MAX_ZOOM} (z+1 з EOX — 404).",
+    )
     _main_top_terrain = tk.Button(
         top_bar,
         text="🏔 Рельєф",
@@ -2976,20 +3649,6 @@ def main() -> None:
     )
     _main_top_ext.pack(side=tk.LEFT, padx=2, pady=4)
     _attach_dark_tooltip(_main_top_ext, "Показати всю завантажену геометрію (маркери/KML) у вікні карти.")
-    _main_top_dark = tk.Button(
-        top_bar,
-        text="🌙 Нічна мапа",
-        command=_set_dark,
-        bg="#2a2a2a",
-        fg="#e8e8e8",
-        activebackground="#353535",
-        activeforeground="#ffffff",
-        relief=tk.FLAT,
-        padx=10,
-        pady=4,
-    )
-    _main_top_dark.pack(side=tk.LEFT, padx=(10, 6), pady=4)
-    _attach_dark_tooltip(_main_top_dark, "Темна векторна підложка (Carto Dark).")
     _main_top_light = tk.Button(
         top_bar,
         text="☀️ Світла мапа",

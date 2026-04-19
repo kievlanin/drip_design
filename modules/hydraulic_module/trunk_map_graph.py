@@ -3,7 +3,7 @@
 
 Семантика (узгоджено з trunk_tree_compute.TrunkTreeNode.kind):
 - source      — насос / витік (єдиний корінь дерева, без вхідних ребер).
-- consumption — споживач / сток (лист, без вихідних ребер).
+- consumption — вузол відбору (може бути листом або проміжним вузлом у ланцюгу відборів).
 - junction    — розгалуження / сумматор (один вхід; у зібраному графі ≥2 виходи, див. validate_trunk_map_graph(..., complete_only)).
 - bend        — пікет / проміжна точка на осі труби (рівно один вхід і один вихід).
 
@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import copy
 import math
 from collections import defaultdict, deque
 from typing import (
@@ -77,14 +78,48 @@ def normalize_legacy_trunk_valve_kinds(
             row["kind"] = KIND_JUNCTION
 
 
+def _next_trunk_free_numeric_id(assigned: Set[str]) -> int:
+    """Наступний вільний індекс N для ідентифікатора TN серед уже зайнятих рядків."""
+    used: Set[int] = set()
+    for s in assigned:
+        t = str(s).strip()
+        if len(t) >= 2 and t[0].upper() == "T" and t[1:].isdigit():
+            used.add(int(t[1:]))
+    k = (max(used) + 1) if used else 0
+    while f"T{k}" in assigned:
+        k += 1
+    return k
+
+
+def _dedupe_trunk_node_ids_inplace(nodes: MutableSequence[MutableMapping[str, Any]]) -> None:
+    """
+    Усуває повтори id: перший вузол з даним id зберігає його, наступні отримують T{N} з наступним вільним номером.
+    Потрібно після редагування графа (два пікети з однаковим T9 ламають trunk_tree та HW).
+    """
+    assigned: Set[str] = set()
+    for row in nodes:
+        if not isinstance(row, MutableMapping):
+            continue
+        tid = str(row.get("id", "")).strip()
+        if not tid:
+            continue
+        if tid not in assigned:
+            assigned.add(tid)
+            continue
+        new_id = f"T{_next_trunk_free_numeric_id(assigned)}"
+        row["id"] = new_id
+        assigned.add(new_id)
+
+
 def ensure_trunk_node_ids(nodes: MutableSequence[MutableMapping[str, Any]]) -> None:
-    """Дописує стабільні id T0, T1, … якщо відсутні."""
+    """Дописує стабільні id T0, T1, … якщо відсутні; усуває дублікати id між вузлами."""
     for i, row in enumerate(nodes):
         if not isinstance(row, MutableMapping):
             continue
         tid = str(row.get("id", "")).strip()
         if not tid:
             row["id"] = f"T{i}"
+    _dedupe_trunk_node_ids_inplace(nodes)
 
 
 def _node_kind(nodes: Sequence[Mapping[str, Any]], idx: int) -> str:
@@ -141,6 +176,23 @@ def expand_trunk_segments_to_pair_edges(
     для кожного ребра path_local — відповідний відрізок полілінії (або пряма між вузлами).
     """
     out: List[Dict[str, Any]] = []
+    carry_keys = ("d_inner_mm", "c_hw", "pipe_material", "pipe_pn", "pipe_od", "bom_length_zero")
+
+    def _attrs_from_seg(seg: Mapping[str, Any], idxs: List[int]) -> Dict[str, Any]:
+        """Гідравліка ребра: скаляри з carry_keys + телескоп лише для одного ребра [a,b] (не дублювати на ланцюг)."""
+        attrs: Dict[str, Any] = {k: seg[k] for k in carry_keys if k in seg}
+        if len(idxs) != 2:
+            return attrs
+        secs_src: Optional[list] = None
+        for sk in ("sections", "telescoped_sections"):
+            v = seg.get(sk)
+            if isinstance(v, list) and len(v) > 0:
+                secs_src = list(v)
+                break
+        if secs_src is not None:
+            attrs["sections"] = copy.deepcopy(secs_src)
+            attrs["telescoped_sections"] = copy.deepcopy(secs_src)
+        return attrs
 
     def _parse_path_local(raw: Any) -> List[Optional[Tuple[float, float]]]:
         pl: List[Optional[Tuple[float, float]]] = []
@@ -174,6 +226,7 @@ def expand_trunk_segments_to_pair_edges(
             idxs = [int(x) for x in ni]
         except (TypeError, ValueError):
             continue
+        attrs = _attrs_from_seg(seg, idxs)
         pl = _parse_path_local(seg.get("path_local"))
 
         if len(idxs) == 2:
@@ -186,11 +239,11 @@ def expand_trunk_segments_to_pair_edges(
                         break
                     loc2.append((float(t[0]), float(t[1])))
             if len(loc2) >= 2:
-                out.append({"node_indices": [a, b], "path_local": loc2})
+                out.append({"node_indices": [a, b], "path_local": loc2, **attrs})
             else:
                 pa, pb = _node_xy(a), _node_xy(b)
                 if pa is not None and pb is not None:
-                    out.append({"node_indices": [a, b], "path_local": [pa, pb]})
+                    out.append({"node_indices": [a, b], "path_local": [pa, pb], **attrs})
             continue
 
         aligned = len(pl) == len(idxs) and all(p is not None for p in pl)
@@ -204,7 +257,7 @@ def expand_trunk_segments_to_pair_edges(
                 if pa is None or pb is None:
                     continue
                 edge_pl = [pa, pb]
-            out.append({"node_indices": [a, b], "path_local": edge_pl})
+            out.append({"node_indices": [a, b], "path_local": edge_pl, **attrs})
 
     return out
 
@@ -340,9 +393,9 @@ def validate_trunk_map_graph(
             errors.append(f"Вузол {i}: у дереві очікується рівно один вхід, має {di}.")
 
         if k == KIND_CONSUMPTION:
-            if outdeg != 0:
+            if outdeg > 1:
                 errors.append(
-                    f"Споживач / сток (вузол {i}): не повинно бути вихідних ребер (лист дерева)."
+                    f"Споживач (вузол {i}): у ланцюгу відборів допускається не більше одного вихідного ребра."
                 )
         elif k == KIND_JUNCTION:
             if outdeg < 1:

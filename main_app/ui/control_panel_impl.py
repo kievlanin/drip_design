@@ -30,7 +30,6 @@ class ControlPanel:
     def __init__(self, app):
         self.app = app
         self.is_expanded = True
-        
         self.main_frame = tk.Frame(app.root, bg="#1e1e1e")
         self.main_frame.pack(side=tk.RIGHT, fill=tk.Y)
         
@@ -77,6 +76,7 @@ class ControlPanel:
         self.build_block_tab()
         self.build_geo_tab()
         self.build_hydro_tab()
+        self.build_trunk_hw_tab()
         self.build_schedule_tab()
         self.build_results_tab()
         self.build_topo_tab()
@@ -107,7 +107,7 @@ class ControlPanel:
         self.len_entry.bind("<Return>", self.app.add_by_length)
         self._attach_tooltip(
             self.len_entry,
-            "Точна довжина лінії (м). Enter — додати відрізок. Режими малювання — ліва панель «Без карти» або вкладка «Карта».",
+            "Точна довжина лінії (м). Enter — додати відрізок. Режими малювання — ліва колонка «Без карти» / «Карта» (вкладка «Малювання»).",
         )
         _len_fr.pack(fill=tk.X, side=tk.BOTTOM, padx=8, pady=(0, 4))
 
@@ -812,14 +812,9 @@ class ControlPanel:
             if self.app._emitter_compensated_effective():
                 self.lbl_q_flow.config(text="Q ном (л/год), компенс. (x=0):")
             else:
-                self.lbl_q_flow.config(text="Q ном (л/год), √H/10м або k·H^x:")
+                self.lbl_q_flow.config(text="Q ном (л/год), k·H^x:")
 
         self.create_input(tab, "H мін компенс. (м вод. ст.):", self.app.var_emit_h_min)
-        self.create_input(
-            tab,
-            "H опорна для Q ном (м вод. ст., турбул.):",
-            self.app.var_emit_h_ref,
-        )
         lat_db_row = tk.Frame(tab, bg="#1e1e1e")
         lat_db_row.pack(fill=tk.X, padx=10, pady=(0, 4))
         tk.Label(
@@ -1109,9 +1104,12 @@ class ControlPanel:
 
     def _on_notebook_tab_changed(self, event=None):
         try:
-            if self.notebook.select() == str(getattr(self, "tab_schedule", "")):
+            sel = self.notebook.select()
+            if sel == str(getattr(self, "tab_schedule", "")):
                 self._sync_schedule_editor()
                 self._render_consumer_schedule_text()
+            elif sel == str(getattr(self, "tab_trunk_hw", "")):
+                self._sync_irrigation_legend()
         except tk.TclError:
             pass
 
@@ -1146,10 +1144,18 @@ class ControlPanel:
             if not ids:
                 continue
             ncons = len(ids)
-            qsum = ncons * 60
+            qsum = 0.0
+            nodes = list(getattr(self.app, "trunk_map_nodes", []) or [])
+            by_id = {str(n.get("id", "")).strip(): n for n in nodes if isinstance(n, dict)}
+            for nid in ids:
+                node = by_id.get(str(nid).strip())
+                if node is None:
+                    qsum += float(self.app.trunk_schedule_test_q_m3h_effective())
+                else:
+                    qsum += float(self.app.trunk_consumer_effective_q_m3h(node))
             lb.insert(
                 tk.END,
-                f"{i + 1:02d}: {', '.join(ids)}   │ ΣQ≈{qsum} м³/год · H≈40 м (тест)",
+                f"{i + 1:02d}: {', '.join(ids)}   │ ΣQ≈{qsum:.1f} м³/год · H≈40 м (тест)",
             )
             slot_for_row.append(i)
         self._irrigation_lb_slot_indices = slot_for_row
@@ -1207,6 +1213,44 @@ class ControlPanel:
         self.app.redraw()
         try:
             self.app._schedule_embedded_map_overlay_refresh()
+        except Exception:
+            pass
+
+    def _schedule_begin_rozklad_consumer_pick(self) -> None:
+        """Вкладка «Розклад», чернетка з поточного слота, VIEW; ЛКМ/ПКМ на полотні чи карті."""
+        app = self.app
+        try:
+            self.notebook.select(str(getattr(self, "tab_schedule", "")))
+        except tk.TclError:
+            pass
+        if hasattr(app, "normalize_consumer_schedule"):
+            app.normalize_consumer_schedule()
+        try:
+            n = int(str(self.var_irrigation_slot.get()).strip())
+        except ValueError:
+            n = 1
+        n = max(1, min(48, n))
+        self.var_irrigation_slot.set(str(n))
+        slots = app.consumer_schedule.get("irrigation_slots") or [[] for _ in range(48)]
+        idx = n - 1
+        cur = list(slots[idx]) if 0 <= idx < len(slots) else []
+        app._rozklad_staging_ids = [str(x).strip() for x in cur if str(x).strip()]
+        try:
+            if app.mode.get() not in ("VIEW", "PAN"):
+                app.mode.set("VIEW")
+        except Exception:
+            pass
+        if hasattr(app, "reset_trunk_map_editing_state"):
+            app.reset_trunk_map_editing_state()
+        else:
+            app._canvas_special_tool = None
+            try:
+                app._refresh_canvas_cursor_for_special_tool()
+            except Exception:
+                pass
+        app.redraw()
+        try:
+            app._schedule_embedded_map_overlay_refresh()
         except Exception:
             pass
 
@@ -1291,23 +1335,23 @@ class ControlPanel:
             self.var_schedule_max_pump_head_m.set(f"{v:.2f}".rstrip("0").rstrip("."))
 
     def _schedule_apply_trunk_v_max_from_entry(self) -> bool:
-        """Макс. швидкість у магістралі (м/с) для розкладу та автопідбору d. False — некоректне число."""
+        """Макс. швидкість у магістралі (м/с): 0 — не обмежувати; >0 — перевірка та фільтр при автопідборі d."""
         self.app.normalize_consumer_schedule()
         try:
             v = float(str(self.var_schedule_trunk_v_max_mps.get()).replace(",", "."))
         except (TypeError, ValueError, tk.TclError):
             silent_showwarning(self.app.root, 
                 "Розклад",
-                "v max у магістралі: введіть додатне число (м/с), наприклад 2.0.",
+                "v max у магістралі: введіть число (м/с), наприклад 0 (вимкнено) або 2.0.",
             )
             return False
-        if v < 0.2 or v > 8.0:
+        if v < 0.0 or v > 8.0:
             silent_showwarning(self.app.root, 
                 "Розклад",
-                "v max поза діапазоном: дозволено від 0.2 до 8.0 м/с.",
+                "v max поза діапазоном: дозволено від 0 до 8.0 м/с (0 — швидкість не враховується).",
             )
             return False
-        v = max(0.2, min(8.0, float(v)))
+        v = max(0.0, min(8.0, float(v)))
         if abs(v - round(v)) < 1e-6:
             disp = str(int(round(v)))
         else:
@@ -1316,20 +1360,135 @@ class ControlPanel:
         self.app.consumer_schedule["trunk_schedule_v_max_mps"] = float(v)
         return True
 
+    def _schedule_apply_trunk_min_seg_from_entry(self) -> bool:
+        """Мінімальна довжина сегмента магістралі (м) для оптимізатора."""
+        self.app.normalize_consumer_schedule()
+        try:
+            v = float(str(self.var_schedule_trunk_min_seg_m.get()).replace(",", "."))
+        except (TypeError, ValueError, tk.TclError):
+            silent_showwarning(
+                self.app.root,
+                "Розклад",
+                "Мін. довжина сегмента: введіть число (м), наприклад 6.",
+            )
+            return False
+        if v < 0.0 or v > 1000.0:
+            silent_showwarning(
+                self.app.root,
+                "Розклад",
+                "Мін. довжина сегмента поза діапазоном: дозволено від 0 до 1000 м.",
+            )
+            return False
+        v = max(0.0, min(1000.0, float(v)))
+        self.var_schedule_trunk_min_seg_m.set(
+            str(int(round(v))) if abs(v - round(v)) < 1e-6 else f"{v:.2f}".rstrip("0").rstrip(".")
+        )
+        self.app.consumer_schedule["trunk_schedule_min_seg_m"] = float(v)
+        return True
+
+    def _schedule_apply_trunk_max_sections_from_entry(self) -> bool:
+        """Максимум секцій телескопа в одному ребрі магістралі."""
+        self.app.normalize_consumer_schedule()
+        try:
+            v = int(float(str(self.var_schedule_trunk_max_sections.get()).replace(",", ".")))
+        except (TypeError, ValueError, tk.TclError):
+            silent_showwarning(
+                self.app.root,
+                "Розклад",
+                "Макс. секцій на ребро: введіть ціле число від 1 до 4.",
+            )
+            return False
+        if v < 1 or v > 4:
+            silent_showwarning(
+                self.app.root,
+                "Розклад",
+                "Макс. секцій на ребро поза діапазоном: дозволено 1…4.",
+            )
+            return False
+        self.var_schedule_trunk_max_sections.set(str(v))
+        self.app.consumer_schedule["trunk_schedule_max_sections_per_edge"] = int(v)
+        return True
+
+    def _schedule_apply_trunk_opt_goal_from_ui(self) -> None:
+        self.app.normalize_consumer_schedule()
+        g = str(self.var_schedule_trunk_opt_goal.get() or "weight").strip().lower()
+        if g not in ("weight", "money", "cost_index"):
+            g = "weight"
+        if g == "cost_index":
+            g = "money"
+        self.var_schedule_trunk_opt_goal.set(g)
+        self.app.consumer_schedule["trunk_schedule_opt_goal"] = g
+
+    def _schedule_apply_trunk_pipe_mode_from_ui(self) -> None:
+        """Режим магістралі: auto (автопідбір) або fixed (фіксовані труби)."""
+        if not hasattr(self, "var_schedule_use_fixed_trunk_pipes"):
+            return
+        self.app.normalize_consumer_schedule()
+        self.app.consumer_schedule["trunk_pipes_selected"] = bool(
+            self.var_schedule_use_fixed_trunk_pipes.get()
+        )
+
     def _sync_schedule_trunk_v_max_ui(self) -> None:
         if not hasattr(self, "var_schedule_trunk_v_max_mps"):
             return
         self.app.normalize_consumer_schedule()
-        vx = self.app.consumer_schedule.get("trunk_schedule_v_max_mps", 2.0)
+        vx = self.app.consumer_schedule.get("trunk_schedule_v_max_mps", 0.0)
         try:
             vx = float(vx)
         except (TypeError, ValueError):
-            vx = 2.0
-        vx = max(0.2, min(8.0, vx))
-        if abs(vx - round(vx)) < 1e-6:
+            vx = 0.0
+        vx = max(0.0, min(8.0, vx))
+        if abs(vx) < 1e-12:
+            self.var_schedule_trunk_v_max_mps.set("0")
+        elif abs(vx - round(vx)) < 1e-6:
             self.var_schedule_trunk_v_max_mps.set(str(int(round(vx))))
         else:
             self.var_schedule_trunk_v_max_mps.set(f"{vx:.2f}".rstrip("0").rstrip("."))
+
+    def _sync_schedule_trunk_min_seg_ui(self) -> None:
+        if not hasattr(self, "var_schedule_trunk_min_seg_m"):
+            return
+        self.app.normalize_consumer_schedule()
+        mn = self.app.consumer_schedule.get("trunk_schedule_min_seg_m", 0.0)
+        try:
+            mn = float(mn)
+        except (TypeError, ValueError):
+            mn = 0.0
+        mn = max(0.0, min(1000.0, mn))
+        self.var_schedule_trunk_min_seg_m.set(
+            str(int(round(mn))) if abs(mn - round(mn)) < 1e-6 else f"{mn:.2f}".rstrip("0").rstrip(".")
+        )
+
+    def _sync_schedule_trunk_max_sections_ui(self) -> None:
+        if not hasattr(self, "var_schedule_trunk_max_sections"):
+            return
+        self.app.normalize_consumer_schedule()
+        ms = self.app.consumer_schedule.get("trunk_schedule_max_sections_per_edge", 2)
+        try:
+            ms = int(ms)
+        except (TypeError, ValueError):
+            ms = 2
+        ms = max(1, min(4, ms))
+        self.var_schedule_trunk_max_sections.set(str(ms))
+
+    def _sync_schedule_trunk_opt_goal_ui(self) -> None:
+        if not hasattr(self, "var_schedule_trunk_opt_goal"):
+            return
+        self.app.normalize_consumer_schedule()
+        g = str(self.app.consumer_schedule.get("trunk_schedule_opt_goal", "weight")).strip().lower()
+        if g not in ("weight", "money", "cost_index"):
+            g = "weight"
+        if g == "cost_index":
+            g = "money"
+        self.var_schedule_trunk_opt_goal.set(g)
+
+    def _sync_schedule_trunk_pipe_mode_ui(self) -> None:
+        if not hasattr(self, "var_schedule_use_fixed_trunk_pipes"):
+            return
+        self.app.normalize_consumer_schedule()
+        self.var_schedule_use_fixed_trunk_pipes.set(
+            bool(self.app.consumer_schedule.get("trunk_pipes_selected", False))
+        )
 
     def _flush_schedule_trunk_v_max_to_app(self) -> None:
         """Перед збереженням: перенести v max з поля в consumer_schedule (без діалогів)."""
@@ -1341,12 +1500,123 @@ class ControlPanel:
         except (TypeError, ValueError, tk.TclError):
             self._sync_schedule_trunk_v_max_ui()
             return
-        v = max(0.2, min(8.0, float(v)))
+        v = max(0.0, min(8.0, float(v)))
         self.app.consumer_schedule["trunk_schedule_v_max_mps"] = float(v)
-        if abs(v - round(v)) < 1e-6:
+        if abs(v) < 1e-12:
+            self.var_schedule_trunk_v_max_mps.set("0")
+        elif abs(v - round(v)) < 1e-6:
             self.var_schedule_trunk_v_max_mps.set(str(int(round(v))))
         else:
             self.var_schedule_trunk_v_max_mps.set(f"{v:.2f}".rstrip("0").rstrip("."))
+
+    def _flush_schedule_trunk_min_seg_to_app(self) -> None:
+        if not hasattr(self, "var_schedule_trunk_min_seg_m"):
+            return
+        self.app.normalize_consumer_schedule()
+        try:
+            v = float(str(self.var_schedule_trunk_min_seg_m.get()).replace(",", "."))
+        except (TypeError, ValueError, tk.TclError):
+            self._sync_schedule_trunk_min_seg_ui()
+            return
+        v = max(0.0, min(1000.0, float(v)))
+        self.app.consumer_schedule["trunk_schedule_min_seg_m"] = float(v)
+        self.var_schedule_trunk_min_seg_m.set(
+            str(int(round(v))) if abs(v - round(v)) < 1e-6 else f"{v:.2f}".rstrip("0").rstrip(".")
+        )
+
+    def _flush_schedule_trunk_max_sections_to_app(self) -> None:
+        if not hasattr(self, "var_schedule_trunk_max_sections"):
+            return
+        self.app.normalize_consumer_schedule()
+        try:
+            v = int(float(str(self.var_schedule_trunk_max_sections.get()).replace(",", ".")))
+        except (TypeError, ValueError, tk.TclError):
+            self._sync_schedule_trunk_max_sections_ui()
+            return
+        v = max(1, min(4, int(v)))
+        self.app.consumer_schedule["trunk_schedule_max_sections_per_edge"] = int(v)
+        self.var_schedule_trunk_max_sections.set(str(v))
+
+    def _flush_schedule_trunk_opt_goal_to_app(self) -> None:
+        if not hasattr(self, "var_schedule_trunk_opt_goal"):
+            return
+        self.app.normalize_consumer_schedule()
+        g = str(self.var_schedule_trunk_opt_goal.get() or "weight").strip().lower()
+        if g not in ("weight", "money", "cost_index"):
+            g = "weight"
+        if g == "cost_index":
+            g = "money"
+        self.var_schedule_trunk_opt_goal.set(g)
+        self.app.consumer_schedule["trunk_schedule_opt_goal"] = g
+
+    def _flush_schedule_trunk_pipe_mode_to_app(self) -> None:
+        if not hasattr(self, "var_schedule_use_fixed_trunk_pipes"):
+            return
+        self.app.normalize_consumer_schedule()
+        self.app.consumer_schedule["trunk_pipes_selected"] = bool(
+            self.var_schedule_use_fixed_trunk_pipes.get()
+        )
+
+    def _schedule_apply_schedule_test_qh_from_entries(self) -> bool:
+        """Типові Q/H для споживачів без індивідуальних trunk_schedule_* на вузлі."""
+        self.app.normalize_consumer_schedule()
+        try:
+            qv = float(str(self.var_schedule_test_q_m3h.get()).replace(",", "."))
+            hv = float(str(self.var_schedule_test_h_m.get()).replace(",", "."))
+        except (TypeError, ValueError, tk.TclError):
+            silent_showwarning(
+                self.app.root,
+                "Розклад",
+                "Типові Q (м³/год) і H (м): введіть числа.",
+            )
+            return False
+        if qv < 0.0 or qv > 10000.0 or hv < 0.0 or hv > 400.0:
+            silent_showwarning(
+                self.app.root,
+                "Розклад",
+                "Типові Q: 0…10000 м³/год; типові H: 0…400 м вод. ст.",
+            )
+            return False
+        qv = max(0.0, min(10000.0, float(qv)))
+        hv = max(0.0, min(400.0, float(hv)))
+        self.var_schedule_test_q_m3h.set(str(int(round(qv))) if abs(qv - round(qv)) < 1e-6 else f"{qv:.2f}".rstrip("0").rstrip("."))
+        self.var_schedule_test_h_m.set(str(int(round(hv))) if abs(hv - round(hv)) < 1e-6 else f"{hv:.2f}".rstrip("0").rstrip("."))
+        self.app.consumer_schedule["trunk_schedule_test_q_m3h"] = float(qv)
+        self.app.consumer_schedule["trunk_schedule_test_h_m"] = float(hv)
+        return True
+
+    def _sync_schedule_test_qh_ui(self) -> None:
+        if not hasattr(self, "var_schedule_test_q_m3h"):
+            return
+        self.app.normalize_consumer_schedule()
+        try:
+            qv = float(self.app.consumer_schedule.get("trunk_schedule_test_q_m3h", 60.0))
+        except (TypeError, ValueError):
+            qv = 60.0
+        qv = max(0.0, min(10000.0, qv))
+        try:
+            hv = float(self.app.consumer_schedule.get("trunk_schedule_test_h_m", 40.0))
+        except (TypeError, ValueError):
+            hv = 40.0
+        hv = max(0.0, min(400.0, hv))
+        self.var_schedule_test_q_m3h.set(str(int(round(qv))) if abs(qv - round(qv)) < 1e-6 else f"{qv:.2f}".rstrip("0").rstrip("."))
+        self.var_schedule_test_h_m.set(str(int(round(hv))) if abs(hv - round(hv)) < 1e-6 else f"{hv:.2f}".rstrip("0").rstrip("."))
+
+    def _flush_schedule_test_qh_to_app(self) -> None:
+        if not hasattr(self, "var_schedule_test_q_m3h"):
+            return
+        self.app.normalize_consumer_schedule()
+        try:
+            qv = float(str(self.var_schedule_test_q_m3h.get()).replace(",", "."))
+            hv = float(str(self.var_schedule_test_h_m.get()).replace(",", "."))
+        except (TypeError, ValueError, tk.TclError):
+            self._sync_schedule_test_qh_ui()
+            return
+        qv = max(0.0, min(10000.0, float(qv)))
+        hv = max(0.0, min(400.0, float(hv)))
+        self.app.consumer_schedule["trunk_schedule_test_q_m3h"] = float(qv)
+        self.app.consumer_schedule["trunk_schedule_test_h_m"] = float(hv)
+        self._sync_schedule_test_qh_ui()
 
     def _schedule_on_consumer_select(self, event=None):
         lb = getattr(self, "lb_sched_consumers", None)
@@ -1424,7 +1694,7 @@ class ControlPanel:
                 if len(errs) > 14:
                     txt.insert(tk.END, f"\n… ще {len(errs) - 14} повідомлень.")
             else:
-                txt.insert(tk.END, "Перевірте: один витік, з’єднані сегменти, споживачі — лише листя.")
+                txt.insert(tk.END, "Перевірте: один витік і з’єднані сегменти дерева магістралі.")
             txt.config(state=tk.DISABLED)
             return
 
@@ -1441,7 +1711,20 @@ class ControlPanel:
         if hasattr(app, "normalize_consumer_schedule"):
             app.normalize_consumer_schedule()
             slots = app.consumer_schedule.get("irrigation_slots") or [[] for _ in range(48)]
-            txt.insert(tk.END, "— Розклад поливів (1…48), тест: 60 м³/год і 40 м на споживача —\n")
+            dq = (
+                app.trunk_schedule_test_q_m3h_effective()
+                if hasattr(app, "trunk_schedule_test_q_m3h_effective")
+                else 60.0
+            )
+            dh = (
+                app.trunk_schedule_test_h_m_effective()
+                if hasattr(app, "trunk_schedule_test_h_m_effective")
+                else 40.0
+            )
+            txt.insert(
+                tk.END,
+                f"— Розклад поливів (1…48), типові тест: {dq:g} м³/год і H≈{dh:g} м —\n",
+            )
             any_slot = any(bool(slots[i]) for i in range(min(48, len(slots))))
             if not any_slot:
                 txt.insert(
@@ -1458,7 +1741,7 @@ class ControlPanel:
                     txt.insert(
                         tk.END,
                         f"Полив {si + 1:02d}: {', '.join(ids)}  "
-                        f"(ΣQ≈{n * 60} м³/год, тест)\n",
+                        f"(ΣQ≈{n * dq:g} м³/год за типовим Q)\n",
                     )
                 txt.insert(tk.END, "\n")
 
@@ -1486,10 +1769,416 @@ class ControlPanel:
             txt.insert(tk.END, "   " + " → ".join(labels) + "\n\n")
         txt.config(state=tk.DISABLED)
 
+    def _ensure_schedule_trunk_field_vars(self) -> None:
+        """StringVar для параметрів магістралі (віджети на правій панелі «Магістраль»)."""
+        if hasattr(self, "var_schedule_max_pump_head_m"):
+            if not hasattr(self, "var_trunk_picket_head_m"):
+                self.var_trunk_picket_head_m = tk.StringVar(value="60")
+            return
+        self.var_schedule_max_pump_head_m = tk.StringVar(value="50")
+        self.var_schedule_trunk_v_max_mps = tk.StringVar(value="0")
+        self.var_schedule_trunk_min_seg_m = tk.StringVar(value="0")
+        self.var_schedule_trunk_max_sections = tk.StringVar(value="2")
+        self.var_schedule_trunk_opt_goal = tk.StringVar(value="weight")
+        self.var_schedule_use_fixed_trunk_pipes = tk.BooleanVar(value=False)
+        self.var_schedule_test_q_m3h = tk.StringVar(value="60")
+        self.var_schedule_test_h_m = tk.StringVar(value="40")
+        self.var_trunk_picket_head_m = tk.StringVar(value="60")
+
+    def build_trunk_hw_tab(self) -> None:
+        """Вкладка керування: розрахунок магістралі за поливами (HW). Інструменти траси — зліва, вкладка «Магістраль»."""
+        if getattr(self, "_trunk_hw_tab_built", False):
+            return
+        self._trunk_hw_tab_built = True
+        self._ensure_schedule_trunk_field_vars()
+        tab = tk.Frame(self.notebook, bg="#1e1e1e")
+        self.notebook.add(tab, text="Магістраль (HW)")
+        self.tab_trunk_hw = tab
+
+        wrap = tk.Frame(tab, bg="#1e1e1e")
+        wrap.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+        tk.Label(
+            wrap,
+            text="Магістраль за поливами (Hazen–Williams)",
+            bg="#1e1e1e",
+            fg="#8BC4FF",
+            font=("Segoe UI", 10, "bold"),
+        ).pack(anchor=tk.W, pady=(0, 4))
+        tk.Label(
+            wrap,
+            text="Трасу та вузли — зліва («Без карти» / «Карта» → «Магістраль»). Каталог труб магістралі — кнопка нижче. Слоти поливів — «Розклад».",
+            bg="#1e1e1e",
+            fg="#90A4AE",
+            font=("Segoe UI", 8),
+            wraplength=300,
+            justify=tk.LEFT,
+        ).pack(anchor=tk.W, pady=(0, 8))
+
+        app = self.app
+        _show_trunk_map_tools = hasattr(app, "add_trunk_picket_at_head_drop") or hasattr(
+            app, "apply_trunk_display_velocity_warn_from_ui"
+        )
+        lf_trunk_map = None
+        if _show_trunk_map_tools:
+            lf_trunk_map = tk.LabelFrame(
+                wrap,
+                text="На полотні / карті",
+                bg="#181818",
+                fg="#88DDFF",
+                font=("Segoe UI", 8, "bold"),
+            )
+            lf_trunk_map.pack(fill=tk.X, pady=(0, 8))
+        _inner_map = tk.Frame(lf_trunk_map, bg="#181818") if lf_trunk_map else None
+        if _inner_map is not None:
+            _inner_map.pack(fill=tk.X, padx=6, pady=4)
+        if hasattr(app, "add_trunk_picket_at_head_drop") and _inner_map is not None:
+            row_h = tk.Frame(_inner_map, bg="#181818")
+            row_h.pack(fill=tk.X, pady=(0, 4))
+            tk.Label(
+                row_h,
+                text="H, м:",
+                bg="#181818",
+                fg="#9CC6E6",
+                font=("Segoe UI", 8, "bold"),
+            ).pack(side=tk.LEFT, padx=(0, 4))
+            ent_ph = tk.Entry(
+                row_h,
+                textvariable=self.var_trunk_picket_head_m,
+                width=7,
+                bg="#333333",
+                fg="#ECEFF1",
+                font=("Consolas", 10, "bold"),
+                insertbackground="white",
+            )
+            ent_ph.pack(side=tk.LEFT, padx=(0, 6))
+
+            def _run_add_trunk_picket_at_h() -> None:
+                raw = str(self.var_trunk_picket_head_m.get()).replace(",", ".").strip()
+                try:
+                    hv = float(raw)
+                except (TypeError, ValueError):
+                    self.var_trunk_picket_head_m.set("60")
+                    hv = 60.0
+                hv = max(0.0, min(400.0, hv))
+                self.var_trunk_picket_head_m.set(str(hv).rstrip("0").rstrip("."))
+                app.add_trunk_picket_at_head_drop(hv)
+
+            btn_ph = tk.Button(
+                row_h,
+                text="➕ Пікет @ H",
+                command=_run_add_trunk_picket_at_h,
+                bg="#1e2f44",
+                fg="#B3E5FC",
+                relief=tk.FLAT,
+                font=("Segoe UI", 8, "bold"),
+            )
+            btn_ph.pack(side=tk.LEFT, fill=tk.X, expand=True)
+            self._attach_tooltip(
+                btn_ph,
+                "За результатами «Магістраль за поливами» знайти точку падіння до введеного H (м) у peak-слоті й вставити пікет, розірвавши ребро.",
+            )
+            self._attach_tooltip(
+                ent_ph,
+                "Цільовий напір H (м), у точці якого вставляється пікет.",
+            )
+        if hasattr(app, "apply_trunk_display_velocity_warn_from_ui") and _inner_map is not None:
+            if hasattr(app, "normalize_consumer_schedule"):
+                app.normalize_consumer_schedule()
+            row_vw = tk.Frame(_inner_map, bg="#181818")
+            row_vw.pack(fill=tk.X, pady=(2, 0))
+            tk.Label(
+                row_vw,
+                text="Vmax≥",
+                bg="#181818",
+                fg="#E57373",
+                font=("Segoe UI", 8, "bold"),
+            ).pack(side=tk.LEFT, padx=(0, 4))
+            if hasattr(app, "var_trunk_display_velocity_warn_mps"):
+                try:
+                    vv0 = float(app.consumer_schedule.get("trunk_display_velocity_warn_mps", 0.0) or 0.0)
+                    app.var_trunk_display_velocity_warn_mps.set("0" if vv0 < 1e-12 else f"{vv0:g}")
+                except (tk.TclError, TypeError, ValueError):
+                    pass
+            ent_vw = tk.Entry(
+                row_vw,
+                textvariable=app.var_trunk_display_velocity_warn_mps,
+                width=5,
+                bg="#333333",
+                fg="#ECEFF1",
+                font=("Consolas", 10, "bold"),
+                insertbackground="white",
+            )
+            ent_vw.pack(side=tk.LEFT, padx=(0, 4))
+
+            def _apply_vw(_event=None) -> None:
+                app.apply_trunk_display_velocity_warn_from_ui()
+
+            ent_vw.bind("<Return>", _apply_vw)
+            ent_vw.bind("<FocusOut>", _apply_vw)
+            tk.Label(
+                row_vw,
+                text="м/с",
+                bg="#181818",
+                fg="#B0BEC5",
+                font=("Segoe UI", 8),
+            ).pack(side=tk.LEFT)
+            self._attach_tooltip(
+                ent_vw,
+                "Поріг для підсвітки магістралі: v ≥ Vmax (м/с) за останнім розрахунком «Магістраль за поливами». "
+                "0 — вимкнено. Не впливає на підбір труб (оптимізація лише за ΔH і каталогом).",
+            )
+
+        calc = tk.Frame(wrap, bg="#181818", highlightthickness=1, highlightbackground="#3d3d3d")
+        calc.pack(fill=tk.BOTH, expand=True, padx=4, pady=(0, 4))
+        tk.Label(
+            calc,
+            text="Розрахунок за поливами",
+            bg="#181818",
+            fg="#8BC4FF",
+            font=("Segoe UI", 9, "bold"),
+        ).pack(anchor=tk.W, padx=6, pady=(6, 4))
+        if hasattr(self.app, "open_pipe_selector"):
+            btn_trunk_pipes = tk.Button(
+                calc,
+                text="✅ Труби для магістралі…",
+                command=lambda: self.app.open_pipe_selector("trunk"),
+                bg="#1b3d2f",
+                fg="#B9F6CA",
+                relief=tk.FLAT,
+                font=("Segoe UI", 8, "bold"),
+            )
+            btn_trunk_pipes.pack(fill=tk.X, padx=6, pady=(0, 6))
+            self._attach_tooltip(
+                btn_trunk_pipes,
+                "Окремий набір дозволених труб для магістралі. Зберігається в проєкті (trunk → allowed_pipes). "
+                "Після вибору можна призначати трубу на кожен відрізок (Подвійний ЛКМ по лінії магістралі в VIEW).",
+            )
+        fr_pump_h = tk.Frame(calc, bg="#181818")
+        fr_pump_h.pack(fill=tk.X, padx=6, pady=(6, 0))
+        tk.Label(
+            fr_pump_h,
+            text="Напір насоса (задано, м вод. ст.)",
+            bg="#181818",
+            fg="#CCCCCC",
+            font=("Segoe UI", 8),
+            justify=tk.LEFT,
+        ).pack(anchor=tk.W)
+        ent_max_pump = tk.Entry(
+            fr_pump_h,
+            textvariable=self.var_schedule_max_pump_head_m,
+            width=10,
+            bg="#333333",
+            fg="#ECEFF1",
+            font=("Consolas", 10, "bold"),
+            insertbackground="white",
+        )
+        ent_max_pump.pack(anchor=tk.W, pady=(2, 0))
+        self._attach_tooltip(
+            ent_max_pump,
+            "Робочий напір насоса (м вод. ст.), під який перевіряється магістраль. "
+            "Менше значення — менший тиск у трубах (м’якші вимоги до класу PN). "
+            "Якщо при цьому H у споживачів < цілі — у звіті буде підказка мінімально потрібного H. "
+            "Зберігається в проєкті.",
+        )
+        fr_min_seg = tk.Frame(calc, bg="#181818")
+        fr_min_seg.pack(fill=tk.X, padx=6, pady=(8, 0))
+        tk.Label(
+            fr_min_seg,
+            text="Мін. довжина сегмента магістралі (м)",
+            bg="#181818",
+            fg="#CCCCCC",
+            font=("Segoe UI", 8),
+            justify=tk.LEFT,
+        ).pack(anchor=tk.W)
+        ent_min_seg = tk.Entry(
+            fr_min_seg,
+            textvariable=self.var_schedule_trunk_min_seg_m,
+            width=10,
+            bg="#333333",
+            fg="#ECEFF1",
+            font=("Consolas", 10, "bold"),
+            insertbackground="white",
+        )
+        ent_min_seg.pack(anchor=tk.W, pady=(2, 0))
+        self._attach_tooltip(
+            ent_min_seg,
+            "Нижня межа довжини сегмента при оптимізації магістралі (Lсегм = 0 або ≥ заданого значення).",
+        )
+        fr_max_sections = tk.Frame(calc, bg="#181818")
+        fr_max_sections.pack(fill=tk.X, padx=6, pady=(8, 0))
+        tk.Label(
+            fr_max_sections,
+            text="Макс. секцій на ребро",
+            bg="#181818",
+            fg="#CCCCCC",
+            font=("Segoe UI", 8),
+            justify=tk.LEFT,
+        ).pack(anchor=tk.W)
+        ent_max_sections = tk.Entry(
+            fr_max_sections,
+            textvariable=self.var_schedule_trunk_max_sections,
+            width=10,
+            bg="#333333",
+            fg="#ECEFF1",
+            font=("Consolas", 10, "bold"),
+            insertbackground="white",
+        )
+        ent_max_sections.pack(anchor=tk.W, pady=(2, 0))
+        self._attach_tooltip(
+            ent_max_sections,
+            "Максимальна кількість телескопічних секцій всередині одного ребра магістралі (1…4).",
+        )
+        fr_opt_goal = tk.Frame(calc, bg="#181818")
+        fr_opt_goal.pack(fill=tk.X, padx=6, pady=(8, 0))
+        tk.Label(
+            fr_opt_goal,
+            text="Критерій підбору труб",
+            bg="#181818",
+            fg="#CCCCCC",
+            font=("Segoe UI", 8),
+            justify=tk.LEFT,
+        ).pack(anchor=tk.W)
+        cb_opt_goal = ttk.Combobox(
+            fr_opt_goal,
+            textvariable=self.var_schedule_trunk_opt_goal,
+            values=("money", "weight"),
+            state="readonly",
+            width=11,
+            font=("Consolas", 10, "bold"),
+        )
+        cb_opt_goal.pack(anchor=tk.W, pady=(2, 0))
+        self._attach_tooltip(
+            cb_opt_goal,
+            "money — мінімізувати сумарну вартість (потрібне поле price_per_m у базі труб); "
+            "weight — мінімізувати сумарну вагу (якщо цін немає, використовуйте weight).",
+        )
+        cb_pipe_mode = tk.Checkbutton(
+            calc,
+            text="Фіксовані труби (без автопідбору)",
+            variable=self.var_schedule_use_fixed_trunk_pipes,
+            bg="#181818",
+            fg="#CCCCCC",
+            selectcolor="#333",
+            activebackground="#181818",
+            activeforeground="#CCCCCC",
+            font=("Segoe UI", 8),
+            justify=tk.LEFT,
+            anchor=tk.W,
+            command=self._schedule_apply_trunk_pipe_mode_from_ui,
+        )
+        cb_pipe_mode.pack(anchor=tk.W, padx=6, pady=(8, 0), fill=tk.X)
+        self._attach_tooltip(
+            cb_pipe_mode,
+            "Вимкнено: перед розрахунком виконується автопідбір діаметрів під заданий H насоса. "
+            "Увімкнено: використовуються вже призначені труби магістралі, а розрахунок оцінює потрібний H насоса.",
+        )
+        btn_tr_hydro = tk.Button(
+            calc,
+            text="▶ Розрахунок магістралі",
+            command=self._schedule_run_trunk_hydro,
+            bg="#1565C0",
+            fg="white",
+            font=("Segoe UI", 9, "bold"),
+        )
+        btn_tr_hydro.pack(fill=tk.X, padx=6, pady=(6, 0))
+        self._attach_tooltip(
+            btn_tr_hydro,
+            "Перед новим розрахунком попередній кеш HW (підсвічування, графік, hover) скидається. "
+            "HW по поливах: типові Q/H — у полях нижче (або індивідуально на споживачі); напір на насосі — "
+            "у полі «Напір насоса». Мін. довжина сегмента і критерій задають автопідбір діаметрів. "
+            "Фарбування відрізків — домінантний полив; підпис біля насоса.",
+        )
+        fr_test_qh = tk.Frame(calc, bg="#181818")
+        fr_test_qh.pack(fill=tk.X, padx=6, pady=(8, 0))
+        tk.Label(
+            fr_test_qh,
+            text="Типові Q / H тесту (м³/год · м)",
+            bg="#181818",
+            fg="#CCCCCC",
+            font=("Segoe UI", 8),
+            justify=tk.LEFT,
+        ).pack(anchor=tk.W)
+        row_tqh = tk.Frame(fr_test_qh, bg="#181818")
+        row_tqh.pack(anchor=tk.W, pady=(2, 0))
+        tk.Label(row_tqh, text="Q", bg="#181818", fg="#aaa", font=("Segoe UI", 8)).pack(side=tk.LEFT)
+        ent_tq = tk.Entry(
+            row_tqh,
+            textvariable=self.var_schedule_test_q_m3h,
+            width=6,
+            bg="#333333",
+            fg="#ECEFF1",
+            font=("Consolas", 10, "bold"),
+            insertbackground="white",
+        )
+        ent_tq.pack(side=tk.LEFT, padx=(4, 10))
+        tk.Label(row_tqh, text="H", bg="#181818", fg="#aaa", font=("Segoe UI", 8)).pack(side=tk.LEFT)
+        ent_th = tk.Entry(
+            row_tqh,
+            textvariable=self.var_schedule_test_h_m,
+            width=6,
+            bg="#333333",
+            fg="#ECEFF1",
+            font=("Consolas", 10, "bold"),
+            insertbackground="white",
+        )
+        ent_th.pack(side=tk.LEFT, padx=(4, 0))
+        self._attach_tooltip(
+            fr_test_qh,
+            "Для кожного споживача можна задати свої Q/H (ПКМ на вузлі). Якщо не задано — "
+            "у розрахунку використовуються ці типові значення. Зберігаються в проєкті.",
+        )
+
+        lf_leg = tk.LabelFrame(
+            wrap,
+            text="Легенда: колір лінії = домінантний полив",
+            bg="#181818",
+            fg="#88DDFF",
+            font=("Segoe UI", 8, "bold"),
+        )
+        lf_leg.pack(fill=tk.X, pady=(8, 0))
+        tk.Label(
+            lf_leg,
+            text="Після розрахунку: d і Q при наведенні на відрізок.",
+            bg="#181818",
+            fg="#999999",
+            font=("Segoe UI", 8),
+            wraplength=300,
+            justify=tk.LEFT,
+        ).pack(anchor=tk.W, padx=6, pady=(4, 2))
+        self.canvas_irrigation_legend = tk.Canvas(
+            lf_leg,
+            width=268,
+            height=120,
+            bg="#222222",
+            highlightthickness=1,
+            highlightbackground="#444444",
+        )
+        self.canvas_irrigation_legend.pack(padx=6, pady=(0, 4))
+        self.lbl_trunk_pipe_legend = tk.Label(
+            lf_leg,
+            text="",
+            bg="#181818",
+            fg="#9DCBFA",
+            font=("Consolas", 8),
+            justify=tk.LEFT,
+            wraplength=300,
+        )
+        self.lbl_trunk_pipe_legend.pack(anchor=tk.W, padx=6, pady=(0, 6))
+
+        self._sync_schedule_max_pump_head_ui()
+        self._sync_schedule_trunk_v_max_ui()
+        self._sync_schedule_trunk_min_seg_ui()
+        self._sync_schedule_trunk_max_sections_ui()
+        self._sync_schedule_trunk_opt_goal_ui()
+        self._sync_schedule_trunk_pipe_mode_ui()
+        self._sync_schedule_test_qh_ui()
+        self._sync_irrigation_legend()
+
     def build_schedule_tab(self):
         tab = tk.Frame(self.notebook, bg="#1e1e1e")
         self.notebook.add(tab, text="Розклад")
         self.tab_schedule = tab
+        self._ensure_schedule_trunk_field_vars()
 
         tk.Label(
             tab,
@@ -1500,8 +2189,8 @@ class ControlPanel:
         ).pack(pady=(10, 4))
         tk.Label(
             tab,
-            text="Тест: кожен споживач 60 м³/год при H≈40 м. Полотно/карта: режим VIEW або PAN, без інструментів "
-            "магістралі. ЛКМ — у чернетку (повтор — зняти), ПКМ — записати у вибраний полив.",
+            text="Типові Q/H та розрахунок HW — на вкладці «Магістраль (HW)» (панель керування). Кнопка «Вибір…» біля № поливу готує режим; полотно/карта: "
+            "VIEW або PAN, без інструментів магістралі. ЛКМ — додати/зняти споживача, ПКМ — записати у вибраний полив.",
             bg="#1e1e1e",
             fg="#aaaaaa",
             font=("Arial", 8),
@@ -1523,24 +2212,35 @@ class ControlPanel:
         left_ir.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 6))
         tk.Label(left_ir, text="№ поливу", bg="#1e1e1e", fg="#CCCCCC", font=("Arial", 8)).pack(anchor=tk.W)
         self.var_irrigation_slot = tk.StringVar(value="1")
+        ir_slot_row = tk.Frame(left_ir, bg="#1e1e1e")
+        ir_slot_row.pack(anchor=tk.W, fill=tk.X, pady=(2, 4))
         self.cb_irrigation = ttk.Combobox(
-            left_ir,
+            ir_slot_row,
             textvariable=self.var_irrigation_slot,
             values=[str(i) for i in range(1, 49)],
             state="readonly",
             width=5,
             font=("Consolas", 10, "bold"),
         )
-        self.cb_irrigation.pack(anchor=tk.W, pady=(2, 4))
+        self.cb_irrigation.pack(side=tk.LEFT, anchor=tk.W)
         self.cb_irrigation.bind("<<ComboboxSelected>>", self._schedule_on_irrigation_combo)
-        tk.Button(
-            left_ir,
-            text="Скинути\nчернетку",
-            command=self._schedule_clear_staging,
-            bg="#444",
-            fg="white",
-            font=("Arial", 8),
-        ).pack(anchor=tk.W, pady=(4, 0))
+        btn_rozklad_pick = tk.Button(
+            ir_slot_row,
+            text="Вибір…",
+            command=self._schedule_begin_rozklad_consumer_pick,
+            bg="#2a4a6a",
+            fg="#E8F4FF",
+            font=("Arial", 8, "bold"),
+            padx=6,
+            pady=1,
+        )
+        btn_rozklad_pick.pack(side=tk.LEFT, padx=(8, 0), anchor=tk.W)
+        self._attach_tooltip(
+            btn_rozklad_pick,
+            "Підготувати вибір споживачів для номера поливу з дропліста: перехід на цю вкладку, режим VIEW, "
+            "вимкнення інструментів магістралі на полотні/карті. Далі на полотні або карті: ЛКМ — додати/зняти споживача, "
+            "ПКМ — записати у вибраний полив.",
+        )
         btn_clr_one = tk.Button(
             left_ir,
             text="Очистити\nполив №",
@@ -1567,79 +2267,9 @@ class ControlPanel:
             btn_clr_all,
             "Видалити споживачів з усіх слотів 1…48 (підтвердження). Кольорові кільця на схемі зникнуть.",
         )
-        btn_tr_hydro = tk.Button(
-            left_ir,
-            text="Розрахунок\nмагістралі",
-            command=self._schedule_run_trunk_hydro,
-            bg="#1565C0",
-            fg="white",
-            font=("Arial", 8, "bold"),
-        )
-        btn_tr_hydro.pack(anchor=tk.W, pady=(8, 0))
-        self._attach_tooltip(
-            btn_tr_hydro,
-            "HW по поливах: 60 м³/год і H≥40 м у споживача; напір на насосі — той, що ви задаєте "
-            "в полі нижче (реальна робоча точка, без автоматичного «завищення» до 100 м). "
-            "Фарбування відрізків — домінантний полив; підпис біля насоса.",
-        )
-        fr_pump_h = tk.Frame(left_ir, bg="#1e1e1e")
-        fr_pump_h.pack(anchor=tk.W, pady=(10, 0), fill=tk.X)
-        tk.Label(
-            fr_pump_h,
-            text="Напір насоса\n(задано, м вод. ст.)",
-            bg="#1e1e1e",
-            fg="#CCCCCC",
-            font=("Arial", 8),
-            justify=tk.LEFT,
-        ).pack(anchor=tk.W)
-        self.var_schedule_max_pump_head_m = tk.StringVar(value="50")
-        ent_max_pump = tk.Entry(
-            fr_pump_h,
-            textvariable=self.var_schedule_max_pump_head_m,
-            width=8,
-            bg="#333333",
-            fg="#ECEFF1",
-            font=("Consolas", 10, "bold"),
-            insertbackground="white",
-        )
-        ent_max_pump.pack(anchor=tk.W, pady=(2, 0))
-        self._attach_tooltip(
-            ent_max_pump,
-            "Робочий напір насоса (м вод. ст.), під який перевіряється магістраль. "
-            "Менше значення — менший тиск у трубах (м’якші вимоги до класу PN). "
-            "Якщо при цьому H у споживачів < 40 м — у звіті буде підказка мінімально потрібного H. "
-            "Зберігається в проєкті.",
-        )
-        fr_vmax = tk.Frame(left_ir, bg="#1e1e1e")
-        fr_vmax.pack(anchor=tk.W, pady=(8, 0), fill=tk.X)
-        tk.Label(
-            fr_vmax,
-            text="v max у магістралі\n(м/с, для перевірки та автопідбору d)",
-            bg="#1e1e1e",
-            fg="#CCCCCC",
-            font=("Arial", 8),
-            justify=tk.LEFT,
-        ).pack(anchor=tk.W)
-        self.var_schedule_trunk_v_max_mps = tk.StringVar(value="2")
-        ent_vmax = tk.Entry(
-            fr_vmax,
-            textvariable=self.var_schedule_trunk_v_max_mps,
-            width=8,
-            bg="#333333",
-            fg="#ECEFF1",
-            font=("Consolas", 10, "bold"),
-            insertbackground="white",
-        )
-        ent_vmax.pack(anchor=tk.W, pady=(2, 0))
-        self._attach_tooltip(
-            ent_vmax,
-            "Верхня межа швидкості потоку в трубах магістралі. Після першого розрахунку за поливами "
-            "діаметри на ребрах дерева підбираються автоматично з дозволених труб (trunk → allowed_pipes) "
-            "так, щоб при максимальній витраті по поливах було v ≤ цього значення. Зберігається в проєкті.",
-        )
         self._attach_tooltip(
             self.cb_irrigation,
-            "Номер поливу (1–48), у який запишуться споживачі з чернетки після ПКМ на полотні.",
+            "Номер поливу (1–48), у який запишуться вибрані споживачі після ПКМ на полотні.",
         )
 
         right_ir = tk.Frame(ir_row, bg="#1e1e1e")
@@ -1671,44 +2301,6 @@ class ControlPanel:
         self.lb_irrigation_slots.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         ir_sc.config(command=self.lb_irrigation_slots.yview)
         self.lb_irrigation_slots.bind("<<ListboxSelect>>", self._schedule_on_slot_list_select)
-
-        lf_leg = tk.LabelFrame(
-            tab,
-            text="Легенда: колір лінії магістралі = домінантний полив",
-            bg="#1e1e1e",
-            fg="#88DDFF",
-            font=("Arial", 9, "bold"),
-        )
-        lf_leg.pack(fill=tk.X, padx=8, pady=(0, 6))
-        tk.Label(
-            lf_leg,
-            text="Лише заповнені поливи: кожен номер — свій колір (як кільця біля споживачів). d і Q при наведенні "
-            "на відрізок після «Розрахунок магістралі».",
-            bg="#1e1e1e",
-            fg="#999999",
-            font=("Arial", 8),
-            wraplength=300,
-            justify=tk.LEFT,
-        ).pack(anchor=tk.W, padx=6, pady=(4, 2))
-        self.canvas_irrigation_legend = tk.Canvas(
-            lf_leg,
-            width=268,
-            height=120,
-            bg="#222222",
-            highlightthickness=1,
-            highlightbackground="#444444",
-        )
-        self.canvas_irrigation_legend.pack(padx=6, pady=(0, 4))
-        self.lbl_trunk_pipe_legend = tk.Label(
-            lf_leg,
-            text="",
-            bg="#1e1e1e",
-            fg="#9DCBFA",
-            font=("Consolas", 8),
-            justify=tk.LEFT,
-            wraplength=300,
-        )
-        self.lbl_trunk_pipe_legend.pack(anchor=tk.W, padx=6, pady=(0, 6))
 
         lf_cap = tk.LabelFrame(
             tab,
@@ -1802,8 +2394,14 @@ class ControlPanel:
         self._schedule_on_irrigation_combo()
         self._render_consumer_schedule_text()
         self._sync_irrigation_legend()
-        self._sync_schedule_max_pump_head_ui()
-        self._sync_schedule_trunk_v_max_ui()
+        if not getattr(self, "_trunk_hw_tab_built", False):
+            self._sync_schedule_max_pump_head_ui()
+            self._sync_schedule_trunk_v_max_ui()
+            self._sync_schedule_trunk_min_seg_ui()
+            self._sync_schedule_trunk_max_sections_ui()
+            self._sync_schedule_trunk_opt_goal_ui()
+            self._sync_schedule_trunk_pipe_mode_ui()
+            self._sync_schedule_test_qh_ui()
 
     def _draw_irrigation_slot_legend(self) -> None:
         c = getattr(self, "canvas_irrigation_legend", None)
@@ -1817,8 +2415,12 @@ class ControlPanel:
         slots = app.consumer_schedule.get("irrigation_slots") or []
         used = [i for i in range(min(48, len(slots))) if slots[i]]
         if not used:
+            try:
+                cx = max(40, int(int(c.cget("width")) / 2))
+            except (tk.TclError, TypeError, ValueError):
+                cx = 124
             c.create_text(
-                134,
+                cx,
                 55,
                 text="Немає заповнених поливів",
                 fill="#888888",
@@ -1861,9 +2463,18 @@ class ControlPanel:
                 text="Труби на магістралі (позначення з каталогу: матеріал PN Ø): після «Розрахунок магістралі за поливами»."
             )
             return
-        sh = h.get("segment_hover")
-        if not isinstance(sh, dict) or not sh:
-            lbl.config(text="")
+        has_hw = getattr(type(app), "_trunk_irrigation_hydro_dict_has_results", lambda _x: False)(
+            h
+        )
+        sh = h.get("segment_hover") if isinstance(h.get("segment_hover"), dict) else {}
+        if not sh:
+            if has_hw:
+                lbl.config(
+                    text="Розрахунок магістралі за поливами виконано: кольори/підписи на полотні — за кешем; "
+                    "детальна легенда діаметрів з’явиться, коли для відрізків зібрано segment_hover."
+                )
+            else:
+                lbl.config(text="")
             return
         labels: dict = {}
         for row in sh.values():

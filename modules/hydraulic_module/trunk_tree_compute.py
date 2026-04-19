@@ -4,7 +4,7 @@
 Узгоджено з проєктом: втрати Hazen–Williams як у lateral_drip_core (D у метрах, Q у м³/с).
 Вузли: витік (source), поворот/розгалуження (bend, junction), споживання (consumption) з заданою Q.
 
-Стійкий режим: одна п'єзометрична висота на витоку; на листях — зазначені витрати q_demand_m3s.
+Стійкий режим: одна п'єзометрична висота на витоку; у вузлах consumption — локальні відбори q_demand_m3s.
 Опційно dz_m на ребрі: Φ_дитина = Φ_батько − hf + dz_m (dz_m = z_батько − z_дитина за замовчуванням).
 
 Подальше розширення: часові ряди Q(t), локальні втрати на трійниках, прив’язка до field_blocks.
@@ -28,7 +28,7 @@ class TrunkTreeNode:
     kind: str
     """«source» | «bend» | «junction» | «consumption»"""
     q_demand_m3s: float = 0.0
-    """Лише для consumption: витрата, що «знімається» в цьому вузлі (м³/с)."""
+    """Для consumption: витрата, що «знімається» в цьому вузлі (м³/с), навіть якщо вузол не лист."""
 
 
 @dataclass(frozen=True)
@@ -41,6 +41,7 @@ class TrunkTreeEdge:
     d_inner_mm: float
     c_hw: float = DEFAULT_HAZEN_WILLIAMS_C
     dz_m: float = 0.0
+    sections: Tuple[Tuple[float, float, float], ...] = ()
     """
     Упор на п'єзометричну лінію: H_дитина = H_батько − hf + dz_m.
     Типово dz_m = z_батько − z_дитина (напір збільшується при спуску дитини вниз).
@@ -133,6 +134,22 @@ def validate_trunk_tree(spec: TrunkTreeSpec) -> List[str]:
             err.append(f"Ребро {e.parent_id!r}→{e.child_id!r}: length_m < 0.")
         if e.d_inner_mm <= 0:
             err.append(f"Ребро {e.parent_id!r}→{e.child_id!r}: d_inner_mm має бути > 0.")
+        if e.sections:
+            s_len = 0.0
+            for si, sec in enumerate(e.sections):
+                try:
+                    lm, dmm, chw = float(sec[0]), float(sec[1]), float(sec[2])
+                except (TypeError, ValueError, IndexError):
+                    err.append(f"Ребро {e.parent_id!r}→{e.child_id!r}: некоректна секція #{si+1}.")
+                    continue
+                if lm <= 0.0 or dmm <= 0.0:
+                    err.append(f"Ребро {e.parent_id!r}→{e.child_id!r}: секція #{si+1} має невалідні L/d.")
+                s_len += max(0.0, lm)
+            if s_len > 1e-9 and abs(s_len - float(e.length_m)) > 1e-4:
+                err.append(
+                    f"Ребро {e.parent_id!r}→{e.child_id!r}: сума довжин секцій {s_len:.3f} м "
+                    f"не дорівнює length_m {float(e.length_m):.3f} м."
+                )
 
     for nid, ps in parents.items():
         if nid == spec.source_id:
@@ -168,8 +185,10 @@ def validate_trunk_tree(spec: TrunkTreeSpec) -> List[str]:
         )
 
     for n in spec.nodes:
-        if n.kind == "consumption" and children.get(n.id):
-            err.append(f"Споживання {n.id!r} не повинно мати дочірніх ребер.")
+        if n.kind == "consumption" and len(children.get(n.id, [])) > 1:
+            err.append(
+                f"Споживання {n.id!r}: допускається не більше одного дочірнього ребра (ланцюг відборів)."
+            )
         if n.kind != "consumption" and n.id != spec.source_id and not children.get(n.id):
             err.append(
                 f"Внутрішній вузол {n.id!r} без дочірніх ребер (очікується хоча б одне ребро вниз)."
@@ -194,11 +213,7 @@ def _subtree_q_m3s(
     if node_id in memo:
         return memo[node_id]
     n = nodes[node_id]
-    if n.kind == "consumption":
-        q = max(0.0, float(n.q_demand_m3s))
-        memo[node_id] = q
-        return q
-    s = 0.0
+    s = max(0.0, float(n.q_demand_m3s)) if n.kind == "consumption" else 0.0
     for e in children_edges.get(node_id, ()):
         s += _subtree_q_m3s(e.child_id, nodes, children_edges, memo)
     memo[node_id] = s
@@ -234,18 +249,33 @@ def compute_trunk_tree_steady(spec: TrunkTreeSpec) -> TrunkTreeResult:
         node_head[parent_id] = h_parent
         for e in children_edges.get(parent_id, ()):
             q = _subtree_q_m3s(e.child_id, nodes, children_edges, memo_q)
-            d_m = float(e.d_inner_mm) / 1000.0
-            hf = hazen_williams_hloss_m(q, float(e.length_m), d_m, float(e.c_hw))
+            if e.sections:
+                hf = 0.0
+                v_max = 0.0
+                d_eff_mm = float(e.d_inner_mm)
+                for sec in e.sections:
+                    lm, dmm, chw = float(sec[0]), float(sec[1]), float(sec[2])
+                    d_m_sec = dmm / 1000.0
+                    hf += hazen_williams_hloss_m(q, lm, d_m_sec, chw)
+                    area_sec = math.pi * (d_m_sec / 2.0) ** 2
+                    v_sec = q / area_sec if area_sec > 1e-18 else 0.0
+                    v_max = max(v_max, v_sec)
+                    d_eff_mm = min(d_eff_mm, dmm)
+                v = v_max
+            else:
+                d_m = float(e.d_inner_mm) / 1000.0
+                hf = hazen_williams_hloss_m(q, float(e.length_m), d_m, float(e.c_hw))
+                area = math.pi * (d_m / 2.0) ** 2
+                v = q / area if area > 1e-18 else 0.0
+                d_eff_mm = float(e.d_inner_mm)
             h_child = h_parent - hf + float(e.dz_m)
-            area = math.pi * (d_m / 2.0) ** 2
-            v = q / area if area > 1e-18 else 0.0
             edge_results.append(
                 TrunkEdgeResult(
                     parent_id=e.parent_id,
                     child_id=e.child_id,
                     q_m3s=q,
                     length_m=float(e.length_m),
-                    d_inner_mm=float(e.d_inner_mm),
+                    d_inner_mm=float(d_eff_mm),
                     c_hw=float(e.c_hw),
                     head_loss_m=hf,
                     dz_m=float(e.dz_m),

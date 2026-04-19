@@ -24,6 +24,7 @@ if str(ROOT) not in sys.path:
 from modules.hydraulic_module.submain_telescope_opt import (
     TelescopeSegment,
     optimize_submain_telescope,
+    optimize_submain_telescope_by_weight,
 )
 from main_app.ui.tooltips import attach_tooltip
 
@@ -46,9 +47,11 @@ class SubmainTelescopeCalculator(tk.Tk):
 
         self.var_h_in = tk.StringVar(value="30")
         self.var_h_end = tk.StringVar(value="20")
-        self.var_vmax = tk.StringVar(value="2.5")
+        self.var_vmax = tk.StringVar(value="0")
         self.var_c_hw = tk.StringVar(value="140")
         self.var_mat = tk.StringVar(value="PVC")
+        self.var_opt_goal = tk.StringVar(value="weight")
+        self.var_min_seg = tk.StringVar(value="0")
 
         r = 0
 
@@ -63,8 +66,19 @@ class SubmainTelescopeCalculator(tk.Tk):
         row("Напір біля насоса / початку сабмейну (м):", ttk.Entry(par, textvariable=self.var_h_in, width=12))
         row("Мін. напір у кінці / дальнього поля (м):", ttk.Entry(par, textvariable=self.var_h_end, width=12))
         row("C Hazen–Williams:", ttk.Entry(par, textvariable=self.var_c_hw, width=12))
-        row("Макс. швидкість у сабмейні (м/с):", ttk.Entry(par, textvariable=self.var_vmax, width=12))
+        row("Макс. швидкість (м/с; 0 = вимкнено):", ttk.Entry(par, textvariable=self.var_vmax, width=12))
+        row("Мін. довжина сегмента (м):", ttk.Entry(par, textvariable=self.var_min_seg, width=12))
         row("Матеріал:", ttk.Combobox(par, textvariable=self.var_mat, values=("PVC", "PE", "Layflat"), width=10, state="readonly"))
+        row(
+            "Критерій оптимізації:",
+            ttk.Combobox(
+                par,
+                textvariable=self.var_opt_goal,
+                values=("weight", "cost_index"),
+                width=12,
+                state="readonly",
+            ),
+        )
 
         tk.Label(
             par,
@@ -149,9 +163,14 @@ class SubmainTelescopeCalculator(tk.Tk):
             h_end = float(self.var_h_end.get().replace(",", "."))
             v_max = float(self.var_vmax.get().replace(",", "."))
             c_hw = float(self.var_c_hw.get().replace(",", "."))
+            min_seg = float(self.var_min_seg.get().replace(",", "."))
         except ValueError:
             silent_showerror(self, "Помилка", "Перевірте числові поля зверху.")
             return
+        min_seg = max(0.0, min(1000.0, min_seg))
+        self.var_min_seg.set(str(int(round(min_seg))) if abs(min_seg - round(min_seg)) < 1e-6 else f"{min_seg:.2f}".rstrip("0").rstrip("."))
+        v_max = max(0.0, min(8.0, v_max))
+        self.var_vmax.set("0" if v_max < 1e-12 else str(int(round(v_max))) if abs(v_max - round(v_max)) < 1e-6 else f"{v_max:.2f}".rstrip("0").rstrip("."))
         try:
             segs = self._parse_segments()
         except ValueError as e:
@@ -159,14 +178,26 @@ class SubmainTelescopeCalculator(tk.Tk):
             return
 
         try:
-            res = optimize_submain_telescope(
-                segs,
-                h_in,
-                h_end,
-                material=self.var_mat.get().strip() or "PVC",
-                c_hw=c_hw,
-                v_max_m_s=v_max,
-            )
+            if (self.var_opt_goal.get().strip().lower() or "weight") == "weight":
+                res = optimize_submain_telescope_by_weight(
+                    segs,
+                    h_in,
+                    h_end,
+                    material=self.var_mat.get().strip() or "PVC",
+                    c_hw=c_hw,
+                    v_max_m_s=v_max,
+                    min_segment_length_m=min_seg,
+                )
+            else:
+                res = optimize_submain_telescope(
+                    segs,
+                    h_in,
+                    h_end,
+                    material=self.var_mat.get().strip() or "PVC",
+                    c_hw=c_hw,
+                    v_max_m_s=v_max,
+                    min_segment_length_m=min_seg,
+                )
         except Exception as e:
             silent_showerror(self, "Помилка", str(e))
             return
@@ -186,11 +217,17 @@ class SubmainTelescopeCalculator(tk.Tk):
                 f"{p.segment_index + 1:>4}  {seg.length_m:>6.1f}  {q_h:>10.2f}  {s.d_nom_mm:>6.0f}  {s.pn:>4}  {p.v_m_s:>6.2f}  {p.hf_m:>10.3f}\n",
             )
         w.insert(tk.END, f"\nΣΔZ по сегментах: {res.total_dz_m:.3f} м\n")
-        w.insert(
-            tk.END,
-            "\nІндекс вартості — умовний (DN і PN), для порівняння варіантів у каталозі; "
-            "реальні ціни зазвичай залежать від постачальника.\n",
-        )
+        if (self.var_opt_goal.get().strip().lower() or "weight") == "weight":
+            w.insert(
+                tk.END,
+                "\nОптимізація за вагою: мінімізується сумарна маса труб при обмеженнях ΔH та v.\n",
+            )
+        else:
+            w.insert(
+                tk.END,
+                "\nІндекс вартості — умовний (DN і PN), для порівняння варіантів у каталозі; "
+                "реальні ціни зазвичай залежать від постачальника.\n",
+            )
 
 
 def main():

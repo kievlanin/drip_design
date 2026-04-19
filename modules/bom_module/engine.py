@@ -31,6 +31,8 @@ class BOMModule:
 
         grouped = {}
         for sec in sections:
+            if bool(sec.get("bom_length_zero", False)):
+                continue
             mat = sec.get("mat", "PVC")
             pn = str(sec.get("pn", "6"))
             d = str(sec.get("d", "0"))

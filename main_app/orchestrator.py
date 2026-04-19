@@ -79,6 +79,20 @@ class IrrigationOrchestrator:
     def freeze_bom(self):
         return self.bom_module.freeze(self.last_bom.get("items", []))
 
+    def trim_auxiliary_results_after_persist(self) -> None:
+        """Звільнити великі допоміжні структури після збереження проєкту / PDF (звіт уже на диску)."""
+        bom = self.last_bom or {}
+        self.last_bom = {
+            "items": list(bom.get("items") or []),
+            "fitting_items": [],
+            "frozen_count": int(bom.get("frozen_count", 0)),
+        }
+        stress = self.last_stress or {}
+        self.last_stress = {
+            "report": str(stress.get("report", "") or ""),
+            "results": {"sections": [], "valves": {}, "emitters": {}},
+        }
+
     def run_stress_test(self, hydraulic_dto):
         adjusted = dict(hydraulic_dto)
         sections = self.last_hydraulic.get("results", {}).get("sections", [])

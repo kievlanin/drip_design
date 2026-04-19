@@ -103,6 +103,59 @@ class TestTrunkTreeCompute(unittest.TestCase):
         res = compute_trunk_tree_steady(spec)
         self.assertTrue(len(res.issues) > 0)
 
+    def test_consumption_chain_node_passes_own_and_downstream_flow(self):
+        spec = TrunkTreeSpec(
+            nodes=(
+                TrunkTreeNode("S", "source"),
+                TrunkTreeNode("C1", "consumption", q_demand_m3s=0.004),
+                TrunkTreeNode("C2", "consumption", q_demand_m3s=0.003),
+            ),
+            edges=(
+                TrunkTreeEdge("S", "C1", 20.0, 90.0),
+                TrunkTreeEdge("C1", "C2", 20.0, 90.0),
+            ),
+            source_id="S",
+            source_head_m=30.0,
+        )
+        self.assertEqual(validate_trunk_tree(spec), [])
+        res = compute_trunk_tree_steady(spec)
+        self.assertEqual(res.issues, ())
+        by_pair = {(e.parent_id, e.child_id): e for e in res.edges}
+        self.assertAlmostEqual(by_pair[("S", "C1")].q_m3s, 0.007, places=9)
+        self.assertAlmostEqual(by_pair[("C1", "C2")].q_m3s, 0.003, places=9)
+        self.assertAlmostEqual(res.total_q_m3s, 0.007, places=9)
+
+    def test_edge_sections_headloss_is_sum_of_section_losses(self):
+        q = 0.006
+        sec1 = (40.0, 63.0, 140.0)
+        sec2 = (60.0, 75.0, 140.0)
+        spec = TrunkTreeSpec(
+            nodes=(
+                TrunkTreeNode("S", "source"),
+                TrunkTreeNode("C", "consumption", q_demand_m3s=q),
+            ),
+            edges=(
+                TrunkTreeEdge(
+                    "S",
+                    "C",
+                    100.0,
+                    63.0,
+                    c_hw=140.0,
+                    sections=(sec1, sec2),
+                ),
+            ),
+            source_id="S",
+            source_head_m=30.0,
+        )
+        res = compute_trunk_tree_steady(spec)
+        self.assertEqual(res.issues, ())
+        er = res.edges[0]
+        hf_exp = (
+            hazen_williams_hloss_m(q, sec1[0], sec1[1] / 1000.0, sec1[2])
+            + hazen_williams_hloss_m(q, sec2[0], sec2[1] / 1000.0, sec2[2])
+        )
+        self.assertAlmostEqual(er.head_loss_m, hf_exp, places=6)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -2,6 +2,10 @@
 _srtm_/*
 !_srtm_/.gitkeep
 
+# Кеш відповідей Overpass (osm_cad_context; за потреби)
+_osm_cad_cache_/*
+!_osm_cad_cache_/.gitkeep
+
 # Python / середовище
 .venv/
 venv/
