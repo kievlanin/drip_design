@@ -60,7 +60,7 @@ python -m main_app.main
 | Шлях | Роль |
 |------|------|
 | `main_app/main.py` | Запуск, `sys.path`, перевірка збігу з `paths.PROJECT_ROOT` |
-| `main_app/paths.py` | `PROJECT_ROOT`, `PIPES_DB_PATH`, `DESIGNS_DIR`, `SRTM_DIR` (`_srtm_`) |
+| `main_app/paths.py` | `PROJECT_ROOT`, `PIPES_DB_PATH`, `DESIGNS_DIR`, `SRTM_DIR` (`_srtm_`); **`load_earthdata_credentials_from_project_file()`** — `EarthData.txt` (.netrc) → `EARTHDATA_USER` / **`EARTHDATA_USERNAME`** / `EARTHDATA_PASSWORD` |
 | `main_app/ui/app_ui.py` | `DripCADUI` — UI + Orchestrator (топографія, розрахунок, BOM, SRTM у потоці) |
 | `main_app/ui/dripcad_legacy.py` | `DripCAD` — canvas, події, **field_blocks**, рельєф, гідравлічне відображення, snap сабмейну, графіки |
 | `main_app/ui/control_panel_impl.py` | Панель керування |
@@ -70,8 +70,8 @@ python -m main_app.main
 | `main_app/ui/tooltips.py` | Спільні тултіпи: `attach_tooltip` (панель), `attach_tooltip_dark` (карта) |
 | `main_app/io/file_io.py` | Реекспорт |
 | `main_app/orchestrator.py` | Geo / Hydraulic / BOM / stress-test; `build_contours(..., elevation_points=?, progress_cb=?, interp_method=?)` |
-| `modules/geo_module/topography_core.py` | `TopoEngine`: ізолінії (marching squares, обрізка Polygon), SRTM-сітка; сітка Z для ізоліній — **IDW** (відра **5×5**) або **кріггінг** (`interp_method`: `idw` / `kriging`, PyKrige, вікно сусідів на великих DEM, корекція варіограми після підбору); ліміти для великих полів; рівні **k×крок** або **`fixed_z_levels`** (точні рівні Z/Q — ізолінія номінального виливу на мапі) |
-| `modules/geo_module/srtm_tiles.py` | Завантаження повних 1°×1° тайлів (Skadi), читання DEM, межі тайлів на карті |
+| `modules/geo_module/topography_core.py` | `TopoEngine`: ізолінії (marching squares, обрізка Polygon), SRTM-сітка; сітка Z — **IDW** або **кріггінг**; **згладжування сітки Z** перед marching squares (`_CONTOUR_GRID_Z_SMOOTH_PASSES`); `_fetch_earthdata_batch` підхоплює креди з **`load_earthdata_credentials_from_project_file`**; рівні **k×крок** / **`fixed_z_levels`** |
+| `modules/geo_module/srtm_tiles.py` | Завантаження 1°×1° тайлів: **Skadi**, **Earthdata** (власний URL або **`earthaccess` + SRTMGL1**), **`configure_earthdata_tk_bridge`** + діалог логіну; межі тайлів на карті |
 | `modules/geo_module/engine.py` | `GeoModule` |
 | `modules/hydraulic_module/__init__.py` | Лінивий імпорт `HydraulicModule` (`__getattr__`) — імпорт `lateral_drip_core` без Shapely |
 | `modules/hydraulic_module/lateral_drip_core.py` | 1D латераль (HW, shooting) **без Shapely** |
@@ -162,7 +162,7 @@ python -m main_app.main
 - **Ізолінії:** межа обрізки — спочатку **рамка зони проєкту** (з карти, `project_zone_bounds_local`), далі **KML зони SRTM** (якщо імпортовано), інакше об’єднання блоків поля, інакше опукла оболонка за точками висоти. Побудова в **фоновому потоці** (UI не блокується); прогрес у **заголовку вікна**; кнопки **«Побудувати ізолінії»** (IDW) і **«Побудувати ізолінії (кріггінг)»** (`btn_build_contours_kriging`). Для великих площ автоматично згрублюються крок сітки та/або крок висоти (з повідомленням і `last_contour_adaptation_note` на `TopoEngine`). Висоти ізоліній — **кратні кроку з панелі** (при згрубленні — `mult × крок`). Кріггінг зазвичай дає **менш шумну** поверхню порівняно з IDW; обидва методи лишаються паралельно.
 - **Меню «Інструменти»:** запуск у окремому процесі `lateral_field_calculator.py` та `submain_telescope_calculator.py` (`subprocess`, `cwd=PROJECT_ROOT`).
 - **Панель малювання:** з правої панелі прибрано; на вкладці **«Карта»** — ліва колонка: **зверху зона** (тайли, контур, шари), **знизу** окрема панель з вкладками **Малювання / Магістраль** (`map_viewer_tk_window.py`, `PanedWindow`). Поле **`L (м)`** — у правій панелі над статистикою.
-- **Рельєф / SRTM:** імпорт KML зони, завантаження тайлів у `_srtm_` (пропуск файлів, що вже є в кеші), «Завантажити з супутника» спочатку читає локальні `.hgt`, далі Open-Meteo для «дір». **Крок сітки точок висоти** при завантаженні DEM — випадач **«Роздільна здатність»**: **5, 15, 30, 45, 90** м (окремо від поля **«Розмір сітки (м)»** для ізоліній). На полотні та на карті — показ **меж кешу** (чекбокс **«Межі кешу»** на карті, на вкладці «Рельєф» — **«Межі кешу (_srtm_ / DEM)»**); також чекбокси рамки зони рельєфу та межі SRTM (для чистого PDF). Зона проєкту на карті + кнопки **тайли + висоти (зона)** узгоджені з панеллю «Рельєф».
+- **Рельєф / SRTM:** імпорт KML зони, завантаження тайлів у `_srtm_` (пропуск файлів, що вже є в кеші), «Завантажити з супутника» спочатку читає локальні `.hgt`, далі резервні API (Open-Elevation / Earthdata за режимом). **Крок сітки точок висоти** — **«Роздільна здатність»**: **5, 15, 30, 45, 90** м. **Межі кешу** на карті / «Рельєф». Зона проєкту на карті: кнопка **«Тайли»** на вкладці «Рельєф» — **лише** завантаження `.hgt` у `_srtm_` (без заливки висот у модель); висоти — окремо. **EarthData.txt** у корені (формат .netrc) або env; для **earthaccess** обов’язково узгоджені **`EARTHDATA_USERNAME`** + пароль; при помилці входу — **діалог** у головному вікні.
 - **Вкладка «Карта»:** відкрита карта задає **`geo_ref`** з центру виду (якщо ще порожньо); малювання контуру поля на карті показує уже покладені сегменти та гумку; лінійка масштабу — окремий шар над картою; тултіпи кнопок режимів на карті — **зверху** (`attach_tooltip_dark`, `above=True`); більшість кнопок карти й панелі керування мають **українські tooltips** (`main_app/ui/tooltips.py`).
 - **Магістраль + «Інфо»:** інструмент **Інфо** на полотні «Без карти» і на карті (потрібен `geo_ref`): при наведенні на **магістраль** підсвічується **жовтим** шлях до насоса; на **розгалуженні** — додатково **лаймом** гілки до **споживачів**. ЛКМ — діалог з підписом об’єкта (пріоритети як у `_collect_world_pick_hits`). Деталі — `dripcad_legacy.py` (`trunk_info_highlight_world_paths`, `_collect_world_pick_hits`), `map_viewer_tk_window.py` (`_paint_map_live_preview`, `<Motion>` для `map_pick_info`).
 - **«Вибір» (`select`):** лише на **полотні «Без карти»** (на вкладці «Карта» інструмент маршрутизується на віджет карти). Та сама логіка підбору, що **«Інфо»**, але **після ЛКМ** вибір **залишається підсвіченим**; **рамка / кросрамка** для множинного вибору; **ПКМ** — спочатку скинути вибір, потім вийти. Код: `dripcad_legacy.py` (`handle_left_release`, `_draw_canvas_selection_layer`, `_pick_hits_in_world_rect`); кнопка з діагональною стрілкою — `map_left_draw_widgets.py`.
@@ -182,6 +182,7 @@ python -m main_app.main
 - **Обов’язково для основного CAD:** `tkinter` (зазвичай з Python), `shapely`
 - **Опційно:** окремі скрипти `lateral_field_calculator.py` / частина `hydraulic_module` можуть працювати **без Shapely** (ядро `lateral_drip_core`, `lateral_field_compute`, `manifold_block_coupling`, `submain_telescope_opt`).
 - **Для ізоліній кріггінгом:** `numpy`, `scipy`, `pykrige` — див. **`requirements-contours-optional.txt`** (`pip install -r requirements-contours-optional.txt`); без них кнопка кріггінгу покаже підказку про встановлення.
+- **Для завантаження тайлів SRTM через NASA (earthaccess):** `earthaccess` у **`requirements-dem.txt`** (`pip install -r requirements-dem.txt` або окремо `pip install earthaccess`).
 - **Для PDF-експорту:** `fpdf2`, `Pillow`
 
 Перевірка імпортів:
@@ -421,4 +422,13 @@ py -c "import tkinter, shapely; print('ok')"
 - **Пайплайн виклику:** `main_app/ui/app_ui.py` -> `main_app/orchestrator.py` -> `modules/geo_module/engine.py` -> `topography_core.fetch_srtm_grid(..., source_mode=...)`; в повідомленні успіху показується активний provider.
 - **Збереження/завантаження:** у `main_app/io/file_io_impl.py` нормалізується і зберігається `consumer_schedule.srtm_source_mode`; після `load_project` відновлюється дропліст/стан верхньої панелі.
 
-*Останнє оновлення опису: 2026-04-21 — додано вибір джерела висот у верхній панелі, автоfallback `Skadi/локальні -> Open-Elevation -> Earthdata`, опційний Earthdata через env-креди, і серіалізацію `consumer_schedule.srtm_source_mode` у JSON.*
+## Нотатка сесії 2026-04-22 (SRTM tiles, EarthData, ізолінії, UI рельєфу)
+
+- **`srtm_tiles`:** завантаження тайлів через **`earthaccess`** (SRTMGL1 LP DAAC), якщо немає `EARTHDATA_SRTM_TILE_BASE`; **`configure_earthdata_tk_bridge`** + модальний діалог логін/пароль при невдалому вході; стратегії `login` без stdin з фонового потоку в GUI (`environment` / `netrc`).
+- **`paths.py`:** `EarthData.txt` → env; синхрон **USER** ↔ **USERNAME** для earthaccess.
+- **`.gitignore`:** `EarthData.txt` (варіанти).
+- **`app_ui` / `control_panel_impl`:** кнопка **«Тайли»** — лише тайли за зоною проєкту (`download_srtm_tiles_for_project_zone`).
+- **`topography_core`:** згладжування сітки Z перед ізолініями; `_fetch_earthdata_batch` + файл кредів.
+- **GitHub:** коміти `82e63d2` (ширший пакет), `fe4977d` (Earthdata UI/USERNAME/діалог).
+
+*Останнє оновлення опису: 2026-04-22 — earthaccess для тайлів, EarthData.txt + USERNAME, діалог логіну, кнопка «Тайли» лише для .hgt, згладжування сітки для ізоліній, оновлення документації.*
