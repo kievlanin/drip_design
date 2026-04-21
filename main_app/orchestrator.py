@@ -47,18 +47,20 @@ class IrrigationOrchestrator:
         }
         return self.geo_module.build_contours(dto)
 
-    def fetch_srtm_grid(self, boundary_coords, geo_ref, resolution):
+    def fetch_srtm_grid(self, boundary_coords, geo_ref, resolution, source_mode="auto"):
         dto = {
             "boundary_coords": boundary_coords,
             "geo_ref": geo_ref,
             "resolution": resolution,
+            "source_mode": source_mode,
         }
         return self.geo_module.fetch_srtm_grid(dto)
 
-    def download_srtm_tiles(self, geo_ref, bounds_xy):
+    def download_srtm_tiles(self, geo_ref, bounds_xy, source_mode="auto"):
         dto = {
             "geo_ref": geo_ref,
             "bounds_xy": bounds_xy,
+            "source_mode": source_mode,
         }
         return self.geo_module.download_srtm_tiles(dto)
 

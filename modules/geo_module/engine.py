@@ -51,8 +51,18 @@ class GeoModule:
         boundary_coords = dto.get("boundary_coords", [])
         geo_ref = dto.get("geo_ref")
         resolution = float(dto.get("resolution", 30.0))
-        count = self.engine.fetch_srtm_grid(boundary_coords, geo_ref, resolution)
-        return {"count": count, "elevation_points": self.get_elevation_points()}
+        source_mode = str(dto.get("source_mode", "auto") or "auto")
+        res = self.engine.fetch_srtm_grid(
+            boundary_coords,
+            geo_ref,
+            resolution,
+            source_mode=source_mode,
+        )
+        if isinstance(res, dict):
+            out = dict(res)
+            out.setdefault("elevation_points", self.get_elevation_points())
+            return out
+        return {"count": int(res), "elevation_points": self.get_elevation_points()}
 
     def download_srtm_tiles(self, dto):
         from modules.geo_module import srtm_tiles
@@ -62,5 +72,8 @@ class GeoModule:
         if not geo_ref or not bb or len(bb) != 4:
             raise ValueError("Потрібні bounds (minx,miny,maxx,maxy) і гео-прив'язка.")
         minx, miny, maxx, maxy = bb
-        return srtm_tiles.download_tiles_for_xy_bounds(float(minx), float(miny), float(maxx), float(maxy), tuple(geo_ref))
+        tile_src = srtm_tiles.tile_source_for_schedule_mode(str(dto.get("source_mode", "auto") or "auto"))
+        return srtm_tiles.download_tiles_for_xy_bounds(
+            float(minx), float(miny), float(maxx), float(maxy), tuple(geo_ref), tile_source=tile_src
+        )
 

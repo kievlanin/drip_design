@@ -4,6 +4,7 @@ import unittest
 
 from modules.hydraulic_module.trunk_irrigation_schedule_hydro import (
     compute_trunk_irrigation_schedule_hydro,
+    estimate_min_pump_head_m_uniform_largest_allowed_pipe,
     optimize_trunk_diameters_by_weight,
 )
 
@@ -25,6 +26,41 @@ class TestTrunkIrrigationScheduleHydro(unittest.TestCase):
         self.assertFalse(issues)
         ps0 = cache["per_slot"].get("0", {})
         self.assertAlmostEqual(float(ps0.get("total_q_m3s", 0.0)), 60.0 / 3600.0, places=8)
+
+    def test_mismatched_section_length_sum_is_rescaled_to_segment_geometry(self):
+        """Сума length_m у телескопі ≠ фактична L ребра з карти — розрахунок не має падати (автоузгодження)."""
+        nodes, segs = self._basic_nodes_and_segments()
+        tree = {
+            "source_id": "S",
+            "source_head_m": 50.0,
+            "nodes": [],
+            "edges": [
+                {
+                    "parent_id": "S",
+                    "child_id": "C1",
+                    "length_m": 999.0,
+                    "d_inner_mm": 100.0,
+                    "c_hw": 140.0,
+                    "sections": [
+                        {"length_m": 30.0, "d_inner_mm": 100.0, "c_hw": 140.0},
+                        {"length_m": 20.0, "d_inner_mm": 100.0, "c_hw": 140.0},
+                    ],
+                }
+            ],
+        }
+        slots = [["C1"]]
+        cache, issues = compute_trunk_irrigation_schedule_hydro(
+            nodes,
+            segs,
+            slots,
+            tree,
+            pump_operating_head_m=50.0,
+            use_required_pump_head=False,
+        )
+        self.assertFalse(issues)
+        ps0 = cache["per_slot"].get("0", {})
+        self.assertIsNotNone(ps0)
+        self.assertFalse(ps0.get("issues"))
 
     def test_schedule_q_ignores_branch_count_fields(self):
         nodes, segs = self._basic_nodes_and_segments()
@@ -65,6 +101,34 @@ class TestTrunkIrrigationScheduleHydro(unittest.TestCase):
         self.assertIn("1", sh)
         self.assertIn("2", sh)
 
+    def test_estimate_min_pump_head_uniform_largest_allowed_pipe(self):
+        """При 0 у полі насоса: оцінка H за однорідною найтовстішою дозволеною трубою."""
+        nodes, segs = self._basic_nodes_and_segments()
+        nodes[1]["trunk_schedule_q_m3h"] = 40.0
+        nodes[1]["trunk_schedule_h_m"] = 16.0
+        slots = [["C1"]]
+        pipes_db = {
+            "PE": {
+                "6": {
+                    "63": {"id": 58.2, "weight_kg_m": 1.7},
+                    "90": {"id": 83.0, "weight_kg_m": 3.0},
+                }
+            }
+        }
+        eff = {"PE": {"6": ["63", "90"]}}
+        m = estimate_min_pump_head_m_uniform_largest_allowed_pipe(
+            nodes,
+            segs,
+            slots,
+            pipes_db=pipes_db,
+            eff_allowed_pipes=eff,
+            q_consumer_m3h=60.0,
+            target_head_m=40.0,
+        )
+        self.assertIsNotNone(m)
+        self.assertGreater(float(m), 16.0)
+        self.assertLessEqual(float(m), 220.0)
+
     def test_fixed_pump_envelope_has_min_required_source_head(self):
         """У режимі заданого H насоса в envelope є оцінка мінімального напору на джерелі."""
         nodes, segs = self._basic_nodes_and_segments()
@@ -89,6 +153,147 @@ class TestTrunkIrrigationScheduleHydro(unittest.TestCase):
         self.assertAlmostEqual(
             float(ps0.get("min_required_source_head_m", 0.0)), float(mrs), places=6
         )
+
+    def test_surface_z_at_xy_applies_dz_along_edges(self):
+        """dz_m = Z(батько)−Z(дитина): при нахилі рельєфу вздовж X напір у споживача зменшується на ΔZ."""
+        nodes, segs = self._basic_nodes_and_segments()
+        slots = [["C1"]]
+        c0, iss0 = compute_trunk_irrigation_schedule_hydro(nodes, segs, slots, {}, pump_operating_head_m=50.0)
+        self.assertFalse(iss0)
+
+        def z_slope(x, y):
+            return 0.1 * float(x)
+
+        c1, iss1 = compute_trunk_irrigation_schedule_hydro(
+            nodes, segs, slots, {}, pump_operating_head_m=50.0, surface_z_at_xy=z_slope
+        )
+        self.assertFalse(iss1)
+        h0 = float(c0["per_slot"]["0"]["node_head_m"]["C1"])
+        h1 = float(c1["per_slot"]["0"]["node_head_m"]["C1"])
+        self.assertAlmostEqual(h0 - h1, 10.0, places=4)
+
+    def test_synthetic_dz_keeps_min_consumer_head_near_target(self):
+        """Регресія: для synthetic dz робочий підбір тримає min_consumer_head_m у межах target ±0.5 м."""
+        nodes = [
+            {"id": "S", "kind": "source", "x": 0.0, "y": 0.0},
+            {
+                "id": "C1",
+                "kind": "consumption",
+                "x": 300.0,
+                "y": 0.0,
+                "trunk_schedule_q_m3h": 40.0,
+                "trunk_schedule_h_m": 10.0,
+            },
+        ]
+        segs = [{"node_indices": [0, 1], "path_local": [(0.0, 0.0), (300.0, 0.0)]}]
+        slots = [["C1"]]
+        pipes_db = {
+            "PE": {
+                "6": {
+                    "63": {"id": 58.2, "weight_kg_m": 1.1},
+                    "75": {"id": 69.2, "weight_kg_m": 1.5},
+                    "90": {"id": 83.0, "weight_kg_m": 2.2},
+                    "110": {"id": 103.6, "weight_kg_m": 3.5},
+                }
+            }
+        }
+        pump_head_m = 30.0
+        target_head_m = 10.0
+        edge_len_m = 300.0
+        for dz in (-6.0, 0.0, 2.5):
+            with self.subTest(dz_m=dz):
+                dz_m = float(dz)
+
+                def z_synthetic(x, _y, dz_cur=dz_m):
+                    return dz_cur * (float(x) / edge_len_m)
+
+                budget_hf = float(pump_head_m - target_head_m - dz_m)
+                self.assertGreater(budget_hf, 0.1)
+                out, opt_issues = optimize_trunk_diameters_by_weight(
+                    trunk_nodes=nodes,
+                    trunk_segments=segs,
+                    irrigation_slots=slots,
+                    pipes_db=pipes_db,
+                    material="PE",
+                    max_head_loss_m=budget_hf,
+                    max_velocity_mps=0.0,
+                    default_q_m3h=40.0,
+                    min_segment_length_m=0.0,
+                    max_sections_per_edge=4,
+                    objective="weight",
+                    pump_operating_head_m=pump_head_m,
+                    schedule_target_head_m=target_head_m,
+                    surface_z_at_xy=z_synthetic,
+                )
+                self.assertFalse(opt_issues)
+                self.assertTrue(out.get("feasible"), msg=str(out.get("message", "")))
+                picks = out.get("picks") or []
+                self.assertTrue(picks)
+
+                edges_payload = []
+                for p in picks:
+                    if not isinstance(p, dict):
+                        continue
+                    eid = str(p.get("edge_id", "")).strip()
+                    if "->" not in eid:
+                        continue
+                    pid, cid = eid.split("->", 1)
+                    edges_payload.append(
+                        {
+                            "parent_id": pid.strip(),
+                            "child_id": cid.strip(),
+                            "d_inner_mm": float(p.get("d_inner_mm", 90.0)),
+                            "c_hw": 140.0,
+                            "sections": list(p.get("sections") or []),
+                        }
+                    )
+                self.assertTrue(edges_payload)
+
+                cache, hydro_issues = compute_trunk_irrigation_schedule_hydro(
+                    nodes,
+                    segs,
+                    slots,
+                    {"edges": edges_payload},
+                    pump_operating_head_m=pump_head_m,
+                    target_head_m=target_head_m,
+                    q_consumer_m3h=40.0,
+                    max_pipe_velocity_mps=0.0,
+                    use_required_pump_head=False,
+                    surface_z_at_xy=z_synthetic,
+                )
+                self.assertFalse(hydro_issues)
+                row = (cache.get("per_slot") or {}).get("0") or {}
+                self.assertFalse(row.get("issues"))
+                mh = row.get("min_consumer_head_m")
+                self.assertIsNotNone(mh)
+                self.assertLessEqual(abs(float(mh) - target_head_m), 0.5)
+
+    def test_pump_suction_offset_adds_topo_z_to_operating_delta(self):
+        """З pump_suction_xy_offset_m + topo: H_джерела = Z(всмоктування) + ΔH (поле насоса)."""
+        nodes, segs = self._basic_nodes_and_segments()
+        nodes[0]["pump_suction_xy_offset_m"] = [100.0, 0.0]
+        slots = [["C1"]]
+
+        def z_flat(_x, _y):
+            return 5.0
+
+        c0, iss0 = compute_trunk_irrigation_schedule_hydro(
+            nodes, segs, slots, {}, pump_operating_head_m=30.0, surface_z_at_xy=z_flat
+        )
+        self.assertFalse(iss0)
+        lim0 = c0.get("limits") or {}
+        self.assertAlmostEqual(float(lim0.get("effective_pump_source_head_m", 0.0)), 35.0, places=6)
+        self.assertEqual(str(lim0.get("pump_source_head_mode")), "suction_z_plus_delta")
+
+    def test_pump_install_geodetic_dz_adds_to_absolute_head(self):
+        nodes, segs = self._basic_nodes_and_segments()
+        nodes[0]["pump_install_geodetic_dz_m"] = 3.5
+        slots = [["C1"]]
+        c0, iss0 = compute_trunk_irrigation_schedule_hydro(nodes, segs, slots, {}, pump_operating_head_m=40.0)
+        self.assertFalse(iss0)
+        lim0 = c0.get("limits") or {}
+        self.assertAlmostEqual(float(lim0.get("effective_pump_source_head_m", 0.0)), 43.5, places=6)
+        self.assertEqual(str(lim0.get("pump_source_head_mode")), "absolute_plus_geodetic_dz")
 
     def test_two_slots_different_edge_flows(self):
         """Різні слоти дають різний Q на ребрах (динаміка Q(t))."""

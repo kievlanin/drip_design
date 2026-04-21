@@ -197,27 +197,43 @@ class DripCADUI(DripCAD):
 
         self.orchestrator.sync_topography_from_ui(self.topo)
         boundary = geom
+        source_mode = "auto"
+        if hasattr(self, "normalize_consumer_schedule"):
+            self.normalize_consumer_schedule()
+        try:
+            source_mode = str(
+                (getattr(self, "consumer_schedule", None) or {}).get("srtm_source_mode", "auto")
+            ).strip().lower()
+        except Exception:
+            source_mode = "auto"
 
-        def _task():
-            try:
-                result = self.orchestrator.fetch_srtm_grid(boundary, self.geo_ref, res)
-                self.root.after(0, _on_success, result["count"])
-            except Exception as err:
-                self.root.after(0, _on_error, str(err))
-
-        def _on_success(count):
+        def _on_success(count, result=None):
+            result = result or {}
             self.orchestrator.sync_topography_to_ui(self.topo)
             self.cached_contours = []
             self.zoom_to_fit()
             self.redraw()
             if hasattr(self, "sync_srtm_model_status"):
                 self.sync_srtm_model_status()
+            active_provider = str(result.get("active_provider", "skadi_local") or "skadi_local")
+            self._srtm_active_provider = active_provider
+            if hasattr(self, "sync_srtm_source_mode_widgets"):
+                self.sync_srtm_source_mode_widgets()
             if hasattr(self.control_panel, "btn_srtm"):
                 self.control_panel.btn_srtm.config(state=tk.NORMAL, text="🌐 Завантажити з супутника")
+            provider_ui = {
+                "skadi_local": "локальні/Skadi",
+                "open_elevation": "Open-Elevation",
+                "earthdata": "NASA Earthdata",
+            }.get(active_provider, active_provider)
+            fallback_chain = result.get("fallback_chain_used") or []
+            fallback_msg = ""
+            if isinstance(fallback_chain, list) and len(fallback_chain) > 1:
+                fallback_msg = f"\nFallback: {' -> '.join(str(x) for x in fallback_chain)}"
             silent_showinfo(self.root, 
                 "Успіх",
                 f"Побудовано {count} точок висоти.\n"
-                "Дані з папки _srtm_, за відсутності тайла — з відкритого API (Open-Meteo).",
+                f"Активне джерело: {provider_ui}.{fallback_msg}",
             )
 
         def _on_error(err):
@@ -228,7 +244,19 @@ class DripCADUI(DripCAD):
         if hasattr(self.control_panel, "btn_srtm"):
             self.control_panel.btn_srtm.config(state=tk.DISABLED, text="⏳ Очікування API...")
 
-        threading.Thread(target=_task, daemon=True).start()
+        def _task_wrapped():
+            try:
+                result = self.orchestrator.fetch_srtm_grid(
+                    boundary,
+                    self.geo_ref,
+                    res,
+                    source_mode=source_mode,
+                )
+                self.root.after(0, _on_success, result.get("count", 0), result)
+            except Exception as err:
+                self.root.after(0, _on_error, str(err))
+
+        threading.Thread(target=_task_wrapped, daemon=True).start()
 
     def download_srtm_tiles(self):
         bb = self.field_download_bounds_xy()
@@ -243,10 +271,19 @@ class DripCADUI(DripCAD):
             return
 
         self.orchestrator.sync_topography_from_ui(self.topo)
+        source_mode = "auto"
+        if hasattr(self, "normalize_consumer_schedule"):
+            self.normalize_consumer_schedule()
+        try:
+            source_mode = str(
+                (getattr(self, "consumer_schedule", None) or {}).get("srtm_source_mode", "auto")
+            ).strip().lower()
+        except Exception:
+            source_mode = "auto"
 
         def _task():
             try:
-                results = self.orchestrator.download_srtm_tiles(self.geo_ref, bb)
+                results = self.orchestrator.download_srtm_tiles(self.geo_ref, bb, source_mode=source_mode)
                 self.root.after(0, _on_ok, results)
             except Exception as err:
                 self.root.after(0, _on_err, str(err))
@@ -269,6 +306,15 @@ class DripCADUI(DripCAD):
             if hasattr(self.control_panel, "btn_srtm_dl"):
                 self.control_panel.btn_srtm_dl.config(state=tk.NORMAL, text="⬇ Тайли SRTM у _srtm_ (за KML/полем)")
             silent_showerror(self.root, "Помилка", f"Не вдалося завантажити тайли:\n{err}")
+
+        if source_mode == "open_elevation":
+            silent_showwarning(
+                self.root,
+                "SRTM",
+                "Open-Elevation не надає файли тайлів .hgt.\n"
+                "Оберіть у верхній панелі «Skadi+локальні» або «NASA Earthdata» (earthaccess / LP DAAC або EARTHDATA_SRTM_TILE_BASE).",
+            )
+            return
 
         if hasattr(self.control_panel, "btn_srtm_dl"):
             self.control_panel.btn_srtm_dl.config(state=tk.DISABLED, text="⏳ Завантаження тайлів…")
@@ -335,27 +381,40 @@ class DripCADUI(DripCAD):
             x += res
         return pts, total
 
-    def prepare_map_project_zone_pipeline(self):
-        """З карти: завантажити тайли за рамкою зони (за потреби) і залити DEM з обраним кроком (5–90 м)."""
+    def download_srtm_tiles_for_project_zone(self):
+        """Лише завантажити .hgt у _srtm_ за рамкою зони проєкту; висоти — окремо («Завантажити з супутника» тощо)."""
         if getattr(self, "project_zone_bounds_local", None) is None:
-            silent_showwarning(self.root, 
+            silent_showwarning(
+                self.root,
                 "Зона проєкту",
                 "На вкладці «Карта»: інструмент «Зона проєкту (рамка)» — потягніть прямокутник ЛКМ.\n"
-                "Далі натисніть «Тайли + висоти (зона)» на карті або підготуйте зону тут.",
+                "Далі натисніть «Тайли» тут або завантажте тайли за KML/полем.",
             )
             return
         if getattr(self, "geo_ref", None) is None:
             silent_showwarning(self.root, "Увага", "Потрібна геоприв'язка (задається при першій рамці або з KML).")
             return
-        try:
-            res = float(self.var_srtm_res.get().replace(",", "."))
-            if res <= 0:
-                raise ValueError
-        except Exception:
-            res = 30.0
 
         self.orchestrator.sync_topography_from_ui(self.topo)
         bb = self.project_zone_bounds_local
+        source_mode = "auto"
+        if hasattr(self, "normalize_consumer_schedule"):
+            self.normalize_consumer_schedule()
+        try:
+            source_mode = str(
+                (getattr(self, "consumer_schedule", None) or {}).get("srtm_source_mode", "auto")
+            ).strip().lower()
+        except Exception:
+            source_mode = "auto"
+
+        if source_mode == "open_elevation":
+            silent_showwarning(
+                self.root,
+                "Зона проєкту",
+                "Open-Elevation не надає завантаження тайлів .hgt.\n"
+                "Оберіть «Skadi+локальні» або «NASA Earthdata» (earthaccess або EARTHDATA_SRTM_TILE_BASE), потім повторіть.",
+            )
+            return
 
         btn_map = getattr(self, "_map_prepare_zone_button", None)
         btn_cp = getattr(getattr(self, "control_panel", None), "btn_prepare_zone", None)
@@ -368,41 +427,33 @@ class DripCADUI(DripCAD):
                     except tk.TclError:
                         pass
 
-        _set_prepare_btns(tk.DISABLED, "⏳ Тайли + висоти…")
+        _set_prepare_btns(tk.DISABLED, "⏳ Тайли…")
 
         def _task():
             try:
-                self.orchestrator.download_srtm_tiles(self.geo_ref, bb)
-                pts, total = self._compute_local_dem_pts_from_bounds(bb, res)
-                self.root.after(0, _done, pts, total, None)
+                results = self.orchestrator.download_srtm_tiles(self.geo_ref, bb, source_mode=source_mode)
+                self.root.after(0, _done, results, None)
             except Exception as err:
-                self.root.after(0, _done, None, 0, str(err))
+                self.root.after(0, _done, None, str(err))
 
-        def _done(pts, total, err):
-            _set_prepare_btns(tk.NORMAL, "⬇ Тайли + висоти (зона)")
+        def _done(results, err):
+            _set_prepare_btns(tk.NORMAL, "⬇ Тайли")
             if hasattr(self, "sync_srtm_model_status"):
                 self.sync_srtm_model_status()
             if err is not None:
                 silent_showerror(self.root, "Помилка", err)
                 return
-            if not pts:
-                silent_showwarning(self.root, 
-                    "SRTM",
-                    "Точок висоти не отримано. Перевірте тайли в _srtm_ і крок сітки на вкладці «Рельєф».",
-                )
-                return
-            self.topo.clear()
-            for x, y, z in pts:
-                self.topo.add_point(float(x), float(y), float(z))
-            self.cached_contours = []
-            self.zoom_to_fit()
-            self.redraw()
+            ok_n = sum(1 for _n, m in results if "завантажено" in m or "вже є" in m)
+            lines = "\n".join(f"{n}: {msg}" for n, msg in results[:40])
+            if len(results) > 40:
+                lines += f"\n… ще {len(results) - 40} рядків"
             if hasattr(self, "_schedule_embedded_map_overlay_refresh"):
                 self._schedule_embedded_map_overlay_refresh()
-            silent_showinfo(self.root, 
-                "Зона проєкту",
-                f"Готово.\nТочок висоти: {len(pts)} / {total} (крок {res:g} м).\n"
-                "Перейдіть на основне полотно — малюйте блоки та виконуйте розрахунок.",
+            silent_showinfo(
+                self.root,
+                "Тайли SRTM (зона)",
+                f"Папка: _srtm_ у корені проєкту.\nУспішно: {ok_n} / {len(results)}\n\n{lines}\n\n"
+                "Щоб залити висоти в модель рельєфу, використайте «Завантажити з супутника» або «Лише висоти з _srtm_».",
             )
 
         threading.Thread(target=_task, daemon=True).start()

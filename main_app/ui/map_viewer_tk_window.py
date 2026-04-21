@@ -226,7 +226,7 @@ def create_embedded_map_panel(parent: tk.Misc, app=None):
                     host._scale_bar_after_id = None
 
     view_state = {
-        "active_tool": "select",
+        "active_tool": None,
         "draft_points": [],
         "draft_path": None,
         "kml_paths": [],
@@ -1563,8 +1563,7 @@ def create_embedded_map_panel(parent: tk.Misc, app=None):
     )
 
     def _set_tool(name):
-        if name is None:
-            name = "select"
+        """None — навігація (ЛКМ+drag на тайлах tkintermapview); «Вибір»/«Інфо» — окремі active_tool."""
         pd = view_state.get("pz_drag")
         if pd and pd.get("rect") is not None:
             try:
@@ -1832,9 +1831,21 @@ def create_embedded_map_panel(parent: tk.Misc, app=None):
                 f"Знайдено в кеші: {existing_n}/{len(tiles)}.",
             )
             return
-        if not silent_askyesno(_map_silent_parent(), 
+        tile_src = srtm_tiles.resolve_tile_source_from_app(app)
+        if tile_src == "open_elevation":
+            silent_showwarning(
+                _map_silent_parent(),
+                "SRTM",
+                "Open-Elevation не надає файли тайлів .hgt.\n"
+                "У верхній панелі оберіть «Skadi+локальні» або «NASA Earthdata» (earthaccess або EARTHDATA_SRTM_TILE_BASE).",
+            )
+            return
+        src_tile_label = {"skadi": "Skadi (AWS)", "earthdata": "NASA Earthdata"}.get(tile_src, tile_src)
+        if not silent_askyesno(
+            _map_silent_parent(),
             "SRTM",
             f"Джерело меж: {src_label}\n"
+            f"Джерело тайлів: {src_tile_label}\n"
             f"Всього в межах: {len(tiles)}\n"
             f"Уже в кеші: {existing_n}\n"
             f"До завантаження: {len(missing_tiles)}\n\n"
@@ -1842,21 +1853,19 @@ def create_embedded_map_panel(parent: tk.Misc, app=None):
         ):
             return
 
-        _btn_dl.config(state=tk.DISABLED, text="⏳ Тайли…")
         dl_status.set(f"SRTM: 0/{len(missing_tiles)}")
 
         def _task():
             srtm_tiles.ensure_srtm_dir()
             ok_n = 0
             for i, (la, lo) in enumerate(missing_tiles, start=1):
-                ok, _msg = srtm_tiles.download_tile(la, lo)
+                ok, _msg = srtm_tiles.download_tile(la, lo, tile_source=tile_src)
                 if ok:
                     ok_n += 1
                 host.after(0, lambda i=i, ok_n=ok_n: dl_status.set(f"SRTM: {i}/{len(missing_tiles)}, успішно {ok_n}"))
             host.after(0, lambda: _finish(ok_n, len(missing_tiles), existing_n, len(tiles)))
 
         def _finish(ok_n, total_downloaded, existed_n, total_all):
-            _btn_dl.config(state=tk.NORMAL, text="⬇ Лише тайли SRTM")
             dl_status.set(
                 f"SRTM: завершено, нових {ok_n}/{total_downloaded}, "
                 f"в кеші {existed_n + ok_n}/{total_all}"
@@ -1969,13 +1978,18 @@ def create_embedded_map_panel(parent: tk.Misc, app=None):
             return True
         if view_state.get("pz_drag"):
             return True
-        if view_state.get("active_tool") in _MAP_TOOLS_POLYLINE | _MAP_TOOLS_TRUNK_POINT | _MAP_TOOLS_PASSIVE:
+        if view_state.get("active_tool") in _MAP_TOOLS_POLYLINE | _MAP_TOOLS_TRUNK_POINT:
             return True
         if view_state.get("active_tool") == "project_zone_rect":
             return True
         if app is None:
             return False
         m = app.mode.get()
+        # Режим PAN: перетягування тайлів (tkintermapview mouse_move), пасивні інструменти не блокують.
+        if m == "PAN":
+            return False
+        if view_state.get("active_tool") in _MAP_TOOLS_PASSIVE:
+            return True
         return m not in ("VIEW", "PAN")
 
     def _b1_press_chain(event):
@@ -2013,7 +2027,8 @@ def create_embedded_map_panel(parent: tk.Misc, app=None):
             }
             return "break"
         tool = view_state.get("active_tool")
-        if tool in _MAP_TOOLS_PASSIVE:
+        # У PAN пасивні інструменти не забирають ЛКМ — інакше зум (колесо) працює, а drag по тайлах ні.
+        if tool in _MAP_TOOLS_PASSIVE and not (app is not None and app.mode.get() == "PAN"):
             if app is None or not getattr(app, "geo_ref", None):
                 silent_showinfo(_map_silent_parent(), 
                     "Інфо",
@@ -2685,7 +2700,7 @@ def create_embedded_map_panel(parent: tk.Misc, app=None):
     ).pack(fill=tk.X, padx=8, pady=(8, 2))
     tk.Label(
         instrumental_top,
-        text="Зона карти, тайли, шари проєкту — нижче; малювання мережі — у нижній панелі.",
+        text="Шари проєкту — у цьому блоці; зона/тайли/висоти керуються на вкладці «Рельєф» праворуч.",
         bg="#181818",
         fg="#666666",
         font=("Segoe UI", 8),
@@ -2693,110 +2708,11 @@ def create_embedded_map_panel(parent: tk.Misc, app=None):
         justify=tk.LEFT,
         anchor="nw",
     ).pack(fill=tk.X, padx=8, pady=(0, 6))
-    tk.Label(instrumental_top, text="Зона / тайли / шари", bg="#181818", fg="#8BC4FF", font=("Segoe UI", 8, "bold")).pack(
+    tk.Label(instrumental_top, text="Шари проєкту", bg="#181818", fg="#8BC4FF", font=("Segoe UI", 8, "bold")).pack(
         fill=tk.X, padx=8, pady=(4, 4)
     )
-    _emb_btn_zone = tk.Button(
-        instrumental_top,
-        text="▭ Зона проєкту (рамка)",
-        command=lambda: _set_tool("project_zone_rect"),
-        bg="#3d2a44",
-        fg="#FFE0F0",
-        relief=tk.FLAT,
-    )
-    _emb_btn_zone.pack(fill=tk.X, padx=8, pady=3)
-    _attach_dark_tooltip(
-        _emb_btn_zone,
-        "Намалювати прямокутник зони проєкту: для завантаження тайлів і заповнення DEM у межах зони.",
-    )
-    _emb_btn_cap = tk.Button(
-        instrumental_top,
-        text="🧭 Захват тайлів",
-        command=lambda: _set_tool("capture_tiles"),
-        bg="#242424",
-        fg="#E8E8E8",
-        relief=tk.FLAT,
-    )
-    _emb_btn_cap.pack(fill=tk.X, padx=8, pady=3)
-    _attach_dark_tooltip(_emb_btn_cap, "Область на карті — завантажити SRTM-тайли лише для виділеного прямокутника.")
-    _emb_btn_blk = tk.Button(
-        instrumental_top,
-        text="🟨 Контур блоку",
-        command=lambda: _set_tool("block_contour"),
-        bg="#242424",
-        fg="#E8E8E8",
-        relief=tk.FLAT,
-    )
-    _emb_btn_blk.pack(fill=tk.X, padx=8, pady=3)
-    _attach_dark_tooltip(_emb_btn_blk, "Намалювати контур поля на карті й перенести його на полотно «Без карти».")
-    _fr_scene = tk.Frame(instrumental_top, bg="#181818")
-    _fr_scene.pack(fill=tk.X, padx=4, pady=3)
-    _ic_scene = tk.Canvas(
-        _fr_scene,
-        width=22,
-        height=22,
-        bg="#2d2d2d",
-        highlightthickness=1,
-        highlightbackground="#555555",
-    )
-    _ic_scene.pack(side=tk.LEFT, padx=(6, 8))
-    for _ix in range(-18, 44, 4):
-        _ic_scene.create_line(_ix, 0, _ix + 24, 24, fill="#7a8a9a", width=1)
-    _emb_btn_lines = tk.Button(
-        _fr_scene,
-        text="Лінії",
-        command=lambda: _set_tool("scene_lines"),
-        bg="#181818",
-        fg="#E8E8E8",
-        activebackground="#252525",
-        activeforeground="#E8E8E8",
-        relief=tk.FLAT,
-        anchor="w",
-        padx=2,
-    )
-    _emb_btn_lines.pack(side=tk.LEFT, fill=tk.X, expand=True)
-    _attach_dark_tooltip(
-        _emb_btn_lines,
-        "Декоративні полілінії на карті (ескіз), зберігаються в проєкті; не беруть участі в розрахунках.",
-    )
-    _emb_btn_cancel = tk.Button(
-        instrumental_top,
-        text="❌ Скасувати",
-        command=lambda: _set_tool(None),
-        bg="#2d1f1f",
-        fg="#FFD1D1",
-        relief=tk.FLAT,
-    )
-    _emb_btn_cancel.pack(fill=tk.X, padx=8, pady=(8, 3))
-    _attach_dark_tooltip(_emb_btn_cancel, "Вимкнути активний спецінструмент карти.")
-    _btn_prepare_zone = tk.Button(
-        instrumental_top,
-        text="⬇ Тайли + висоти (зона)",
-        command=lambda: app.prepare_map_project_zone_pipeline() if app is not None and hasattr(app, "prepare_map_project_zone_pipeline") else None,
-        bg="#1f4a32",
-        fg="#D7FFE6",
-        relief=tk.FLAT,
-    )
-    _btn_prepare_zone.pack(fill=tk.X, padx=8, pady=(4, 3))
-    _attach_dark_tooltip(
-        _btn_prepare_zone,
-        "Завантажити відсутні тайли та заповнити висоти в зоні проєкту (крок з панелі «Рельєф»).",
-    )
     if app is not None:
-        app._map_prepare_zone_button = _btn_prepare_zone
-    _btn_dl = tk.Button(
-        instrumental_top,
-        text="⬇ Лише тайли SRTM",
-        command=_download_tiles,
-        bg="#1f3b2a",
-        fg="#D7FFE6",
-        relief=tk.FLAT,
-    )
-    _btn_dl.pack(fill=tk.X, padx=8, pady=(2, 3))
-    _attach_dark_tooltip(
-        _btn_dl,
-        "Лише завантажити відсутні SRTM-тайли для поточної зони/KML без побудови сітки висот.",
-    )
+        app._map_prepare_zone_button = None
     tk.Label(instrumental_top, text="Шари overlay", bg="#181818", fg="#8BC4FF", font=("Segoe UI", 9, "bold")).pack(
         fill=tk.X, padx=10, pady=(10, 4)
     )
@@ -2902,9 +2818,9 @@ def create_embedded_map_panel(parent: tk.Misc, app=None):
     host._refresh_project_overlay = _show_project_overlay
     host._set_map_tool = _set_tool
     try:
-        _set_tool("select")
+        _set_tool(None)
     except Exception:
-        view_state["active_tool"] = "select"
+        view_state["active_tool"] = None
     host._map_hint_var = hint
     host._zoom_box_on = _zoom_box_on
     host._zoom_extents_project = _zoom_extents_project
@@ -3159,6 +3075,15 @@ def main() -> None:
                 "Спершу намалюйте контур захвату тайлів (мінімум 3 вершини) і завершіть ПКМ.",
             )
             return
+        tile_src = srtm_tiles.resolve_tile_source_from_app(app)
+        if tile_src == "open_elevation":
+            silent_showwarning(
+                root,
+                "SRTM",
+                "Open-Elevation не надає файли тайлів .hgt.\n"
+                "У головному вікні оберіть «Skadi+локальні» або «NASA Earthdata» (earthaccess / LP DAAC або власний URL).",
+            )
+            return
         lats = [p[0] for p in pts]
         lons = [p[1] for p in pts]
         lat_min, lat_max = min(lats), max(lats)
@@ -3167,8 +3092,11 @@ def main() -> None:
         if not tiles:
             silent_showinfo(root, "SRTM", "Немає тайлів для завантаження у вибраному контурі.")
             return
-        if not silent_askyesno(root, 
+        src_tile_label = {"skadi": "Skadi (AWS)", "earthdata": "NASA Earthdata"}.get(tile_src, tile_src)
+        if not silent_askyesno(
+            root,
             "SRTM",
+            f"Джерело тайлів: {src_tile_label}\n"
             f"Буде завантажено до {len(tiles)} тайлів у:\n{SRTM_DIR}\n\nПродовжити?",
         ):
             return
@@ -3181,7 +3109,7 @@ def main() -> None:
             results = []
             ok_n = 0
             for i, (la, lo) in enumerate(tiles, start=1):
-                ok, msg = srtm_tiles.download_tile(la, lo)
+                ok, msg = srtm_tiles.download_tile(la, lo, tile_source=tile_src)
                 if ok:
                     ok_n += 1
                 results.append((srtm_tiles.tile_base_name(la, lo), msg))

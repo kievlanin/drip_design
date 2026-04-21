@@ -1,25 +1,221 @@
 """
-Повні тайли SRTM у форматі .hgt (CGIAR / AWS Skadi).
-Завантаження цілих файлів; висота з локального кешу, якщо тайл є.
+Повні тайли SRTM у форматі .hgt (CGIAR / AWS Skadi; опційно NASA Earthdata).
+Earthdata: або власний HTTP (EARTHDATA_SRTM_TILE_BASE + Basic auth), або пакет earthaccess
+(search_data SRTMGL1 → download → розпаковка .zip з LP DAAC).
 """
 from __future__ import annotations
 
+import base64
 import gzip
 import math
+import os
 import re
 import struct
+import threading
 import time
 import urllib.error
 import urllib.request
+import zipfile
 from pathlib import Path
 from typing import Iterable, List, Optional, Tuple
 
-from main_app.paths import SRTM_DIR
+from main_app.paths import SRTM_DIR, load_earthdata_credentials_from_project_file
 
 # Публічне дзеркало void-filled SRTM (gzip .hgt.gz)
 SKADI_BASE = "https://s3.amazonaws.com/elevation-tiles-prod/skadi"
 
 _hgt_cache: dict[str, "HgtTile"] = {}
+
+
+def tile_source_for_schedule_mode(schedule_mode: str) -> str:
+    """
+    Джерело HTTP для завантаження тайлів .hgt (не плутати з API точкових висот).
+    auto / skadi_local → Skadi; earthdata → власний URL (EARTHDATA_SRTM_TILE_BASE + auth)
+    або earthaccess (SRTMGL1); open_elevation → не підтримує файли тайлів.
+    """
+    m = str(schedule_mode or "auto").strip().lower()
+    if m == "earthdata":
+        return "earthdata"
+    if m == "open_elevation":
+        return "open_elevation"
+    return "skadi"
+
+
+def resolve_tile_source_from_app(app) -> str:
+    if app is None:
+        return "skadi"
+    try:
+        if hasattr(app, "normalize_consumer_schedule"):
+            app.normalize_consumer_schedule()
+        cs = getattr(app, "consumer_schedule", None) or {}
+        mode = str(cs.get("srtm_source_mode", "auto")).strip().lower()
+    except Exception:
+        mode = "auto"
+    return tile_source_for_schedule_mode(mode)
+
+
+def _earthdata_tile_url(lat_sw: int, lon_sw: int) -> Optional[str]:
+    """
+    База URL у тому ж вигляді, що й Skadi: {base}/{N50}/N50E029.hgt.gz
+    Задайте EARTHDATA_SRTM_TILE_BASE (без завершального слеша).
+    Опційно EARTHDATA_SRTM_TILE_SUFFIX (за замовчуванням .hgt.gz), напр. .hgt для нестиснутого.
+    """
+    base = (os.getenv("EARTHDATA_SRTM_TILE_BASE", "") or "").strip().rstrip("/")
+    if not base:
+        return None
+    stem = tile_base_name(lat_sw, lon_sw)
+    if stem.lower().endswith(".hgt"):
+        stem = stem[:-4]
+    sub = tile_s3_subdir(lat_sw)
+    suffix = (os.getenv("EARTHDATA_SRTM_TILE_SUFFIX", ".hgt.gz") or ".hgt.gz").strip()
+    if suffix and not suffix.startswith("."):
+        suffix = "." + suffix
+    return f"{base}/{sub}/{stem}{suffix}"
+
+
+def _earthdata_basic_auth_header() -> Optional[str]:
+    load_earthdata_credentials_from_project_file()
+    user = (os.getenv("EARTHDATA_USER", "") or "").strip()
+    password = (os.getenv("EARTHDATA_PASSWORD", "") or "").strip()
+    if not user or not password:
+        return None
+    token = base64.b64encode(f"{user}:{password}".encode("utf-8")).decode("ascii")
+    return f"Basic {token}"
+
+
+_earthaccess_lock = threading.Lock()
+_earthaccess_login_ok = False
+
+
+def _reset_earthaccess_login_state() -> None:
+    """Для тестів або після явної зміни облікових даних Earthdata."""
+    global _earthaccess_login_ok
+    _earthaccess_login_ok = False
+
+
+def _ensure_earthaccess_login(earthaccess_mod) -> Tuple[bool, str]:
+    global _earthaccess_login_ok
+    if _earthaccess_login_ok:
+        return True, ""
+    try:
+        earthaccess_mod.login(strategy="all", persist=True)
+        _earthaccess_login_ok = True
+        return True, ""
+    except Exception as e:
+        return False, str(e)
+
+
+def _hgt_bytes_from_earthaccess_paths(paths: List[Path], stem_core: str) -> bytes:
+    """LP DAAC віддає .zip із файлом *.hgt усередині."""
+    for p in paths:
+        if not p.is_file():
+            continue
+        suf = p.suffix.lower()
+        if suf == ".hgt":
+            return p.read_bytes()
+        if suf == ".zip":
+            with zipfile.ZipFile(p, "r") as zf:
+                members = [n for n in zf.namelist() if not n.endswith("/")]
+                hgt_names = [
+                    n
+                    for n in members
+                    if n.lower().split("/")[-1].endswith(".hgt")
+                ]
+                if not hgt_names:
+                    continue
+                leaf_pref = [
+                    n
+                    for n in hgt_names
+                    if stem_core in n.replace("\\", "/").split("/")[-1].upper()
+                ]
+                pick = leaf_pref[0] if leaf_pref else hgt_names[0]
+                return zf.read(pick)
+    raise ValueError("немає .hgt у завантажених файлах earthaccess")
+
+
+def _download_tile_payload_earthaccess(
+    lat_sw: int,
+    lon_sw: int,
+    cache_dir: Path,
+    name: str,
+) -> Tuple[bool, str, Optional[bytes]]:
+    """
+    NASA LP DAAC SRTMGL1 v003 через earthaccess (без ручного EARTHDATA_SRTM_TILE_BASE).
+    """
+    try:
+        import earthaccess
+    except ImportError:
+        return (
+            False,
+            "немає пакета earthaccess (pip install earthaccess) або задайте "
+            "EARTHDATA_SRTM_TILE_BASE + EARTHDATA_USER / EARTHDATA_PASSWORD.",
+            None,
+        )
+
+    stem_core = name[:-4] if name.lower().endswith(".hgt") else name
+
+    load_earthdata_credentials_from_project_file()
+
+    with _earthaccess_lock:
+        ok_login, err_login = _ensure_earthaccess_login(earthaccess)
+        if not ok_login:
+            return (
+                False,
+                f"Earthdata (earthaccess): не вдалося увійти ({err_login}). "
+                "Задайте EARTHDATA_USER/EARTHDATA_PASSWORD або .netrc, або виконайте earthaccess.login() у консолі.",
+                None,
+            )
+        try:
+            granules = earthaccess.search_data(
+                short_name="SRTMGL1",
+                version="003",
+                granule_name=f"{stem_core}*",
+                count=5,
+            )
+        except Exception as e:
+            return False, f"CMR search_data: {e}", None
+        if not granules:
+            return (
+                False,
+                f"CMR: не знайдено гранулу SRTMGL1 для {stem_core}",
+                None,
+            )
+        granule0 = granules[0]
+
+    try:
+        try:
+            paths = earthaccess.download(
+                granule0,
+                local_path=str(cache_dir),
+                threads=1,
+                show_progress=False,
+            )
+        except TypeError:
+            paths = earthaccess.download(
+                granule0,
+                local_path=str(cache_dir),
+                threads=1,
+            )
+    except Exception as e:
+        return False, f"earthaccess.download: {e}", None
+
+    if not paths:
+        return False, "earthaccess.download не повернув шляхів до файлів", None
+
+    path_list = [Path(x) for x in paths]
+    try:
+        raw = _hgt_bytes_from_earthaccess_paths(path_list, stem_core.upper())
+    except Exception as e:
+        return False, str(e), None
+
+    for p in path_list:
+        try:
+            if p.is_file() and p.suffix.lower() == ".zip":
+                p.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    return True, "", raw
 
 
 def ensure_srtm_dir() -> Path:
@@ -118,7 +314,15 @@ def wgs84_bounds_from_xy_bounds(minx: float, miny: float, maxx: float, maxy: flo
     return min(lats), max(lats), min(lons), max(lons)
 
 
-def download_tiles_for_xy_bounds(minx: float, miny: float, maxx: float, maxy: float, geo_ref: Tuple[float, float]) -> List[Tuple[str, str]]:
+def download_tiles_for_xy_bounds(
+    minx: float,
+    miny: float,
+    maxx: float,
+    maxy: float,
+    geo_ref: Tuple[float, float],
+    *,
+    tile_source: str = "skadi",
+) -> List[Tuple[str, str]]:
     if not geo_ref:
         raise ValueError("Потрібна geo_ref.")
     lat0, lat1, lon0, lon1 = wgs84_bounds_from_xy_bounds(minx, miny, maxx, maxy, geo_ref)
@@ -128,7 +332,7 @@ def download_tiles_for_xy_bounds(minx: float, miny: float, maxx: float, maxy: fl
     for i, (la, lo) in enumerate(tiles):
         if i > 0:
             time.sleep(0.35)
-        ok, msg = download_tile(la, lo, cache_dir)
+        ok, msg = download_tile(la, lo, cache_dir, tile_source=tile_source)
         results.append((tile_base_name(la, lo), msg))
     return results
 
@@ -175,9 +379,16 @@ def resolve_hgt_path(cache_dir: Path, lat_sw: int, lon_sw: int) -> Optional[Path
     return None
 
 
-def download_tile(lat_sw: int, lon_sw: int, cache_dir: Optional[Path] = None) -> Tuple[bool, str]:
+def download_tile(
+    lat_sw: int,
+    lon_sw: int,
+    cache_dir: Optional[Path] = None,
+    *,
+    tile_source: str = "skadi",
+) -> Tuple[bool, str]:
     """
-    Завантажує повний .hgt.gz і зберігає розпакований .hgt у cache_dir.
+    Завантажує повний .hgt.gz (або .hgt) і зберігає розпакований .hgt у cache_dir.
+    tile_source: skadi | earthdata | open_elevation
     Повертає (успіх, повідомлення).
     """
     cache_dir = cache_dir or ensure_srtm_dir()
@@ -186,30 +397,84 @@ def download_tile(lat_sw: int, lon_sw: int, cache_dir: Optional[Path] = None) ->
     if out_path.is_file() and out_path.stat().st_size > 0:
         return True, f"вже є: {name}"
 
-    url = skadi_url(lat_sw, lon_sw)
-    req = urllib.request.Request(url, headers={"User-Agent": "DripCAD/1.0 (SRTM tiles; contact: local)"})
+    src = str(tile_source or "skadi").strip().lower()
+    if src == "open_elevation":
+        return (
+            False,
+            f"{name}: Open-Elevation не надає файли тайлів .hgt; для тайлів оберіть «Skadi+локальні» "
+            "або «NASA Earthdata» (earthaccess або власний EARTHDATA_SRTM_TILE_BASE).",
+        )
+
+    payload: Optional[bytes] = None
+    tag = "Skadi"
+
+    if src == "earthdata":
+        tag = "Earthdata"
+        url = _earthdata_tile_url(lat_sw, lon_sw)
+        auth = _earthdata_basic_auth_header()
+        if url and auth:
+            headers = {
+                "User-Agent": "DripCAD/1.0 (SRTM tiles; Earthdata)",
+                "Authorization": auth,
+            }
+            req = urllib.request.Request(url, headers=headers)
+            try:
+                with urllib.request.urlopen(req, timeout=120) as resp:
+                    payload = resp.read()
+            except urllib.error.HTTPError as e:
+                if e.code == 404:
+                    return False, f"немає на сервері: {name} (404)"
+                return False, f"{name}: HTTP {e.code} {e.reason}"
+            except Exception as e:
+                return False, f"{name}: {e}"
+        else:
+            ok_ea, msg_ea, raw_ea = _download_tile_payload_earthaccess(
+                lat_sw, lon_sw, cache_dir, name
+            )
+            if not ok_ea or raw_ea is None:
+                return False, f"{name}: {msg_ea}"
+            payload = raw_ea
+            tag = "Earthdata (earthaccess)"
+    else:
+        url = skadi_url(lat_sw, lon_sw)
+        headers = {"User-Agent": "DripCAD/1.0 (SRTM tiles; contact: local)"}
+        req = urllib.request.Request(url, headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                payload = resp.read()
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                return False, f"немає на сервері: {name} (404)"
+            return False, f"{name}: HTTP {e.code} {e.reason}"
+        except Exception as e:
+            return False, f"{name}: {e}"
+
+    if payload is None:
+        return False, f"{name}: порожня відповідь"
+
+    raw: bytes
     try:
-        with urllib.request.urlopen(req, timeout=120) as resp:
-            raw_gz = resp.read()
-    except urllib.error.HTTPError as e:
-        if e.code == 404:
-            return False, f"немає на сервері: {name} (404)"
-        return False, f"{name}: HTTP {e.code} {e.reason}"
-    except Exception as e:
-        return False, f"{name}: {e}"
+        raw = gzip.decompress(payload)
+    except Exception:
+        raw = payload
 
     try:
-        raw = gzip.decompress(raw_gz)
+        HgtTile(raw, lat_sw, lon_sw)
     except Exception as e:
-        return False, f"{name}: помилка gzip: {e}"
+        return False, f"{name}: некоректні дані тайла (.hgt): {e}"
 
     cache_dir.mkdir(parents=True, exist_ok=True)
     out_path.write_bytes(raw)
     _hgt_cache.pop(str(out_path.resolve()), None)
-    return True, f"завантажено: {name}"
+    return True, f"завантажено ({tag}): {name}"
 
 
-def download_tiles_for_boundary(boundary_coords: List[Tuple[float, float]], geo_ref: Tuple[float, float]) -> List[Tuple[str, str]]:
+def download_tiles_for_boundary(
+    boundary_coords: List[Tuple[float, float]],
+    geo_ref: Tuple[float, float],
+    *,
+    tile_source: str = "skadi",
+) -> List[Tuple[str, str]]:
     """Список (ім'я тайлу, статус) для усіх 1°×1°, що перетинають bbox контуру."""
     if not boundary_coords or not geo_ref:
         raise ValueError("Потрібен контур і geo_ref.")
@@ -220,7 +485,7 @@ def download_tiles_for_boundary(boundary_coords: List[Tuple[float, float]], geo_
     for i, (la, lo) in enumerate(tiles):
         if i > 0:
             time.sleep(0.35)
-        ok, msg = download_tile(la, lo, cache_dir)
+        ok, msg = download_tile(la, lo, cache_dir, tile_source=tile_source)
         results.append((tile_base_name(la, lo), msg))
     return results
 

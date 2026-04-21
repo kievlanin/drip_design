@@ -1,3 +1,8 @@
+# Облікові дані NASA Earthdata (локально; не комітити)
+EarthData.txt
+earthdata.txt
+Earthdata.txt
+
 # Локальні SRTM-тайли (великі .hgt); структура папки — через _srtm_/.gitkeep
 _srtm_/*
 !_srtm_/.gitkeep

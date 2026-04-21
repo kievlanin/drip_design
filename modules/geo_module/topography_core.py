@@ -1,5 +1,10 @@
+import json
 import math
-from typing import Callable, List, Optional, Sequence, Tuple
+import os
+import time
+import urllib.error
+import urllib.request
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 from shapely.geometry import Polygon, LineString, MultiLineString
 from shapely.ops import linemerge
@@ -13,6 +18,41 @@ _MIN_NEIGHBORS_FOR_LOCAL_IDW = 6
 # Великі поля (напр. 1,3×6,5 км при кроці 5 м): без обмеження — мільйони операцій marching squares.
 _CONTOUR_MAX_GRID_CELLS = 280_000
 _CONTOUR_MAX_Z_LEVELS = 320
+
+# Згладжування сітки Z перед marching squares: придушує «зубці» / різкі згини ізоліній від шуму
+# у вихідних точках або локальної інтерполяції (IDW/кріггінг). 0 — вимкнути.
+# Кожен «прохід» = сепарабельний [1,2,1]/4 по рядках і по стовпцях (аналог легкого Gaussian).
+_CONTOUR_GRID_Z_SMOOTH_PASSES = 2
+
+
+def _smooth_contour_grid_z_binomial(
+    grid: dict,
+    rows: int,
+    cols: int,
+    passes: int,
+) -> None:
+    """
+    In-place згладжування Z у grid[(r,c)] = (gx, gy, z); gx, gy не змінюються.
+    Потребує numpy (у проєкті вже використовується для кріггінгу сітки).
+    """
+    if passes <= 0 or rows < 1 or cols < 1:
+        return
+    import numpy as np
+
+    Z = np.empty((rows, cols), dtype=np.float64)
+    for r in range(rows):
+        for c in range(cols):
+            Z[r, c] = float(grid[(r, c)][2])
+    out = Z
+    for _ in range(int(passes)):
+        p = np.pad(out, ((0, 0), (1, 1)), mode="edge")
+        out = (p[:, :-2] + 2.0 * p[:, 1:-1] + p[:, 2:]) * 0.25
+        p = np.pad(out, ((1, 1), (0, 0)), mode="edge")
+        out = (p[:-2, :] + 2.0 * p[1:-1, :] + p[2:, :]) * 0.25
+    for r in range(rows):
+        for c in range(cols):
+            gx, gy, _ = grid[(r, c)]
+            grid[(r, c)] = (gx, gy, float(out[r, c]))
 
 
 def _idw_z(x: float, y: float, points: Sequence[Tuple[float, float, float]], power: float) -> float:
@@ -251,6 +291,7 @@ class TopoEngine:
         self.srtm_boundary_pts_local = []
         self.power = 2.0
         self.last_contour_adaptation_note: Optional[str] = None
+        self.last_srtm_provider_info: Dict[str, object] = {}
 
     def add_point(self, x, y, z):
         self.elevation_points.append((x, y, z))
@@ -297,11 +338,87 @@ class TopoEngine:
             self.last_contour_adaptation_note = "\n".join(notes)
         return res
 
-    def fetch_srtm_grid(self, boundary_coords, geo_ref, resolution=30.0):
-        import json
-        import time
-        import urllib.error
-        import urllib.request
+    def _fetch_open_elevation_batch(
+        self, batch: List[Tuple[float, float]]
+    ) -> List[float]:
+        url = "https://api.open-elevation.com/api/v1/lookup"
+        payload = {
+            "locations": [{"latitude": float(lat), "longitude": float(lon)} for lat, lon in batch]
+        }
+        raw = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=raw,
+            headers={
+                "User-Agent": "DripCAD/1.0",
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=45) as response:
+            data = json.loads(response.read().decode("utf-8"))
+        rows = data.get("results")
+        if not isinstance(rows, list) or len(rows) != len(batch):
+            raise ValueError("Open-Elevation повернув неповні дані.")
+        out: List[float] = []
+        for row in rows:
+            if not isinstance(row, dict) or "elevation" not in row:
+                raise ValueError("Open-Elevation: некоректний формат відповіді.")
+            out.append(float(row["elevation"]))
+        return out
+
+    def _fetch_earthdata_batch(
+        self, batch: List[Tuple[float, float]]
+    ) -> List[float]:
+        from main_app.paths import load_earthdata_credentials_from_project_file
+
+        load_earthdata_credentials_from_project_file()
+        # Earthdata endpoint винесено в env, бо в проєктах часто різні проксі/шлюзи.
+        base = (os.getenv("EARTHDATA_ELEVATION_API_URL", "") or "").strip()
+        if not base:
+            raise ValueError(
+                "NASA Earthdata не налаштовано (немає EARTHDATA_ELEVATION_API_URL)."
+            )
+        user = (os.getenv("EARTHDATA_USER", "") or "").strip()
+        password = (os.getenv("EARTHDATA_PASSWORD", "") or "").strip()
+        if not user or not password:
+            raise ValueError(
+                "NASA Earthdata не налаштовано (немає EARTHDATA_USER/EARTHDATA_PASSWORD)."
+            )
+        lats = ",".join(f"{lat:.6f}" for lat, _ in batch)
+        lons = ",".join(f"{lon:.6f}" for _, lon in batch)
+        url = f"{base}?latitude={lats}&longitude={lons}"
+        auth = (f"{user}:{password}").encode("utf-8")
+        import base64
+
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": "DripCAD/1.0",
+                "Accept": "application/json",
+                "Authorization": f"Basic {base64.b64encode(auth).decode('ascii')}",
+            },
+            method="GET",
+        )
+        with urllib.request.urlopen(req, timeout=60) as response:
+            data = json.loads(response.read().decode("utf-8"))
+        rows = data.get("elevation")
+        if not isinstance(rows, list) or len(rows) != len(batch):
+            raise ValueError("NASA Earthdata повернув неповні дані.")
+        return [float(v) for v in rows]
+
+    def _provider_chain_for_mode(self, mode: str) -> List[str]:
+        mm = str(mode or "auto").strip().lower()
+        mapping = {
+            "auto": ["open_elevation", "earthdata"],
+            "skadi_local": ["open_elevation", "earthdata"],
+            "open_elevation": ["open_elevation", "earthdata"],
+            "earthdata": ["earthdata", "open_elevation"],
+        }
+        return list(mapping.get(mm, mapping["auto"]))
+
+    def fetch_srtm_grid(self, boundary_coords, geo_ref, resolution=30.0, source_mode="auto"):
         from shapely.geometry import Point
 
         from main_app.paths import SRTM_DIR
@@ -357,48 +474,75 @@ class TopoEngine:
             elevations.append(z)
 
         missing_idx = [i for i, z in enumerate(elevations) if z is None]
+        active_provider = "skadi_local"
+        fallback_chain_used: List[str] = []
+        provider_errors: Dict[str, str] = {}
         if missing_idx:
             if len(missing_idx) > 1500:
                 raise ValueError(
                     f"Без локальних тайлів у _srtm_ потрібно >1500 запитів до API ({len(missing_idx)}).\n"
                     "Завантажте тайли (кнопка на вкладці «Рельєф») або збільште крок сітки (напр. 90 м)."
                 )
+            provider_chain = self._provider_chain_for_mode(source_mode)
+            provider_fetch = {
+                "open_elevation": self._fetch_open_elevation_batch,
+                "earthdata": self._fetch_earthdata_batch,
+            }
             batch_size = 100
-            for b_start in range(0, len(missing_idx), batch_size):
-                if b_start > 0:
-                    time.sleep(3.0)
-                chunk_ix = missing_idx[b_start : b_start + batch_size]
-                batch = [geo_points[i] for i in chunk_ix]
-                lats = ",".join(f"{lat:.6f}" for lat, _lon in batch)
-                lons = ",".join(f"{lon:.6f}" for _lat, lon in batch)
-                url = f"https://api.open-meteo.com/v1/elevation?latitude={lats}&longitude={lons}"
+            for provider in provider_chain:
+                still_missing = [i for i, z in enumerate(elevations) if z is None]
+                if not still_missing:
+                    break
+                fetcher = provider_fetch.get(provider)
+                if fetcher is None:
+                    continue
                 try:
-                    req = urllib.request.Request(url, headers={"User-Agent": "DripCAD/1.0 Mozilla/5.0"})
-                    with urllib.request.urlopen(req) as response:
-                        data = json.loads(response.read().decode())
-                    if "elevation" not in data:
-                        raise ValueError("API не повернув дані про висоту.")
-                    api_z = data["elevation"]
+                    for b_start in range(0, len(still_missing), batch_size):
+                        if b_start > 0:
+                            time.sleep(1.2)
+                        chunk_ix = still_missing[b_start : b_start + batch_size]
+                        batch = [geo_points[i] for i in chunk_ix]
+                        api_z = fetcher(batch)
+                        for j, idx in enumerate(chunk_ix):
+                            elevations[idx] = float(api_z[j])
+                    fallback_chain_used.append(provider)
+                    active_provider = provider
                 except urllib.error.HTTPError as e:
                     err_msg = e.read().decode("utf-8", errors="ignore")
-                    if e.code == 429:
-                        raise ValueError(
-                            "Ліміт API (429 Too Many Requests).\nСпробуйте пізніше, завантажте тайли в _srtm_ або збільште крок."
-                        ) from e
-                    if e.code == 400:
-                        raise ValueError(f"Некоректний запит до API.\n{err_msg}") from e
-                    raise ValueError(f"Помилка сервера: {e.code} {e.reason}") from e
-                for j, idx in enumerate(chunk_ix):
-                    elevations[idx] = float(api_z[j])
+                    provider_errors[provider] = f"HTTP {e.code}: {err_msg or e.reason}"
+                    continue
+                except Exception as ex:
+                    provider_errors[provider] = str(ex)
+                    continue
 
         self.clear()
         for i, (x, y) in enumerate(grid_points):
             z = elevations[i]
             if z is None:
-                raise ValueError("Не вдалося отримати висоту для частини точок (void SRTM і відсутність даних API).")
+                provider_bits = ", ".join(
+                    f"{k}: {v}" for k, v in provider_errors.items()
+                ) or "немає доступних онлайн-джерел"
+                raise ValueError(
+                    "Не вдалося отримати висоту для частини точок "
+                    "(void SRTM і недоступні онлайн-резерви).\n"
+                    f"Деталі: {provider_bits}"
+                )
             self.add_point(x, y, float(z))
-
-        return len(grid_points)
+        self.last_srtm_provider_info = {
+            "source_mode": str(source_mode or "auto"),
+            "active_provider": active_provider,
+            "fallback_chain_used": fallback_chain_used,
+            "provider_errors": provider_errors,
+            "missing_points_resolved": len(missing_idx),
+        }
+        return {
+            "count": len(grid_points),
+            "active_provider": active_provider,
+            "fallback_chain_used": fallback_chain_used,
+            "provider_errors": provider_errors,
+            "missing_points_resolved": len(missing_idx),
+            "elevation_points": list(self.elevation_points),
+        }
 
 
 def _generate_contours_core(
@@ -551,6 +695,28 @@ def _generate_contours_core(
                 min_z = z
             if z > max_z:
                 max_z = z
+
+    if _CONTOUR_GRID_Z_SMOOTH_PASSES > 0:
+        try:
+            _smooth_contour_grid_z_binomial(
+                grid, rows, cols, _CONTOUR_GRID_Z_SMOOTH_PASSES
+            )
+            notes.append(
+                "Ізолінії: згладжено сітку висот (фільтр придушення артефактів / різких згинів)."
+            )
+            min_z = float("inf")
+            max_z = float("-inf")
+            for r in range(rows):
+                for c in range(cols):
+                    z = float(grid[(r, c)][2])
+                    if z < min_z:
+                        min_z = z
+                    if z > max_z:
+                        max_z = z
+        except ImportError:
+            notes.append(
+                "Згладжування сітки Z для ізоліній пропущено (немає numpy)."
+            )
 
     if min_z == float("inf") or max_z == float("-inf"):
         return []

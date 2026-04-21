@@ -193,8 +193,8 @@ def _normalize_consumer_schedule_payload(raw) -> dict:
             v = raw.get("max_pump_head_m")
             if v is not None and str(v).strip() != "":
                 fv = float(v)
-                if fv > 0.0:
-                    out["max_pump_head_m"] = float(fv)
+                if fv >= 0.0:
+                    out["max_pump_head_m"] = max(0.0, min(400.0, float(fv)))
         except (TypeError, ValueError):
             pass
         try:
@@ -243,6 +243,10 @@ def _normalize_consumer_schedule_payload(raw) -> dict:
             goal = "money"
         out["trunk_schedule_opt_goal"] = goal
         out["trunk_pipes_selected"] = bool(raw.get("trunk_pipes_selected", False))
+        src_mode = str(raw.get("srtm_source_mode", "auto")).strip().lower()
+        if src_mode not in ("auto", "skadi_local", "open_elevation", "earthdata"):
+            src_mode = "auto"
+        out["srtm_source_mode"] = src_mode
     return out
 
 
@@ -974,6 +978,16 @@ def load_project(app):
         if hasattr(app, "sync_trunk_display_velocity_warn_var_from_schedule"):
             try:
                 app.sync_trunk_display_velocity_warn_var_from_schedule()
+            except Exception:
+                pass
+        if hasattr(app, "sync_srtm_source_mode_var_from_schedule"):
+            try:
+                app.sync_srtm_source_mode_var_from_schedule()
+            except Exception:
+                pass
+        if hasattr(app, "sync_srtm_source_mode_widgets"):
+            try:
+                app.sync_srtm_source_mode_widgets()
             except Exception:
                 pass
         if cp is not None and hasattr(cp, "_sync_schedule_test_qh_ui"):

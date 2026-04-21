@@ -200,6 +200,7 @@ class DripCAD:
             "trunk_display_velocity_warn_mps": 0.0,
             "trunk_pipes_selected": False,
             "trunk_telescope_label_pos": {},
+            "srtm_source_mode": "auto",
         }
         self._rozklad_staging_ids: List[str] = []
         self.trunk_irrigation_hydro_cache: Optional[dict] = None
@@ -249,6 +250,8 @@ class DripCAD:
         self.mode = tk.StringVar(value="VIEW")
         self.action = tk.StringVar(value="ADD") 
         self.ortho_on = tk.BooleanVar(value=True)
+        self.var_srtm_source_mode = tk.StringVar(value="auto")
+        self._srtm_active_provider = "skadi_local"
         
         self.var_lat_step = tk.StringVar(value="0.9")
         self.var_emit_step = tk.StringVar(value="0.3")
@@ -417,6 +420,40 @@ class DripCAD:
         )
         self.cb_active_block.pack(side=tk.LEFT, pady=4)
         self.cb_active_block.bind("<<ComboboxSelected>>", self._on_active_block_combo)
+        tk.Label(
+            self.top_bar,
+            text="Джерело SRTM:",
+            bg="#1a1a1e",
+            fg="#aaaaaa",
+            font=("Arial", 9),
+        ).pack(side=tk.LEFT, padx=(10, 4), pady=4)
+        self.cb_srtm_source_mode = ttk.Combobox(
+            self.top_bar,
+            width=18,
+            state="readonly",
+            values=[
+                "Авто",
+                "Skadi+локальні",
+                "Open-Elevation",
+                "NASA Earthdata",
+            ],
+        )
+        self.cb_srtm_source_mode.pack(side=tk.LEFT, pady=4)
+        self.cb_srtm_source_mode.bind("<<ComboboxSelected>>", self._on_srtm_source_combo)
+        attach_tooltip(
+            self.cb_srtm_source_mode,
+            "Джерело для сітки висот (API) і для завантаження тайлів .hgt у _srtm_. "
+            "Skadi — публічне дзеркало AWS. NASA Earthdata — earthaccess (pip install earthaccess, SRTMGL1 LP DAAC) "
+            "або власний EARTHDATA_SRTM_TILE_BASE + облік (env або EarthData.txt у корені проєкту). Open-Elevation — лише точкові висоти, без тайлів.",
+        )
+        self.lbl_srtm_active_provider = tk.Label(
+            self.top_bar,
+            text="Активне: локальні/Skadi",
+            bg="#1a1a1e",
+            fg="#88ddff",
+            font=("Arial", 8, "bold"),
+        )
+        self.lbl_srtm_active_provider.pack(side=tk.LEFT, padx=(6, 4), pady=4)
         self._btn_submain_editor = ttk.Button(
             self.top_bar,
             text="Редактор сабмейну…",
@@ -498,6 +535,8 @@ class DripCAD:
             self.pipe_material.set(avail[0])
         self.update_pn_dropdown(skip_reset=True)
         self.sync_hydro_pipe_summary()
+        self.sync_srtm_source_mode_var_from_schedule()
+        self.sync_srtm_source_mode_widgets()
         self.sync_srtm_model_status()
         self.bind_events()
         self._sync_lat_disp_widgets()
@@ -1321,13 +1360,15 @@ class DripCAD:
             if sl <= 1e-9 or sd <= 1e-9:
                 continue
             oc = row.get("objective_cost", None)
+            od_s = self._trunk_pipe_row_outer_d_mm_str(row, seg, float(sd))
+            od_show = od_s if (od_s and od_s != "—") else f"{sd:.0f}"
             if oc is not None:
                 try:
-                    sec_parts.append(f"{sl:.1f}м/Ø{sd:.0f}/C{float(oc):.1f}")
+                    sec_parts.append(f"{sl:.1f}м/Ø{od_show}/C{float(oc):.1f}")
                 except (TypeError, ValueError):
-                    sec_parts.append(f"{sl:.1f}м/Ø{sd:.0f}")
+                    sec_parts.append(f"{sl:.1f}м/Ø{od_show}")
             else:
-                sec_parts.append(f"{sl:.1f}м/Ø{sd:.0f}")
+                sec_parts.append(f"{sl:.1f}м/Ø{od_show}")
         if not sec_parts:
             return base
         return f"{base} · секції: " + ", ".join(sec_parts[:4])
@@ -1450,7 +1491,7 @@ class DripCAD:
         return chunk_pl, lines, sec
 
     def _trunk_telescope_short_label(self, seg: dict) -> str:
-        """Один рядок для підказки: кілька секцій на ребрі (довжина × d_inner)."""
+        """Один рядок для підказки: кілька секцій на ребрі (довжина × зовн. Ø)."""
         if not isinstance(seg, dict):
             return ""
         secs = seg.get("sections")
@@ -1469,13 +1510,15 @@ class DripCAD:
                 continue
             if sl <= 1e-9 or sd <= 1e-9:
                 continue
-            parts.append(f"{sl:.0f}м×Ø{sd:.0f}")
+            od_s = self._trunk_pipe_row_outer_d_mm_str(row, seg, float(sd))
+            od_show = od_s if (od_s and od_s != "—") else f"{sd:.0f}"
+            parts.append(f"{sl:.0f}м×Ø{od_show}")
         if len(parts) < 2:
             return ""
         return "Телескоп: " + " + ".join(parts)
 
     def _trunk_telescope_section_label_text(self, sec: dict) -> str:
-        """Один рядок підпису телескоп-секції на карті (формат як у секцій сабмейну)."""
+        """Один рядок підпису телескоп-секції на карті (зовнішній Ø: d_nom або каталог за d_inner)."""
         if not isinstance(sec, dict):
             return ""
         try:
@@ -1488,14 +1531,23 @@ class DripCAD:
             return ""
         mat = str(sec.get("material", "") or "").strip() or "PE"
         pn = str(sec.get("pn", "") or "").strip() or "?"
-        d_use = dnom if dnom > 1e-6 else din
-        if d_use <= 1e-6:
-            return ""
-        # Не використовувати .rstrip("0") на цілих мм: "110".rstrip("0") → "11".
-        if abs(d_use - round(d_use)) < 0.01:
-            d_txt = str(int(round(d_use)))
+        if dnom > 1e-6:
+            d_use = dnom
+            if abs(d_use - round(d_use)) < 0.01:
+                d_txt = str(int(round(d_use)))
+            else:
+                d_txt = f"{d_use:.2f}".rstrip("0").rstrip(".")
         else:
-            d_txt = f"{d_use:.2f}".rstrip("0").rstrip(".")
+            od_s = self._trunk_pipe_row_outer_d_mm_str(sec, {}, float(din))
+            if od_s and od_s != "—":
+                d_txt = od_s
+            elif din > 1e-6:
+                if abs(din - round(din)) < 0.01:
+                    d_txt = str(int(round(din)))
+                else:
+                    d_txt = f"{din:.2f}".rstrip("0").rstrip(".")
+            else:
+                return ""
         return f"{mat} Ø{d_txt}/{pn} L={lm:.1f}m"
 
     @staticmethod
@@ -3240,10 +3292,11 @@ class DripCAD:
         path: List[Tuple[float, float]],
         slot_row: dict,
         nodes: List[dict],
-    ) -> Optional[List[Tuple[float, float, float, float]]]:
+    ) -> Optional[Tuple[List[Tuple[float, float, float, float, float]], float]]:
         """
-        Список ділянок (s0, s1, H0, H1) у метрах вздовж полілінії path[0]→path[-1], лінійний H у межах кожної
-        HW-секції телескопа (як у compute_trunk_tree_steady). None — якщо не вдалося зібрати ребра кешу.
+        (ділянки, Q_m3s): кожна ділянка — (s0, s1, H0, H1, d_inner_mm) у метрах вздовж path[0]→path[-1],
+        лінійний H у межах HW-секції телескопа (як у compute_trunk_tree_steady). Q — для v у ψ=H−v²/(2g).
+        None — якщо не вдалося зібрати ребра кешу.
         """
         if not isinstance(seg, dict) or len(path) < 2:
             return None
@@ -3267,9 +3320,10 @@ class DripCAD:
                 return f"T{idx}"
             return str(n.get("id", "")).strip() or f"T{idx}"
 
-        pieces: List[Tuple[float, float, float, float]] = []
+        pieces: List[Tuple[float, float, float, float, float]] = []
         s_off = 0.0
         h_prev_end: Optional[float] = None
+        q_track = 0.0
         for j in range(len(idxs) - 1):
             u, v = idxs[j], idxs[j + 1]
             id_u, id_v = _nid(u), _nid(v)
@@ -3287,6 +3341,7 @@ class DripCAD:
                 return None
             pid, cid, hu, hd = ed[0], ed[1], float(ed[2]), float(ed[3])
             q = self._trunk_edge_q_m3s(slot_row, pid, cid)
+            q_track = max(q_track, float(q))
             trow = self._trunk_tree_edge_row_by_pair(pid, cid)
             forward = id_u == pid and id_v == cid
             reverse = id_u == cid and id_v == pid
@@ -3296,7 +3351,11 @@ class DripCAD:
                 h_a, h_b = (hu, hd) if forward else (hd, hu)
                 if h_prev_end is not None and abs(h_prev_end - h_a) > 0.15:
                     h_a = h_prev_end
-                pieces.append((s_off, s_off + leg_geom, h_a, h_b))
+                try:
+                    d_leg = float(seg.get("d_inner_mm", 90.0) or 90.0)
+                except (TypeError, ValueError):
+                    d_leg = 90.0
+                pieces.append((s_off, s_off + leg_geom, h_a, h_b, d_leg))
                 h_prev_end = h_b
                 s_off += leg_geom
                 continue
@@ -3318,12 +3377,12 @@ class DripCAD:
                     g0 = s_off + s_loc
                     g1 = s_off + s_loc + Lm * scale_s
                     h1 = h_run - hf
-                    pieces.append((g0, g1, h_run, h1))
+                    pieces.append((g0, g1, h_run, h1, float(dmm)))
                     h_run = h1
                     s_loc += Lm * scale_s
                 if pieces:
-                    s0l, s1l, h0l, _h1l = pieces[-1]
-                    pieces[-1] = (s0l, s1l, h0l, float(hd))
+                    s0l, s1l, h0l, _h1l, d_last = pieces[-1]
+                    pieces[-1] = (s0l, s1l, h0l, float(hd), d_last)
                 h_prev_end = float(hd)
             else:
                 h_run = float(hd)
@@ -3336,22 +3395,20 @@ class DripCAD:
                     g0 = s_off + s_loc
                     g1 = s_off + s_loc + Lm * scale_s
                     h1 = h_run + hf
-                    pieces.append((g0, g1, h_run, h1))
+                    pieces.append((g0, g1, h_run, h1, float(dmm)))
                     h_run = h1
                     s_loc += Lm * scale_s
                 if pieces:
-                    s0l, s1l, h0l, _h1l = pieces[-1]
-                    pieces[-1] = (s0l, s1l, h0l, float(hu))
+                    s0l, s1l, h0l, _h1l, d_last = pieces[-1]
+                    pieces[-1] = (s0l, s1l, h0l, float(hu), d_last)
                 h_prev_end = float(hu)
             s_off += leg_geom
         if not pieces:
             return None
-        return pieces
+        return (pieces, float(q_track))
 
     @staticmethod
-    def _trunk_head_at_s_on_pieces(
-        s: float, pieces: Sequence[Tuple[float, float, float, float]]
-    ) -> float:
+    def _trunk_head_at_s_on_pieces(s: float, pieces: Sequence[Tuple]) -> float:
         s = max(0.0, float(s))
         if not pieces:
             return 0.0
@@ -3360,7 +3417,8 @@ class DripCAD:
         lo_l, hi_l = (last[0], last[1]) if last[0] <= last[1] else (last[1], last[0])
         ha_l, hb_l = (last[2], last[3]) if last[0] <= last[1] else (last[3], last[2])
         last_h = float(hb_l if s >= hi_l - 1e-9 else ha_l)
-        for s0, s1, h0, h1 in ordered:
+        for p in ordered:
+            s0, s1, h0, h1 = p[0], p[1], p[2], p[3]
             lo, hi = (s0, s1) if s0 <= s1 else (s1, s0)
             ha, hb = (h0, h1) if s0 <= s1 else (h1, h0)
             if s <= hi + 1e-7:
@@ -3370,8 +3428,50 @@ class DripCAD:
                 return float(ha + (hb - ha) * t)
         return last_h
 
+    @staticmethod
+    def _trunk_d_inner_mm_at_s_on_pieces(s: float, pieces: Sequence[Tuple]) -> float:
+        """Внутрішній Ø (мм) на відстані s по шматках профілю (5-й елемент), інакше 90."""
+        s = max(0.0, float(s))
+        if not pieces:
+            return 90.0
+        ordered = sorted(pieces, key=lambda p: (min(p[0], p[1]), max(p[0], p[1])))
+        for p in ordered:
+            if len(p) < 5:
+                break
+            s0, s1 = float(p[0]), float(p[1])
+            lo, hi = (s0, s1) if s0 <= s1 else (s1, s0)
+            if lo - 1e-9 <= s <= hi + 1e-7:
+                try:
+                    return max(1e-6, float(p[4]))
+                except (TypeError, ValueError):
+                    return 90.0
+        try:
+            lp = ordered[-1]
+            if len(lp) >= 5:
+                return max(1e-6, float(lp[4]))
+        except (TypeError, ValueError, IndexError):
+            pass
+        return 90.0
+
+    @staticmethod
+    def _trunk_bernoulli_psi_static_m(h_line_m: float, q_m3s: float, d_inner_mm: float) -> float:
+        """Статична складова повного напору (лінія енергії): ψ = H − v²/(2g), v=Q/A."""
+        g = 9.80665
+        try:
+            dmm = float(d_inner_mm)
+        except (TypeError, ValueError):
+            dmm = 90.0
+        if dmm <= 1e-6:
+            return float(h_line_m)
+        d_m = dmm / 1000.0
+        area = math.pi * (0.5 * d_m) ** 2
+        if area < 1e-18:
+            return float(h_line_m)
+        v = float(q_m3s) / area
+        return float(h_line_m) - (v * v) / (2.0 * g)
+
     def open_trunk_segment_pressure_profile(self, segment_index: Optional[int] = None) -> None:
-        """Графік напору H(s) вздовж полілінії: HW по секціях телескопа з trunk_tree, s — відстань по трасі."""
+        """Графік ψ(s)=H−v²/(2g) (Бернуллі, статична складова), H(s) пунктиром, ΔZ(s) по рельєфу; сітка 10 м + стики HW."""
         if segment_index is None:
             si = self._selected_trunk_segment_index()
         else:
@@ -3435,56 +3535,206 @@ class DripCAD:
             )
             return
         h0, h1 = float(heads[0]), float(heads[1])
-        profile_pieces = self._trunk_hw_pressure_pieces_along_polyline(seg, path, slot_row, nodes)
-        use_hw_telescope = profile_pieces is not None
-        if not use_hw_telescope:
-            profile_pieces = [(0.0, total_len, h0, h1)]
-        step_m = max(1.5, min(20.0, total_len / 100.0))
-        sample_n = max(32, int(math.ceil(total_len / step_m)))
-        cand: List[float] = [total_len * float(i) / float(sample_n) for i in range(sample_n + 1)]
-        for s0, s1, _, _ in profile_pieces:
-            cand.extend([float(s0), float(s1)])
+        hover_raw = (h.get("segment_hover") or {}).get(str(si))
+        if not isinstance(hover_raw, dict):
+            hover_raw = (h.get("segment_hover") or {}).get(int(si))  # type: ignore[arg-type]
+        hover: Dict[str, Any] = hover_raw if isinstance(hover_raw, dict) else {}
+        hq = self._trunk_hw_pressure_pieces_along_polyline(seg, path, slot_row, nodes)
+        use_hw_telescope = hq is not None
+        if use_hw_telescope:
+            profile_pieces, q_edge = hq
+        else:
+            try:
+                d_lin = float(hover.get("d_inner_mm", seg.get("d_inner_mm", 90.0)) or 90.0)
+            except (TypeError, ValueError):
+                d_lin = 90.0
+            profile_pieces = [(0.0, total_len, h0, h1, d_lin)]
+            try:
+                q_edge = float(hover.get("q_m3s", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                q_edge = 0.0
+        if q_edge <= 1e-18:
+            try:
+                q_edge = float(hover.get("q_m3s", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                q_edge = 0.0
+        # Вузли по трасі кожні 10 м (рельєф ΔZ і ψ/H на одній сітці) + межі секцій HW.
+        _st_m = 10.0
+        cand: List[float] = [0.0, float(total_len)]
+        s_run = _st_m
+        while s_run < total_len - 1e-9:
+            cand.append(float(s_run))
+            s_run += _st_m
+        for p in profile_pieces:
+            cand.extend([float(p[0]), float(p[1])])
         d_vals = sorted({max(0.0, min(total_len, float(x))) for x in cand})
         head_vals = [DripCAD._trunk_head_at_s_on_pieces(d, profile_pieces) for d in d_vals]
-        h_min = min(head_vals)
-        h_max = max(head_vals)
-        if abs(h_max - h_min) < 1e-4:
-            h_max = h_min + 1.0
-        h_mid = 0.5 * (h_min + h_max)
-        h_span = max(1e-6, h_max - h_min)
+        psi_vals = [
+            DripCAD._trunk_bernoulli_psi_static_m(
+                head_vals[i],
+                q_edge,
+                DripCAD._trunk_d_inner_mm_at_s_on_pieces(d_vals[i], profile_pieces),
+            )
+            for i in range(len(d_vals))
+        ]
+        z_rel_vals: Optional[List[float]] = None
+        z0_abs: Optional[float] = None
+        gauge_vals: Optional[List[float]] = None
+        if getattr(self.topo, "elevation_points", None):
+            try:
+                x0, y0 = self._polyline_point_at_dist(path, 0.0)
+                z0_abs = float(self.topo.get_z(x0, y0))
+                z_rel_vals = []
+                for d in d_vals:
+                    x, y = self._polyline_point_at_dist(path, float(d))
+                    z_rel_vals.append(float(self.topo.get_z(x, y)) - z0_abs)
+            except Exception:
+                z_rel_vals = None
+                z0_abs = None
+        has_relief = z_rel_vals is not None and len(z_rel_vals) == len(d_vals) and z0_abs is not None
+        if has_relief:
+            # ψ − ΔZ траси: ΔZ(s) = Z(s) − Z(s=0) — без абсолютної висоти рельєфу (малі зручні числа на осі).
+            gauge_vals = [
+                float(psi_vals[i]) - float(z_rel_vals[i]) for i in range(len(d_vals))
+            ]
+        else:
+            gauge_vals = None
+
+        def _padded_y_range(vals: List[float]) -> Tuple[float, float]:
+            lo, hi = float(min(vals)), float(max(vals))
+            if abs(hi - lo) < 1e-4:
+                hi = lo + 1.0
+            span = hi - lo
+            pad = max(1e-4, 0.02 * span)
+            return lo - pad, hi + pad
+
+        channels: List[Dict[str, Any]] = []
+        y0h, y1h = _padded_y_range(head_vals)
+        channels.append(
+            {
+                "id": "H",
+                "zone_label": "H",
+                "title": "H (напір, HW)",
+                "vals": head_vals,
+                "color": "#66BB6A",
+                "dash": (4, 4),
+                "lw": 1,
+                "ymin": y0h,
+                "ymax": y1h,
+            }
+        )
+        y0p, y1p = _padded_y_range(psi_vals)
+        _fuchsia_dyn = "#FF1493"
+        channels.append(
+            {
+                "id": "psi",
+                "zone_label": "ψ",
+                "title": "ψ = H − v²/(2g)",
+                "vals": psi_vals,
+                "color": _fuchsia_dyn,
+                "dash": (),
+                "lw": 2,
+                "ymin": y0p,
+                "ymax": y1p,
+            }
+        )
+        if has_relief and z_rel_vals is not None:
+            y0z, y1z = _padded_y_range(list(z_rel_vals))
+            channels.append(
+                {
+                    "id": "dZ",
+                    "zone_label": "ΔZ",
+                    "title": "ΔZ (рельєф від початку траси)",
+                    "vals": list(z_rel_vals),
+                    "color": "#C4A35A",
+                    "dash": (),
+                    "lw": 2,
+                    "ymin": y0z,
+                    "ymax": y1z,
+                }
+            )
+        if has_relief and gauge_vals is not None:
+            y0g, y1g = _padded_y_range(gauge_vals)
+            channels.append(
+                {
+                    "id": "gauge",
+                    "zone_label": "ψ−ΔZ",
+                    "title": "ψ − ΔZ (Z траси від s=0)",
+                    "vals": gauge_vals,
+                    "color": "#81D4FA",
+                    "dash": (2, 3),
+                    "lw": 2,
+                    "ymin": y0g,
+                    "ymax": y1g,
+                }
+            )
+
+        def _default_v_for(cid: str) -> float:
+            att = f"_trunk_pressure_profile_vscale_{cid}"
+            if hasattr(self, att):
+                try:
+                    return max(0.05, min(20.0, float(getattr(self, att))))
+                except (TypeError, ValueError):
+                    pass
+            leg = getattr(self, "_trunk_pressure_profile_vscale", 1.0)
+            try:
+                lf = max(0.05, min(20.0, float(leg)))
+            except (TypeError, ValueError):
+                lf = 1.0
+            return lf
 
         win = tk.Toplevel(self.root)
         win.title(f"Напір вздовж ребра · відрізок #{si + 1} · полив #{int(dom_slot) + 1}")
         win.transient(self.root)
         win.configure(bg="#1e1e1e")
-        win.geometry("900x480")
+        win.geometry("1000x720")
 
         top = tk.Frame(win, bg="#1e1e1e")
         top.pack(fill=tk.X, padx=8, pady=(8, 0))
-        tk.Label(top, text="Вертикальний масштаб (H)", bg="#1e1e1e", fg="#CFD8DC").pack(side=tk.LEFT)
-        v_default = getattr(self, "_trunk_pressure_profile_vscale", 1.0)
-        try:
-            v_default_f = float(v_default)
-        except (TypeError, ValueError):
-            v_default_f = 1.0
-        v_default_f = max(0.05, min(20.0, v_default_f))
-        var_vscale = tk.StringVar(value=str(v_default_f).rstrip("0").rstrip("."))
-        ent_vscale = ttk.Entry(top, textvariable=var_vscale, width=8)
-        ent_vscale.pack(side=tk.LEFT, padx=(8, 6))
-        tk.Label(top, text="(1 = без стискання по H)", bg="#1e1e1e", fg="#90A4AE").pack(side=tk.LEFT)
+        tk.Label(
+            top,
+            text="Масштаб по вертикалі (окремо для кожної панелі; 1 = тільки діапазон даних; <1 — «розтяг»):",
+            bg="#1e1e1e",
+            fg="#CFD8DC",
+            font=("Segoe UI", 11),
+        ).pack(anchor=tk.W)
+        row_sc = tk.Frame(win, bg="#1e1e1e")
+        row_sc.pack(fill=tk.X, padx=8, pady=(2, 0))
+        var_vscale_by_id: Dict[str, tk.StringVar] = {}
+        ent_by_id: Dict[str, ttk.Entry] = {}
+        for ch in channels:
+            cid = str(ch["id"])
+            vf = _default_v_for(cid)
+            var_vscale_by_id[cid] = tk.StringVar(value=str(vf).rstrip("0").rstrip("."))
+            lf = tk.Label(row_sc, text=f"{ch['title'][:18]}:", bg="#1e1e1e", fg="#B0BEC5", font=("Segoe UI", 10))
+            lf.pack(side=tk.LEFT, padx=(0, 2))
+            ent = ttk.Entry(row_sc, textvariable=var_vscale_by_id[cid], width=7)
+            ent.pack(side=tk.LEFT, padx=(0, 10))
+            ent_by_id[cid] = ent
 
         cv = tk.Canvas(win, bg="#101216", highlightthickness=0)
         cv.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
         state: Dict[str, Optional[float]] = {"d": None}
-        geom: Dict[str, float] = {"ml": 56.0, "pw": 1.0, "mt": 18.0, "ph": 1.0, "y0": 1.0}
+        geom: Dict[str, float] = {"ml": 208.0, "pw": 1.0, "mt": 22.0, "ph": 1.0, "y0": 1.0}
 
-        def _current_vscale() -> float:
-            raw = str(var_vscale.get()).replace(",", ".").strip()
+        def _parse_v_entry(var: tk.StringVar) -> float:
+            raw = str(var.get()).replace(",", ".").strip()
             try:
                 v = float(raw)
             except (TypeError, ValueError):
                 v = 1.0
             return max(0.05, min(20.0, v))
+
+        def _persist_vscales() -> None:
+            for cid, var in var_vscale_by_id.items():
+                v = _parse_v_entry(var)
+                setattr(self, f"_trunk_pressure_profile_vscale_{cid}", float(v))
+            if "psi" in var_vscale_by_id:
+                self._trunk_pressure_profile_vscale = float(_parse_v_entry(var_vscale_by_id["psi"]))
+            elif var_vscale_by_id:
+                self._trunk_pressure_profile_vscale = float(
+                    _parse_v_entry(next(iter(var_vscale_by_id.values())))
+                )
 
         def _draw_chart(_event=None) -> None:
             try:
@@ -3497,52 +3747,160 @@ class DripCAD:
             except tk.TclError:
                 pass
             _tsp = "trunk_seg_pressure"
-            ml, mr, mt, mb = 56, 20, 18, 44
+            # ml — відступ під підписи осі Y кожної панелі.
+            ml, mr, mt, mb = 208, 20, 22, 148
             pw = max(10, w - ml - mr)
-            ph = max(10, hcv - mt - mb)
-            y0 = mt + ph
-            geom.update({"ml": float(ml), "pw": float(pw), "mt": float(mt), "ph": float(ph), "y0": float(y0)})
-            cv.create_line(ml, mt, ml, y0, fill="#8FA4B8", width=2, tags=_tsp)
-            cv.create_line(ml, y0, ml + pw, y0, fill="#8FA4B8", width=2, tags=_tsp)
-
-            vscale = _current_vscale()
-            self._trunk_pressure_profile_vscale = vscale
-            h_span_draw = h_span / max(1e-6, vscale)
+            ph_total = max(10, hcv - mt - mb)
+            n_ch = max(1, len(channels))
+            panel_gap = 5.0
+            ph_panel = max(1.0, (ph_total - (n_ch - 1) * panel_gap) / float(n_ch))
+            panels: List[Dict[str, Any]] = []
+            y_cursor = float(mt)
+            for ch in channels:
+                p_top = y_cursor
+                p_bot = p_top + ph_panel
+                cid = str(ch["id"])
+                panels.append(
+                    {
+                        "ch": ch,
+                        "id": cid,
+                        "top": p_top,
+                        "bot": p_bot,
+                        "h": ph_panel,
+                        "ymin": float(ch["ymin"]),
+                        "ymax": float(ch["ymax"]),
+                    }
+                )
+                y_cursor = p_bot + panel_gap
+            chart_bottom = float(panels[-1]["bot"]) if panels else float(mt)
+            y_plot_bottom = chart_bottom - 12.0
+            geom.update({"ml": float(ml), "pw": float(pw), "mt": float(mt), "ph": ph_total, "y0": chart_bottom})
+            panel_by_id = {str(p["id"]): p for p in panels}
 
             def sx(d: float) -> float:
                 return ml + (float(d) / total_len) * pw
 
-            def sy_head(hv: float) -> float:
-                top_h = h_mid + 0.5 * h_span_draw
-                return mt + (top_h - float(hv)) / h_span_draw * ph
+            def sy_for_panel(p: Dict[str, Any], yv: float) -> float:
+                ymin, ymax = float(p["ymin"]), float(p["ymax"])
+                vscale = _parse_v_entry(var_vscale_by_id[str(p["id"])])
+                span = max(1e-9, ymax - ymin)
+                span_draw = span / max(1e-6, vscale)
+                mid = 0.5 * (ymin + ymax)
+                top_y = mid + 0.5 * span_draw
+                return float(p["top"]) + (top_y - float(yv)) / span_draw * float(p["h"])
 
-            pts: List[float] = []
-            for d, hv in zip(d_vals, head_vals):
-                pts.extend([sx(d), sy_head(hv)])
-            if len(pts) >= 4:
-                cv.create_line(*pts, fill="#A5D6A7", width=2, smooth=False, tags=_tsp)
+            cv.create_line(ml, mt, ml, chart_bottom, fill="#8FA4B8", width=2, tags=_tsp)
+            cv.create_line(ml, chart_bottom, ml + pw, chart_bottom, fill="#8FA4B8", width=2, tags=_tsp)
 
+            for i, p in enumerate(panels):
+                ch = p["ch"]
+                pts_ln: List[float] = []
+                for d, v in zip(d_vals, ch["vals"]):
+                    pts_ln.extend([sx(d), sy_for_panel(p, float(v))])
+                if len(pts_ln) >= 4:
+                    dash = ch.get("dash")
+                    if isinstance(dash, (list, tuple)) and len(dash) > 0:
+                        cv.create_line(
+                            *pts_ln,
+                            fill=str(ch["color"]),
+                            width=int(ch.get("lw", 2)),
+                            dash=tuple(dash),
+                            smooth=False,
+                            tags=_tsp,
+                        )
+                    else:
+                        cv.create_line(
+                            *pts_ln,
+                            fill=str(ch["color"]),
+                            width=int(ch.get("lw", 2)),
+                            smooth=False,
+                            tags=_tsp,
+                        )
+                if i < len(panels) - 1:
+                    cv.create_line(ml, p["bot"], ml + pw, p["bot"], fill="#37474F", width=1, tags=_tsp)
+                col = str(ch.get("color", "#B0BEC5"))
+                cy = float(p["top"]) + 0.5 * float(p["h"])
+                t_full = str(ch.get("title", "") or "").strip()
+                zlab = str(ch.get("zone_label") or t_full)
+                if float(p["h"]) >= 52.0 and t_full:
+                    cv.create_text(
+                        6,
+                        cy,
+                        text=t_full,
+                        anchor=tk.W,
+                        fill=col,
+                        font=("Segoe UI", 9, "bold"),
+                        width=118,
+                        tags=_tsp,
+                    )
+                elif zlab:
+                    cv.create_text(
+                        8,
+                        cy,
+                        text=zlab,
+                        anchor=tk.W,
+                        fill=col,
+                        font=("Segoe UI", 11, "bold"),
+                        tags=_tsp,
+                    )
+                ticks_right = (i % 2) == 1
+                for frac in (0.0, 0.5, 1.0):
+                    yy = p["ymin"] + (p["ymax"] - p["ymin"]) * frac
+                    y_pix = sy_for_panel(p, yy)
+                    if ticks_right:
+                        cv.create_line(ml, y_pix, ml + 4, y_pix, fill=col, width=2, tags=_tsp)
+                        cv.create_text(
+                            ml + 8,
+                            y_pix,
+                            text=f"{yy:.1f}",
+                            anchor=tk.W,
+                            fill=col,
+                            font=("Segoe UI", 11, "bold"),
+                            tags=_tsp,
+                        )
+                    else:
+                        cv.create_line(ml - 4, y_pix, ml, y_pix, fill=col, width=2, tags=_tsp)
+                        cv.create_text(
+                            ml - 8,
+                            y_pix,
+                            text=f"{yy:.1f}",
+                            anchor=tk.E,
+                            fill=col,
+                            font=("Segoe UI", 11, "bold"),
+                            tags=_tsp,
+                        )
+
+            s_axis_y = chart_bottom
             for frac in (0.0, 0.5, 1.0):
-                d = total_len * frac
-                x = sx(d)
-                cv.create_line(x, y0, x, y0 + 4, fill="#8FA4B8", tags=_tsp)
-                cv.create_text(x, y0 + 8, text=f"{d:.0f} м", anchor=tk.N, fill="#B0BEC5", font=("Segoe UI", 8), tags=_tsp)
-            for frac in (0.0, 0.5, 1.0):
-                hh = h_min + (h_max - h_min) * frac
-                y = sy_head(hh)
-                cv.create_line(ml - 4, y, ml, y, fill="#8FA4B8", tags=_tsp)
-                cv.create_text(ml - 8, y, text=f"{hh:.1f}", anchor=tk.E, fill="#B0BEC5", font=("Segoe UI", 8), tags=_tsp)
+                d_ax = total_len * frac
+                x_ax = sx(d_ax)
+                cv.create_line(x_ax, s_axis_y, x_ax, s_axis_y + 4, fill="#8FA4B8", tags=_tsp)
+                cv.create_text(
+                    x_ax,
+                    s_axis_y + 10,
+                    text=f"{d_ax:.0f} м",
+                    anchor=tk.N,
+                    fill="#B0BEC5",
+                    font=("Segoe UI", 14),
+                    tags=_tsp,
+                )
 
             d_probe = state.get("d")
             if d_probe is not None:
                 dp = max(0.0, min(float(d_probe), total_len))
                 hp = float(DripCAD._trunk_head_at_s_on_pieces(dp, profile_pieces))
+                dpr = DripCAD._trunk_d_inner_mm_at_s_on_pieces(dp, profile_pieces)
+                od_probe = self._trunk_pipe_row_outer_d_mm_str(None, seg, float(dpr))
+                if not od_probe or od_probe == "—":
+                    od_probe = f"{float(dpr):.0f}"
+                psip = float(DripCAD._trunk_bernoulli_psi_static_m(hp, q_edge, dpr))
                 xp = sx(dp)
-                yp = sy_head(hp)
+                p_psi = panel_by_id.get("psi")
+                yp = sy_for_panel(p_psi, psip) if p_psi is not None else chart_bottom * 0.5
                 ah = 7.0
                 aw = 10.0
                 y_top = float(mt) + ah
-                y_bot = float(y0) - ah
+                y_bot = float(y_plot_bottom)
                 if y_bot > y_top + 4.0:
                     cv.create_line(xp, y_top, xp, y_bot, fill="#FFEB3B", width=2, tags=_tsp)
                 cv.create_polygon(
@@ -3557,19 +3915,25 @@ class DripCAD:
                     width=1,
                     tags=_tsp,
                 )
+                y_mark = float(y_plot_bottom)
                 cv.create_polygon(
                     xp,
-                    y0,
+                    y_mark,
                     xp - aw * 0.5,
-                    y0 - ah,
+                    y_mark - ah,
                     xp + aw * 0.5,
-                    y0 - ah,
+                    y_mark - ah,
                     fill="#FFEB3B",
                     outline="#F57F17",
                     width=1,
                     tags=_tsp,
                 )
-                cv.create_line(xp, yp, xp, y0, fill="#FFF59D", dash=(3, 3), width=1, tags=_tsp)
+                y_a = float(yp)
+                y_b = float(y_plot_bottom)
+                y_d1 = min(y_a, y_b)
+                y_d2 = max(y_a, y_b)
+                if y_d2 > y_d1 + 0.5:
+                    cv.create_line(xp, y_d1, xp, y_d2, fill="#FFF59D", dash=(3, 3), width=1, tags=_tsp)
                 cv.create_polygon(
                     xp,
                     yp - 6,
@@ -3582,43 +3946,130 @@ class DripCAD:
                     width=2,
                     tags=_tsp,
                 )
+                for p in panels:
+                    cid = str(p["id"])
+                    if cid == "psi":
+                        continue
+                    try:
+                        if cid == "H":
+                            y_mark_c = float(hp)
+                        elif cid == "dZ" and has_relief and z_rel_vals is not None:
+                            z0p = float(self.topo.get_z(*self._polyline_point_at_dist(path, 0.0)))
+                            pxp, _pyp = self._polyline_point_at_dist(path, dp)
+                            y_mark_c = float(self.topo.get_z(pxp, _pyp)) - z0p
+                        elif cid == "gauge" and has_relief and z_rel_vals is not None:
+                            z0p = float(self.topo.get_z(*self._polyline_point_at_dist(path, 0.0)))
+                            pxp, _pyp = self._polyline_point_at_dist(path, dp)
+                            dz_rel = float(self.topo.get_z(pxp, _pyp)) - z0p
+                            y_mark_c = float(psip) - dz_rel
+                        else:
+                            continue
+                        yc = sy_for_panel(p, y_mark_c)
+                        cv.create_oval(xp - 4, yc - 4, xp + 4, yc + 4, outline=str(p["ch"]["color"]), width=2, tags=_tsp)
+                    except Exception:
+                        pass
+                vq_p = max(0.0, float(hp) - float(psip))
+                # Підказка — біля правого краю поля графіка (не перекриває підписи осі Y зліва).
+                xr = float(ml) + float(pw) - 10.0
+                fpr = ("Segoe UI", 12)
+                lines_probe: List[Tuple[str, str]] = [
+                    ("s", f"{dp:.1f} м"),
+                    ("H", f"{hp:.2f} м"),
+                    ("v²/2g", f"{vq_p:.4f} м"),
+                    ("ψ", f"{psip:.2f} м"),
+                    ("Ø", f"{od_probe} мм"),
+                    ("Q", f"{q_edge:.4f} м³/с"),
+                ]
+                if has_relief:
+                    try:
+                        pxp, pyp = self._polyline_point_at_dist(path, dp)
+                        z_abs_p = float(self.topo.get_z(pxp, pyp))
+                        dzp = z_abs_p - float(
+                            self.topo.get_z(*self._polyline_point_at_dist(path, 0.0))
+                        )
+                        lines_probe.append(("ΔZ", f"{dzp:.2f} м"))
+                        lines_probe.append(("ψ−ΔZ", f"{psip - dzp:.2f} м"))
+                    except Exception:
+                        pass
+                n_ln = len(lines_probe)
+                lh = 17.0
+                y_mid = float(yp)
+                y_top_blk = y_mid - 0.5 * lh * float(max(1, n_ln))
+                y_top_blk = max(float(mt) + 8.0, min(y_top_blk, float(y_plot_bottom) - lh * float(n_ln) - 8.0))
+                for i, (lab, val) in enumerate(lines_probe):
+                    yy = y_top_blk + lh * float(i)
+                    col = "#ECEFF1"
+                    if lab == "H":
+                        col = "#A5D6A7"
+                    elif lab in ("v²/2g", "ψ"):
+                        col = _fuchsia_dyn
+                    elif lab in ("ΔZ", "ψ−ΔZ"):
+                        col = "#B3E5FC"
+                    cv.create_text(
+                        xr,
+                        yy,
+                        text=f"{lab}  {val}",
+                        anchor=tk.E,
+                        fill=col,
+                        font=fpr,
+                        tags=_tsp,
+                    )
+
+            if use_hw_telescope:
+                if has_relief:
+                    sub_lines = [
+                        "Кожна крива — окрема панель з власною віссю Y і коефіцієнтом масштабу зверху (1 = лише діапазон даних).",
+                        "s — відстань по полілінії; H — HW по секціях телескопа (trunk_tree).",
+                        "ψ = H − Q²/(2gA²) — Бернуллі; ΔZ(s) — Z(s)−Z(0) по трасі; ψ−ΔZ — ψ мінус той самий ΔZ (без абсолютного Z).",
+                    ]
+                else:
+                    sub_lines = [
+                        "Дві панелі: H і ψ — кожна зі своєю віссю Y і масштабом зверху (1 = уміщення діапазону даних).",
+                        "s — відстань по полілінії; H — HW по секціях телескопа (trunk_tree).",
+                        "ψ = H − Q²/(2gA²) — статична складова; A = π(d/2)² за d(s) з секцій.",
+                    ]
+            else:
+                if has_relief:
+                    sub_lines = [
+                        "Кожна крива — окрема панель з власною віссю Y і коефіцієнтом масштабу зверху.",
+                        "s — по трасі; H — лінійно між напорами кінцевих вузлів; ψ — Бернуллі (d,Q з segment_hover).",
+                        "ΔZ(s) — Z(s)−Z(0); ψ−ΔZ — без абсолютної висоти, лише відносно початку полілінії траси.",
+                    ]
+                else:
+                    sub_lines = [
+                        "Дві панелі (H і ψ) з окремими осями Y і масштабами зверху.",
+                        "s — відстань по трасі між вузлами; H — лінійно між напорами кінцевих вузлів.",
+                        "ψ — з Бернуллі та d,Q з segment_hover; A = π(d/2)² за поточним Ø ребра.",
+                    ]
+            pad_leg = 10.0
+            x_left = float(ml) + 8.0
+            x_right = float(ml) + float(pw) - 8.0
+            y_top = float(chart_bottom) + 10.0
+            lh_leg = 21.0
+            n_leg = len(sub_lines)
+            y_bot = y_top + 2.0 * pad_leg + lh_leg * float(n_leg)
+            cv.create_rectangle(
+                x_left,
+                y_top,
+                x_right,
+                y_bot,
+                outline="#689F63",
+                width=1,
+                fill="#141916",
+                tags=_tsp,
+            )
+            x_txt = x_left + pad_leg
+            y_txt0 = y_top + pad_leg
+            for i, row in enumerate(sub_lines):
                 cv.create_text(
-                    min(xp + 10.0, ml + pw - 4.0),
-                    mt + 8,
-                    text=f"s={dp:.1f} м, H≈{hp:.2f} м вод. ст.",
+                    x_txt,
+                    y_txt0 + lh_leg * float(i),
+                    text=row,
                     anchor=tk.NW,
-                    fill="#FFFDE7",
-                    font=("Segoe UI", 8, "bold"),
+                    fill="#A5D6A7",
+                    font=("Segoe UI", 14),
                     tags=_tsp,
                 )
-
-            cv.create_text(
-                ml + pw / 2,
-                hcv - 18,
-                text=(
-                    f"L={total_len:.1f} м · H(поч. траси)={h0:.2f} · H(кін. траси)={h1:.2f} м вод. ст. · "
-                    f"масштаб H: ×{vscale:.3g} · ΔH по трасі={abs(h1 - h0):.3f} м"
-                ),
-                anchor=tk.CENTER,
-                fill="#CFD8DC",
-                font=("Segoe UI", 9, "bold"),
-                tags=_tsp,
-            )
-            sub = (
-                "s — відстань по полілінії від першого вузла відрізка; H — HW по секціях телескопа з trunk_tree "
-                "(узгоджено з compute_trunk_tree_steady), кути на стиках секцій."
-                if use_hw_telescope
-                else "s — відстань по трасі; H — лінійно між напорами кінцевих вузлів (немає секцій у trunk_tree для цього ребра)."
-            )
-            cv.create_text(
-                ml + pw / 2,
-                mt - 2,
-                text=sub,
-                anchor=tk.S,
-                fill="#A5D6A7",
-                font=("Segoe UI", 8),
-                tags=_tsp,
-            )
 
         def _on_motion(ev: tk.Event) -> None:
             ml = float(geom["ml"])
@@ -3639,18 +4090,22 @@ class DripCAD:
             _draw_chart()
 
         def _apply_vscale(_ev=None) -> None:
-            v = _current_vscale()
-            var_vscale.set(str(v).rstrip("0").rstrip("."))
+            _persist_vscales()
+            for cid, var in var_vscale_by_id.items():
+                v = _parse_v_entry(var)
+                var.set(str(v).rstrip("0").rstrip("."))
             _draw_chart()
 
         def _on_close() -> None:
+            _persist_vscales()
             self._set_trunk_profile_probe(None, None, None)
             try:
                 win.destroy()
             except tk.TclError:
                 pass
 
-        ent_vscale.bind("<Return>", _apply_vscale, add="+")
+        for _e in ent_by_id.values():
+            _e.bind("<Return>", _apply_vscale, add="+")
         cv.bind("<Configure>", _draw_chart, add="+")
         cv.bind("<Motion>", _on_motion, add="+")
         cv.bind("<Enter>", _on_motion, add="+")
@@ -4648,6 +5103,14 @@ class DripCAD:
                 if callable(res):
                     try:
                         res()
+                    except Exception:
+                        pass
+                # Поки вкладка «Карта» була неактивна, overlay не оновлювався — підганяємо вид під геометрію проєкту.
+                try:
+                    self.root.after(50, self.refresh_map_after_project_load)
+                except Exception:
+                    try:
+                        self.refresh_map_after_project_load()
                     except Exception:
                         pass
         else:
@@ -7013,10 +7476,15 @@ class DripCAD:
 
     @staticmethod
     def _trunk_non_empty_section_list_from_seg(seg: Any) -> List[Any]:
-        """Секції телескопа з сегмента карти: спершу telescoped_sections, інакше непорожній sections."""
+        """
+        Секції телескопа з сегмента карти: спочатку sections (як у _normalize_trunk_tree_payload
+        і _trunk_segment_telescope_path_chunks), інакше telescoped_sections.
+        Узгоджено, щоб після оновлення лише sections не підхоплювався застарілий коротший telescoped_sections
+        при sync карти → дерево перед розрахунком.
+        """
         if not isinstance(seg, dict):
             return []
-        for key in ("telescoped_sections", "sections"):
+        for key in ("sections", "telescoped_sections"):
             v = seg.get(key)
             if isinstance(v, list) and len(v) > 0:
                 return list(v)
@@ -7191,8 +7659,10 @@ class DripCAD:
             if d_seg is not None and d_seg > 0.0:
                 dmm = d_seg
                 chw = float(ch_seg) if ch_seg is not None else 140.0
-                secs = list(sec_seg) if sec_seg else []
-                if not secs:
+                if sec_seg:
+                    secs = self._rescale_trunk_telescope_sections_for_length(sec_seg, float(lm))
+                else:
+                    secs = []
                     _pd, _pch, prior_secs = old_or.get(
                         (pa, pb), old_un.get(tuple(sorted((pa, pb))), (90.0, 140.0, []))
                     )
@@ -7202,6 +7672,8 @@ class DripCAD:
                 dmm, chw, secs = old_or.get(
                     (pa, pb), old_un.get(tuple(sorted((pa, pb))), (90.0, 140.0, []))
                 )
+                if isinstance(secs, list) and secs and lm > 1e-9:
+                    secs = self._rescale_trunk_telescope_sections_for_length(secs, float(lm))
 
             edge_row = {
                     "parent_id": pa,
@@ -9560,6 +10032,7 @@ class DripCAD:
                 "trunk_display_velocity_warn_mps": 0.0,
                 "trunk_pipes_selected": False,
                 "trunk_telescope_label_pos": {},
+                "srtm_source_mode": "auto",
             }
             return
         groups = raw.get("groups")
@@ -9601,7 +10074,7 @@ class DripCAD:
                 mph = float(v)
         except (TypeError, ValueError):
             mph = 50.0
-        mph = max(1.0, min(400.0, float(mph)))
+        mph = max(0.0, min(400.0, float(mph)))
         vm = 0.0
         try:
             vx = raw.get("trunk_schedule_v_max_mps")
@@ -9708,7 +10181,71 @@ class DripCAD:
             "trunk_display_velocity_warn_mps": vwarn,
             "trunk_pipes_selected": bool(raw.get("trunk_pipes_selected", False)),
             "trunk_telescope_label_pos": tel_pos,
+            "srtm_source_mode": str(raw.get("srtm_source_mode", "auto")).strip().lower(),
         }
+        if self.consumer_schedule["srtm_source_mode"] not in (
+            "auto",
+            "skadi_local",
+            "open_elevation",
+            "earthdata",
+        ):
+            self.consumer_schedule["srtm_source_mode"] = "auto"
+
+    @staticmethod
+    def _srtm_source_mode_labels() -> Dict[str, str]:
+        return {
+            "auto": "Авто",
+            "skadi_local": "Skadi+локальні",
+            "open_elevation": "Open-Elevation",
+            "earthdata": "NASA Earthdata",
+        }
+
+    def sync_srtm_source_mode_var_from_schedule(self) -> None:
+        self.normalize_consumer_schedule()
+        if not hasattr(self, "var_srtm_source_mode"):
+            return
+        mode = str((self.consumer_schedule or {}).get("srtm_source_mode", "auto")).strip().lower()
+        if mode not in self._srtm_source_mode_labels():
+            mode = "auto"
+        try:
+            self.var_srtm_source_mode.set(mode)
+        except tk.TclError:
+            pass
+
+    def sync_srtm_source_mode_widgets(self) -> None:
+        combo = getattr(self, "cb_srtm_source_mode", None)
+        lbl = getattr(self, "lbl_srtm_active_provider", None)
+        labels = self._srtm_source_mode_labels()
+        mode = str(getattr(self, "var_srtm_source_mode", tk.StringVar(value="auto")).get() or "auto")
+        mode = mode if mode in labels else "auto"
+        if combo is not None:
+            try:
+                combo.set(labels.get(mode, labels["auto"]))
+            except tk.TclError:
+                pass
+        provider_map = {
+            "skadi_local": "локальні/Skadi",
+            "open_elevation": "Open-Elevation",
+            "earthdata": "NASA Earthdata",
+        }
+        active = provider_map.get(str(getattr(self, "_srtm_active_provider", "skadi_local")), "локальні/Skadi")
+        if lbl is not None:
+            try:
+                lbl.config(text=f"Активне: {active}")
+            except tk.TclError:
+                pass
+
+    def _on_srtm_source_combo(self, _event=None) -> None:
+        combo = getattr(self, "cb_srtm_source_mode", None)
+        if combo is None:
+            return
+        label = str(combo.get() or "").strip()
+        rev = {v: k for k, v in self._srtm_source_mode_labels().items()}
+        mode = rev.get(label, "auto")
+        self.var_srtm_source_mode.set(mode)
+        self.normalize_consumer_schedule()
+        self.consumer_schedule["srtm_source_mode"] = mode
+        self.sync_srtm_source_mode_widgets()
 
     def sync_trunk_display_velocity_warn_var_from_schedule(self) -> None:
         """Підставити в поле UI значення з consumer_schedule (завантаження проєкту тощо). Не викликати з redraw."""
@@ -10586,19 +11123,25 @@ class DripCAD:
         try:
             vmax = float(lim.get("max_pipe_velocity_mps", 0.0) or 0.0)
             h_zad = float(lim.get("pump_operating_head_m", lim.get("max_pump_head_m", 0.0)) or 0.0)
+            h_eff = float(lim.get("effective_pump_source_head_m", h_zad) or h_zad)
         except (TypeError, ValueError):
-            vmax, h_zad = 0.0, 0.0
+            vmax, h_zad, h_eff = 0.0, 0.0, 0.0
         is_required_mode = str(mode.get("pump_head_mode", "fixed")).strip().lower() == "required"
         if is_required_mode:
             try:
                 h_zad = float(env.get("max_source_head_m", h_zad) or h_zad)
             except (TypeError, ValueError):
                 pass
+            h_eff = h_zad
         if h_zad <= 1e-9:
             try:
                 h_zad = float(self.consumer_schedule.get("max_pump_head_m", 50.0) or 50.0)
             except (TypeError, ValueError):
                 h_zad = 50.0
+            h_eff = h_zad
+        h_extra = ""
+        if not is_required_mode and abs(h_eff - h_zad) > 1e-3:
+            h_extra = f"  [у моделі H_джерела≈{h_eff:.1f} м]"
         lim_s = ""
         if vmax > 1e-9:
             lim_s = f"  •  v≤{vmax:.1f} м/с"
@@ -10618,12 +11161,12 @@ class DripCAD:
             req_src_frag = f"  •  H на джерелі мін. (оцінка) ≈ {h_min_src_req:.1f} м"
         if h_worst is not None:
             line1 = (
-                f"Насос: {head_caption} {h_zad:.1f} м{req_src_frag}  •  H мін. у споживачах ≈ {h_worst:.1f} м  •  "
+                f"Насос: {head_caption} {h_zad:.1f} м{h_extra}{req_src_frag}  •  H мін. у споживачах ≈ {h_worst:.1f} м  •  "
                 f"Q≥{self._fmt_flow_m3h(q_m3h)} м³/год{lim_s}"
             )
         else:
             line1 = (
-                f"Насос: {head_caption} {h_zad:.1f} м{req_src_frag}  •  Q≥{self._fmt_flow_m3h(q_m3h)} м³/год{lim_s}"
+                f"Насос: {head_caption} {h_zad:.1f} м{h_extra}{req_src_frag}  •  Q≥{self._fmt_flow_m3h(q_m3h)} м³/год{lim_s}"
             )
         line2 = (
             "(H мін. у споживачах — найнижчий напір серед активних споживачів у розрахованих поливах; "
@@ -10652,21 +11195,26 @@ class DripCAD:
         mode = h.get("mode") if isinstance(h.get("mode"), dict) else {}
         try:
             p_m = float(lim.get("pump_operating_head_m", lim.get("max_pump_head_m", 0.0)) or 0.0)
+            p_eff = float(lim.get("effective_pump_source_head_m", p_m) or p_m)
         except (TypeError, ValueError):
-            p_m = 0.0
+            p_m, p_eff = 0.0, 0.0
         if str(mode.get("pump_head_mode", "fixed")).strip().lower() == "required":
             try:
                 p_m = float(env.get("max_source_head_m", p_m) or p_m)
             except (TypeError, ValueError):
                 pass
+            p_eff = p_m
         if p_m <= 1e-9:
             try:
                 p_m = float(self.consumer_schedule.get("max_pump_head_m", 50.0) or 50.0)
             except (TypeError, ValueError):
                 p_m = 50.0
+            p_eff = p_m
         if q_m3h <= 1e-9 and p_m <= 1e-9:
             return None
-        return (f"Q ≈ {self._fmt_flow_m3h(q_m3h)} м³/год", f"P ≈ {p_m:.1f} м вод. ст.")
+        p_show = p_eff if abs(p_eff - p_m) > 1e-3 else p_m
+        p_note = f"H_джерела≈{p_show:.1f} м" if abs(p_eff - p_m) > 1e-3 else f"P ≈ {p_show:.1f} м вод. ст."
+        return (f"Q ≈ {self._fmt_flow_m3h(q_m3h)} м³/год", p_note)
 
     def _draw_trunk_irrigation_pump_label_canvas(self) -> None:
         lines = self.trunk_irrigation_hydro_pump_label_lines()
@@ -11188,18 +11736,128 @@ class DripCAD:
         optimized_used = False
         best_metric_val: Optional[float] = None
         last_cache_ok: Optional[dict] = None
+        # Трекаємо найкращий за дефіцитом варіант серед усіх ітерацій (може бути з дефіцитом).
+        best_def_val: float = float("inf")
+        best_def_cache: Optional[dict] = None
+        best_def_tree: Optional[dict] = None
+        best_def_metric_val: Optional[float] = None
         budget = float(max_hloss_budget_m)
         n_mat = max(1, len(eff_filtered))
+        surf_z = self._trunk_surface_z_callback()
 
-        for _iter in range(4):
+        def _cache_worst_deficit_m(cache_obj: Any) -> float:
+            if not isinstance(cache_obj, dict):
+                return float("inf")
+            wd = 0.0
+            for row in (cache_obj.get("per_slot") or {}).values():
+                if not isinstance(row, dict):
+                    continue
+                try:
+                    wd = max(wd, float(row.get("head_deficit_m", 0.0) or 0.0))
+                except (TypeError, ValueError):
+                    continue
+            return float(wd)
+
+        # --- Оцінка геодезичного перепаду dz_eff по найгіршому споживачу ---
+        # Optimizer не знає про геодезію: він працює лише з бюджетом ΔH (втрати напору).
+        # Щоб його бюджет відповідав реальній фізиці compute_trunk_irrigation_schedule_hydro,
+        # треба зменшити його на геодезичний підйом уздовж магістралі. Оцінюємо як різницю
+        # `min_consumer_head` між розрахунком без рельєфу і з рельєфом для однорідної найбільшої
+        # дозволеної труби (однакове для обох викликів — отже різниця == dz по найгіршому шляху).
+        dz_eff: float = 0.0
+        try:
+            cands_init = allowed_pipe_candidates_sorted(
+                normalize_allowed_pipes_map(eff_filtered), pipe_db
+            )
+        except Exception:
+            cands_init = []
+        if cands_init and surf_z is not None:
+            pick_u = cands_init[-1]
+            try:
+                d_nom_u = float(pick_u.get("d", 0.0) or 0.0)
+                d_in_u = float(pick_u.get("inner", 0.0) or 0.0)
+                c_hw_u = float(pick_u.get("c_hw", 140.0) or 140.0)
+            except (TypeError, ValueError):
+                d_nom_u, d_in_u, c_hw_u = 0.0, 0.0, 140.0
+            mat_u = str(pick_u.get("mat", "")).strip()
+            pn_u = str(pick_u.get("pn", "")).strip()
+            if d_nom_u > 0.0 and d_in_u > 0.0:
+                payload_probe = self._normalize_trunk_tree_payload(trunk_tree_working)
+                for edge in payload_probe.get("edges", []):
+                    if not isinstance(edge, dict):
+                        continue
+                    try:
+                        lm_u = float(edge.get("length_m", 0.0) or 0.0)
+                    except (TypeError, ValueError):
+                        lm_u = 0.0
+                    edge["d_inner_mm"] = d_in_u
+                    edge["c_hw"] = c_hw_u
+                    if lm_u > 1e-9:
+                        sec_u = [{
+                            "length_m": lm_u,
+                            "d_nom_mm": d_nom_u,
+                            "d_inner_mm": d_in_u,
+                            "material": mat_u,
+                            "pn": pn_u,
+                        }]
+                        edge["sections"] = copy.deepcopy(sec_u)
+                        edge["telescoped_sections"] = copy.deepcopy(sec_u)
+                    else:
+                        edge.pop("sections", None)
+                        edge.pop("telescoped_sections", None)
+                try:
+                    # Використовуємо високий pump_operating_head_m, щоб уникнути випадку
+                    # "uniform largest не закриває target" — тоді compute може обрізати hydraulics
+                    # або видати попередження/дефіцит, що завадить коректно зчитати min_hc.
+                    probe_pump_h = float(mph) + 1000.0
+                    c_with_z, g_with_z = compute_trunk_irrigation_schedule_hydro(
+                        trunk_nodes, trunk_segments, slots, payload_probe,
+                        q_consumer_m3h=float(dq), target_head_m=float(dh),
+                        max_pipe_velocity_mps=v_pipe_max,
+                        pump_operating_head_m=probe_pump_h,
+                        use_required_pump_head=False,
+                        surface_z_at_xy=surf_z,
+                    )
+                    c_no_z, g_no_z = compute_trunk_irrigation_schedule_hydro(
+                        trunk_nodes, trunk_segments, slots, payload_probe,
+                        q_consumer_m3h=float(dq), target_head_m=float(dh),
+                        max_pipe_velocity_mps=v_pipe_max,
+                        pump_operating_head_m=probe_pump_h,
+                        use_required_pump_head=False,
+                        surface_z_at_xy=None,
+                    )
+                    env_wz = (c_with_z.get("envelope") or {}) if isinstance(c_with_z.get("envelope"), dict) else {}
+                    env_nz = (c_no_z.get("envelope") or {}) if isinstance(c_no_z.get("envelope"), dict) else {}
+                    hc_wz = env_wz.get("worst_min_consumer_head_m")
+                    hc_nz = env_nz.get("worst_min_consumer_head_m")
+                    if hc_wz is not None and hc_nz is not None:
+                        # Різниця консумер-напорів двох розрахунків = алгебраїчне dz уздовж
+                        # найгіршого шляху (hf_uniform однакове в обох викликах — скорочується).
+                        # Додатнє dz => споживач ВИЩЕ джерела (рельєф забирає напір) =>
+                        #   бюджет на втрати тертя треба звузити.
+                        # Від'ємне dz => споживач НИЖЧЕ джерела (рельєф дає запас) =>
+                        #   бюджет на втрати тертя можна РОЗШИРИТИ, аби optimizer міг обрати
+                        #   легшу комбінацію, яка скидає саме надлишок напору (H_сп ≈ target).
+                        dz_eff = float(hc_nz) - float(hc_wz)
+                except Exception:
+                    dz_eff = 0.0
+        if abs(dz_eff) > 1e-6:
+            budget = max(0.1, float(max_hloss_budget_m) - float(dz_eff))
+            direction = "підйом" if dz_eff > 0 else "спуск"
             _prog(
-                f"Магістраль поливів: іт.{_iter + 1}/4, ΔH≤{budget:.1f} м "
+                f"Магістраль поливів: геодезичний {direction} ΔZ≈{dz_eff:+.2f} м → "
+                f"робочий бюджет ΔH≤{budget:.2f} м"
+            )
+
+        for _iter in range(8):
+            _prog(
+                f"Магістраль поливів: іт.{_iter + 1}/8, ΔH≤{budget:.1f} м "
                 f"({len(eff_filtered)} мат.)"
             )
             failed_by_mat: List[str] = []
             best_local = None
             for mi, (mat, pns) in enumerate(eff_filtered.items()):
-                _prog(f"Підбір: {mat} ({mi + 1}/{n_mat}), іт.{_iter + 1}/4")
+                _prog(f"Підбір: {mat} ({mi + 1}/{n_mat}), іт.{_iter + 1}/8")
                 allowed_one = {str(mat): pns} if isinstance(pns, dict) else {}
                 out_opt, issues_opt = optimize_trunk_diameters_by_weight(
                     trunk_nodes,
@@ -11216,6 +11874,7 @@ class DripCAD:
                     max_sections_per_edge=int(max_sections_per_edge),
                     pump_operating_head_m=float(mph),
                     schedule_target_head_m=float(dh),
+                    surface_z_at_xy=surf_z,
                 )
                 if issues_opt:
                     failed_by_mat.append(f"[{mat}] " + "; ".join(str(msg) for msg in issues_opt[:2]))
@@ -11279,27 +11938,151 @@ class DripCAD:
                 max_pipe_velocity_mps=v_pipe_max,
                 pump_operating_head_m=mph,
                 use_required_pump_head=False,
+                surface_z_at_xy=surf_z,
             )
             if g2:
                 auto_warn_msgs.extend(g2[:4])
                 budget *= 1.18
                 continue
-            last_cache_ok = cache2
             optimized_used = True
-            worst_def = 0.0
-            for row in (cache2.get("per_slot") or {}).values():
-                if not isinstance(row, dict):
-                    continue
-                try:
-                    worst_def = max(worst_def, float(row.get("head_deficit_m", 0.0) or 0.0))
-                except (TypeError, ValueError):
-                    continue
+            worst_def = _cache_worst_deficit_m(cache2)
+            # Запам'ятовуємо варіант з мінімальним дефіцитом (а серед таких — з меншою метрикою).
+            cur_metric = float(best_local[0])
+            improved = (worst_def + 1e-9 < best_def_val) or (
+                abs(worst_def - best_def_val) <= 1e-9
+                and (best_def_metric_val is None or cur_metric + 1e-9 < best_def_metric_val)
+            )
+            if improved:
+                best_def_val = worst_def
+                best_def_cache = cache2
+                best_def_tree = copy.deepcopy(trunk_tree_working)
+                best_def_metric_val = cur_metric
+            # `last_cache_ok` фіксуємо ЛИШЕ для безпрофіцитних варіантів — щоб не повертати
+            # користувачу "дефіцитний телескоп" навіть якщо в наступних ітераціях погіршаємо.
             if worst_def <= 1e-3:
+                last_cache_ok = cache2
+                best_metric_val = cur_metric
                 break
-            budget *= max(1.05, min(1.35, 1.0 + worst_def / max(1.0, dh)))
+            # Є дефіцит напору у перевірці по слотах: бюджет втрат треба ЗМЕНШУВАТИ
+            # (строгіший ΔH => більші діаметри), а не розширювати.
+            tighten = max(0.45, min(0.95, 1.0 - worst_def / max(1.0, dh)))
+            budget = max(0.1, budget * tighten)
 
-        trunk_hydro_opt_applied = bool(optimized_used)
+        trunk_hydro_opt_applied = bool(optimized_used and last_cache_ok is not None)
+        # Fallback для авто-режиму спрацьовує у двох випадках:
+        #   1) оптимізатор не знайшов жодного допустимого рішення (optimized_used=False);
+        #   2) усі знайдені ним варіанти телескопа давали дефіцит напору у перевірці по
+        #      слотах (last_cache_ok is None) — не можна віддавати користувачеві дефіцитний
+        #      телескоп, якщо однорідна найбільша труба закриває дефіцит або дає менший.
         if not trunk_hydro_opt_applied:
+            # Fallback для авто-режиму: якщо оптимізатор не знайшов допустиме рішення,
+            # а в кеші лишився дефіцит, пробуємо однорідну найбільшу дозволену трубу
+            # на всіх ребрах, щоб уникнути "залипання" на старому телескопі.
+            try:
+                cands = allowed_pipe_candidates_sorted(
+                    normalize_allowed_pipes_map(eff_filtered), pipe_db
+                )
+            except Exception:
+                cands = []
+            if cands:
+                pick = cands[-1]
+                try:
+                    d_nom = float(pick.get("d", 0.0) or 0.0)
+                    d_in = float(pick.get("inner", 0.0) or 0.0)
+                except (TypeError, ValueError):
+                    d_nom, d_in = 0.0, 0.0
+                if d_nom > 0.0 and d_in > 0.0:
+                    try:
+                        c_hw = float(pick.get("c_hw", 140.0) or 140.0)
+                    except (TypeError, ValueError):
+                        c_hw = 140.0
+                    mat = str(pick.get("mat", "")).strip()
+                    pn = str(pick.get("pn", "")).strip()
+                    payload_u = self._normalize_trunk_tree_payload(trunk_tree_working)
+                    for edge in payload_u.get("edges", []):
+                        if not isinstance(edge, dict):
+                            continue
+                        try:
+                            lm = float(edge.get("length_m", 0.0) or 0.0)
+                        except (TypeError, ValueError):
+                            lm = 0.0
+                        edge["d_inner_mm"] = d_in
+                        edge["c_hw"] = c_hw
+                        if lm > 1e-9:
+                            sec = [{
+                                "length_m": lm,
+                                "d_nom_mm": d_nom,
+                                "d_inner_mm": d_in,
+                                "material": mat,
+                                "pn": pn,
+                            }]
+                            edge["sections"] = copy.deepcopy(sec)
+                            edge["telescoped_sections"] = copy.deepcopy(sec)
+                        else:
+                            edge.pop("sections", None)
+                            edge.pop("telescoped_sections", None)
+                    trunk_tree_working.clear()
+                    trunk_tree_working.update(self._normalize_trunk_tree_payload(payload_u))
+                    self._sync_trunk_segment_hydraulic_props_from_tree(
+                        trunk_nodes=trunk_nodes,
+                        trunk_segments=trunk_segments,
+                        trunk_tree_data=trunk_tree_working,
+                    )
+                    payload_u2 = self._normalize_trunk_tree_payload(trunk_tree_working)
+                    cache_u, g_u = compute_trunk_irrigation_schedule_hydro(
+                        trunk_nodes,
+                        trunk_segments,
+                        slots,
+                        payload_u2,
+                        q_consumer_m3h=float(dq),
+                        target_head_m=float(dh),
+                        max_pipe_velocity_mps=v_pipe_max,
+                        pump_operating_head_m=mph,
+                        use_required_pump_head=False,
+                        surface_z_at_xy=surf_z,
+                    )
+                    if not g_u:
+                        # Порівнюємо дефіцит fallback з найкращим, що дав optimizer (best_def_cache),
+                        # а якщо оптимізатор не знаходив взагалі — з cache_initial.
+                        ref_cache = best_def_cache if best_def_cache is not None else cache_initial
+                        if _cache_worst_deficit_m(cache_u) + 1e-9 < _cache_worst_deficit_m(ref_cache):
+                            return {
+                                "optimized_used": True,
+                                "trunk_hydro_opt_applied": True,
+                                "cache": cache_u,
+                                "autosized_note": (
+                                    "Автопідбір не дав кращого допустимого телескопа; "
+                                    "застосовано однорідну найбільшу дозволену трубу "
+                                    f"({mat} PN{pn} Ø{int(round(d_nom))}).\n"
+                                ),
+                                "auto_warn_msgs": auto_warn_msgs,
+                                "out_nodes": trunk_nodes,
+                                "out_segs": trunk_segments,
+                                "out_tree": dict(trunk_tree_working),
+                            }
+            # Fallback на uniform largest не допоміг. Якщо optimizer знайшов хоч якийсь варіант
+            # (навіть з дефіцитом) — повертаємо найкращий з них, відновлюючи відповідний стан дерева.
+            if best_def_cache is not None and best_def_tree is not None:
+                trunk_tree_working.clear()
+                trunk_tree_working.update(best_def_tree)
+                self._sync_trunk_segment_hydraulic_props_from_tree(
+                    trunk_nodes=trunk_nodes,
+                    trunk_segments=trunk_segments,
+                    trunk_tree_data=trunk_tree_working,
+                )
+                return {
+                    "optimized_used": True,
+                    "trunk_hydro_opt_applied": True,
+                    "cache": best_def_cache,
+                    "autosized_note": (
+                        "Автопідбір виконано, але жоден варіант не закрив дефіцит напору; "
+                        "повернуто варіант з найменшим дефіцитом.\n"
+                    ),
+                    "auto_warn_msgs": auto_warn_msgs,
+                    "out_nodes": trunk_nodes,
+                    "out_segs": trunk_segments,
+                    "out_tree": dict(trunk_tree_working),
+                }
             return {
                 "optimized_used": False,
                 "trunk_hydro_opt_applied": False,
@@ -11456,6 +12239,52 @@ class DripCAD:
         except Exception:
             pass
 
+    def _trunk_surface_z_callback(self):
+        """Z(x,y) з рельєфу для trunk_tree.dz_m (якщо немає топоточок — None, dz=0)."""
+        if not getattr(self.topo, "elevation_points", None):
+            return None
+        topo = self.topo
+
+        def _z(x: float, y: float) -> float:
+            return float(topo.get_z(float(x), float(y)))
+
+        return _z
+
+    def estimate_max_pump_head_from_largest_allowed_trunk_pipe(self) -> Optional[float]:
+        """
+        Орієнтовний мінімальний напір на джерелі (м вод. ст.), якщо всі ребра магістралі — одна
+        найтовстіша труба з дозволеного набору (для підстановки замість 0 у «Напір насоса»).
+        """
+        from modules.hydraulic_module.trunk_irrigation_schedule_hydro import (
+            estimate_min_pump_head_m_uniform_largest_allowed_pipe,
+        )
+
+        nodes = list(getattr(self, "trunk_map_nodes", []) or [])
+        segs = list(getattr(self, "trunk_map_segments", []) or [])
+        slots = (getattr(self, "consumer_schedule", None) or {}).get("irrigation_slots") or [
+            [] for _ in range(48)
+        ]
+        eff_all = normalize_allowed_pipes_map(
+            getattr(self, "trunk_allowed_pipes", None)
+            or getattr(self, "allowed_pipes", {})
+            or {}
+        )
+        eff_use = self._trunk_eff_materials_with_nonempty_pn(eff_all)
+        dq = float(self.trunk_schedule_test_q_m3h_effective())
+        dh = float(self.trunk_schedule_test_h_m_effective())
+        surf = self._trunk_surface_z_callback()
+        return estimate_min_pump_head_m_uniform_largest_allowed_pipe(
+            nodes,
+            segs,
+            slots,
+            pipes_db=getattr(self, "pipe_db", {}) or {},
+            eff_allowed_pipes=eff_use,
+            q_consumer_m3h=dq,
+            target_head_m=dh,
+            max_pipe_velocity_mps=0.0,
+            surface_z_at_xy=surf,
+        )
+
     def run_trunk_irrigation_schedule_hydro(self) -> None:
         from modules.hydraulic_module.trunk_irrigation_schedule_hydro import (
             compute_trunk_irrigation_schedule_hydro,
@@ -11486,6 +12315,15 @@ class DripCAD:
             mph = float(self.consumer_schedule.get("max_pump_head_m", 50.0))
         except (TypeError, ValueError):
             mph = 50.0
+        if mph <= 1e-12:
+            est = self.estimate_max_pump_head_from_largest_allowed_trunk_pipe()
+            if est is not None:
+                mph = max(1.0, min(400.0, float(est)))
+                self.consumer_schedule["max_pump_head_m"] = mph
+                if cp is not None and hasattr(cp, "_sync_schedule_max_pump_head_ui"):
+                    cp._sync_schedule_max_pump_head_ui()
+            else:
+                mph = 50.0
         mph = max(1.0, min(400.0, mph))
         self.consumer_schedule["max_pump_head_m"] = mph
         # За домовленістю оптимізація магістралі й перевірка слотів виконуються
@@ -11518,6 +12356,7 @@ class DripCAD:
         dq = self.trunk_schedule_test_q_m3h_effective()
         dh = self.trunk_schedule_test_h_m_effective()
         pipes_selected = bool(self.consumer_schedule.get("trunk_pipes_selected", False))
+        surf_z = self._trunk_surface_z_callback()
         cache, g_issues = compute_trunk_irrigation_schedule_hydro(
             self.trunk_map_nodes,
             self.trunk_map_segments,
@@ -11528,6 +12367,7 @@ class DripCAD:
             max_pipe_velocity_mps=v_pipe_max,
             pump_operating_head_m=mph,
             use_required_pump_head=pipes_selected,
+            surface_z_at_xy=surf_z,
         )
         autosized_note = ""
         auto_warn_msgs: List[str] = []
@@ -11592,7 +12432,10 @@ class DripCAD:
             dh_worst = float(
                 self.trunk_schedule_max_target_head_m_among_slots(slots, default_h_m=float(dh))
             )
-            max_hloss_budget_m = max(0.1, float(mph) - dh_worst)
+            # Мікрозапас до бюджету ΔH: захист від прикордонного "невміщується на ~1e-4 м"
+            # між автопідстановкою H (бінарний пошук) і дискретним підбором секцій.
+            # Значення тримаємо дуже малим, щоб не створювати реальний додатковий дефіцит.
+            max_hloss_budget_m = max(0.1, float(mph) - dh_worst + 3e-4)
             title_base = self.root.title()
 
             def _restore_title() -> None:
@@ -11734,7 +12577,7 @@ class DripCAD:
                         trunk_tree_working=w_tree,
                         eff_filtered=eff_use,
                         dq=float(dq),
-                        dh=float(dh),
+                        dh=float(dh_worst),
                         mph=float(mph),
                         v_pipe_max=float(v_pipe_max),
                         min_seg_m=float(min_seg_m),
@@ -12974,7 +13817,7 @@ class DripCAD:
             
         z_val = self.topo.get_z(wx, wy) if self.topo.elevation_points else 0.0
         if hasattr(self.control_panel, 'lbl_z_cursor'):
-            self.control_panel.lbl_z_cursor.config(text=f"Z під курсором: {z_val:.2f} м (pts: {len(self.topo.elevation_points)})")
+            self.control_panel.lbl_z_cursor.config(text=f"Z= {z_val:.2f} м")
         
         self.redraw(skip_heavy_canvas_layers=zoom_rubber)
         self.canvas.delete("preview")
@@ -14763,6 +15606,7 @@ class DripCAD:
             "trunk_schedule_test_h_m": 40.0,
             "trunk_display_velocity_warn_mps": 0.0,
             "trunk_pipes_selected": False,
+            "srtm_source_mode": "auto",
         }
         self._rozklad_staging_ids = []
         self._canvas_special_tool = None
@@ -14773,6 +15617,10 @@ class DripCAD:
         self._trunk_route_edge_end_idx = None
         if hasattr(self, "var_trunk_display_velocity_warn_mps"):
             self.var_trunk_display_velocity_warn_mps.set("0")
+        if hasattr(self, "var_srtm_source_mode"):
+            self.var_srtm_source_mode.set("auto")
+        self._srtm_active_provider = "skadi_local"
+        self.sync_srtm_source_mode_widgets()
         self.is_georeferenced = False
         self.mode.set("VIEW")
         self.zoom, self.offset_x, self.offset_y = 0.7, 425, 375

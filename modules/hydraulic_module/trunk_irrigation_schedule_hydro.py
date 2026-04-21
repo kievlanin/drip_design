@@ -6,16 +6,19 @@
 перевірка H ≥ H_ціль для кожного активного (ціль теж може бути індивідуальною на вузлі).
 Втрати Hazen–Williams як у trunk_tree_compute.
 
-Заданий pump_operating_head_m — робочий напір на насосі (м вод. ст.): один розрахунок HW на слот;
-перевірка, що в активних споживачів H ≥ target_head_m. Якщо ні — у issues додається орієнтовний
-мінімум H (бінарний пошук). max_pipe_velocity_mps > 0 — додаткова перевірка швидкості в трубах; 0 — не перевіряти.
+Заданий pump_operating_head_m — типово абсолютний п'єзометричний H на джерелі (м вод. ст.);
+якщо у вузлі source задано pump_suction_xy_offset_m і є surface_z_at_xy — трактується як ΔH насоса,
+H_source = Z_топо(всмоктування) + ΔH (+ опційно pump_install_geodetic_dz_m). Опційно pump_install_geodetic_dz_m
+додається до заданого напору (перепад входу/виходу насоса в проєкті, м).
+
+Опційно surface_z_at_xy(x, y) — рельєф (м); на ребрі dz_m = Z(батько) − Z(дитина) для compute_trunk_tree_steady.
 """
 
 from __future__ import annotations
 
 import copy
 import math
-from typing import Any, Dict, FrozenSet, List, Mapping, Optional, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, FrozenSet, List, Mapping, Optional, Sequence, Set, Tuple
 
 from .trunk_map_graph import build_oriented_edges
 from .pipe_weight_optimizer import (
@@ -25,12 +28,15 @@ from .pipe_weight_optimizer import (
     optimize_fixed_topology_by_weight,
     optimize_single_line_allocation_by_weight,
 )
+from .hydraulics_constants import hazen_c_from_pipe_entry
 from .trunk_tree_compute import (
     TrunkTreeEdge,
     TrunkTreeNode,
     TrunkTreeSpec,
     compute_trunk_tree_steady,
 )
+
+_TRUNK_MICRO_SECTION_MERGE_M = 5.0
 
 
 def _node_id(nodes: Sequence[Mapping[str, Any]], i: int) -> str:
@@ -70,6 +76,94 @@ def _segment_length_m(nodes: Sequence[Mapping[str, Any]], seg: Mapping[str, Any]
             if s > 1e-6:
                 return s
     return 0.0
+
+
+def _collapse_short_telescope_sections(
+    sections: Sequence[Mapping[str, Any]],
+    *,
+    max_tail_m: float = _TRUNK_MICRO_SECTION_MERGE_M,
+) -> List[Dict[str, Any]]:
+    """
+    Прибрати "мікрохвости" телескопа: секції з L <= max_tail_m доклеюються до сусідньої.
+    Пріоритет — попередня (upstream) секція.
+    """
+    out: List[Dict[str, Any]] = [dict(s) for s in (sections or []) if isinstance(s, Mapping)]
+    if len(out) <= 1:
+        return out
+
+    tail_lim = max(0.0, float(max_tail_m))
+    eps = 1e-9
+
+    def _num(v: Any) -> Optional[float]:
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
+    while len(out) > 1:
+        changed = False
+        for i, sec in enumerate(out):
+            li = _num(sec.get("length_m"))
+            if li is None or li <= eps or li > tail_lim + eps:
+                continue
+            j = i - 1 if i > 0 else 1
+            rec = out[j]
+            lr = _num(rec.get("length_m"))
+            if lr is None or lr < 0.0:
+                lr = 0.0
+            rec["length_m"] = float(lr + li)
+            for key in ("head_loss_m", "weight_kg", "objective_cost"):
+                rv = _num(rec.get(key))
+                sv = _num(sec.get(key))
+                add = 0.0
+                if rv is not None and lr > eps:
+                    add = float(rv / lr) * li
+                elif sv is not None and li > eps:
+                    add = float(sv / li) * li
+                if add > 0.0:
+                    rec[key] = float((rv if rv is not None else 0.0) + add)
+            out.pop(i)
+            changed = True
+            break
+        if not changed:
+            break
+    return out
+
+
+def _rescale_hw_section_tuples_to_edge_length(
+    sections: Sequence[Any], length_m: float
+) -> Tuple[Tuple[float, float, float], ...]:
+    """
+    Сума length у секціях HW (кортежі L_m, d_mm, C) має збігатися з length_m ребра — інакше validate_trunk_tree падає.
+    Пропорційно масштабує L по секціях; d_inner та C не змінюються.
+    """
+    lm_edge = float(length_m)
+    if lm_edge <= 1e-12:
+        return ()
+    rows: List[Tuple[float, float, float]] = []
+    s_old = 0.0
+    for sec in sections:
+        try:
+            L = float(sec[0])
+            d = float(sec[1])
+            c = float(sec[2])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if L <= 1e-12 or d <= 1e-12:
+            continue
+        rows.append((L, d, c))
+        s_old += L
+    if not rows:
+        return ()
+    if abs(s_old - lm_edge) <= 1e-4:
+        return tuple(rows)
+    scale = lm_edge / s_old
+    scaled_lens: List[float] = []
+    for r in rows[:-1]:
+        scaled_lens.append(max(0.0, r[0] * scale))
+    last = max(0.0, lm_edge - sum(scaled_lens))
+    scaled_lens.append(last)
+    return tuple((float(ln), float(d), float(c)) for (L, d, c), ln in zip(rows, scaled_lens))
 
 
 def _trunk_tree_edge_props(payload: Mapping[str, Any]) -> Dict[Tuple[str, str], Dict[str, Any]]:
@@ -192,6 +286,96 @@ def _issues_pipe_velocity(
     return out
 
 
+def _parse_pump_suction_xy_offset_m(
+    raw: Any,
+) -> Optional[Tuple[float, float]]:
+    """Зсув точки всмоктування від вузла source: (dx_m, dy_m) у локальних XY."""
+    if raw is None:
+        return None
+    if isinstance(raw, (list, tuple)) and len(raw) >= 2:
+        try:
+            return (float(raw[0]), float(raw[1]))
+        except (TypeError, ValueError):
+            return None
+    if isinstance(raw, Mapping):
+        try:
+            dx = float(raw.get("x_m", raw.get("dx_m", 0.0)))
+            dy = float(raw.get("y_m", raw.get("dy_m", 0.0)))
+        except (TypeError, ValueError):
+            return None
+        return (dx, dy)
+    return None
+
+
+def _effective_pump_source_head_m(
+    nodes: Sequence[Mapping[str, Any]],
+    src_idx: int,
+    pump_head_m: float,
+    surface_z_at_xy: Optional[Callable[[float, float], float]],
+) -> Tuple[float, Optional[float], str]:
+    """
+    П'єзометричний напір у вузлі source для TrunkTreeSpec.
+
+    За замовчуванням pump_head_m — абсолютний H на джерелі (режим absolute).
+
+    pump_install_geodetic_dz_m на вузлі source (м): додається до pump_head_m
+    (корекція на перепад висот між входом і виходом насоса / монтаж, Z_вх − Z_вих у проєкті).
+
+    Якщо задано pump_suction_xy_offset_m [dx,dy] і є surface_z_at_xy:
+    pump_head_m (+ geodetic) трактується як ΔH насоса, Z всмоктування — топо в (x+dx, y+dy),
+    H_source = Z_всмоктування + pump_head_m + geodetic (режим suction_z_plus_delta).
+    """
+    mph = float(pump_head_m)
+    n = nodes[int(src_idx)]
+    gdz = 0.0
+    raw_gdz = n.get("pump_install_geodetic_dz_m")
+    if raw_gdz is not None:
+        try:
+            gdz = float(raw_gdz)
+        except (TypeError, ValueError):
+            gdz = 0.0
+    delta_core = mph + gdz
+    off = _parse_pump_suction_xy_offset_m(n.get("pump_suction_xy_offset_m"))
+    if off is not None and surface_z_at_xy is not None:
+        try:
+            xs = float(n["x"])
+            ys = float(n["y"])
+        except (KeyError, TypeError, ValueError):
+            return max(0.5, min(900.0, delta_core)), None, "absolute_plus_geodetic_dz" if gdz else "absolute"
+        dx, dy = off[0], off[1]
+        try:
+            z_suc = float(surface_z_at_xy(xs + dx, ys + dy))
+        except Exception:
+            return max(0.5, min(900.0, delta_core)), None, "absolute_plus_geodetic_dz" if gdz else "absolute"
+        h_src = z_suc + delta_core
+        return max(0.5, min(900.0, h_src)), z_suc, "suction_z_plus_delta"
+    if abs(gdz) > 1e-12:
+        return max(0.5, min(900.0, delta_core)), None, "absolute_plus_geodetic_dz"
+    return max(0.5, min(900.0, mph)), None, "absolute"
+
+
+def _edge_dz_m_from_surface(
+    nodes: Sequence[Mapping[str, Any]],
+    parent_idx: int,
+    child_idx: int,
+    surface_z_at_xy: Optional[Callable[[float, float], float]],
+) -> float:
+    """
+    Різниця висот рельєфу вздовж орієнтованого ребра parent→child: Z(parent) − Z(child) (м),
+    як у TrunkTreeEdge.dz_m для compute_trunk_tree_steady (h_дитина = h_батько − hf + dz_m).
+    """
+    if surface_z_at_xy is None:
+        return 0.0
+    try:
+        pu = nodes[int(parent_idx)]
+        cv = nodes[int(child_idx)]
+        zp = float(surface_z_at_xy(float(pu["x"]), float(pu["y"])))
+        zc = float(surface_z_at_xy(float(cv["x"]), float(cv["y"])))
+        return zp - zc
+    except Exception:
+        return 0.0
+
+
 def _segment_index_for_uv(
     segments: Sequence[Mapping[str, Any]], u: int, v: int
 ) -> Optional[int]:
@@ -251,6 +435,7 @@ def compute_trunk_irrigation_schedule_hydro(
     max_pipe_velocity_mps: float = 0.0,
     pump_operating_head_m: float = 50.0,
     use_required_pump_head: bool = False,
+    surface_z_at_xy: Optional[Callable[[float, float], float]] = None,
 ) -> Tuple[Dict[str, Any], List[str]]:
     """
     Повертає (cache_dict, global_messages).
@@ -259,9 +444,11 @@ def compute_trunk_irrigation_schedule_hydro(
     global_issues: List[str] = []
     lim_vel = max(0.0, float(max_pipe_velocity_mps))
     pump_h = max(1.0, min(400.0, float(pump_operating_head_m)))
-    limits_block: Dict[str, float] = {
+    limits_block: Dict[str, Any] = {
         "max_pipe_velocity_mps": lim_vel,
         "pump_operating_head_m": pump_h,
+        "effective_pump_source_head_m": pump_h,
+        "pump_source_head_mode": "absolute",
     }
     mode_block: Dict[str, Any] = {
         "pump_head_mode": "required" if bool(use_required_pump_head) else "fixed"
@@ -303,6 +490,16 @@ def compute_trunk_irrigation_schedule_hydro(
         global_issues.append("Не знайдено вузол-витік (source).")
         return empty, global_issues
 
+    eff_pump_h, z_suc_sampled, pump_head_mode = _effective_pump_source_head_m(
+        nodes, int(src_idx), pump_h, surface_z_at_xy
+    )
+    limits_block["effective_pump_source_head_m"] = float(eff_pump_h)
+    limits_block["pump_source_head_mode"] = str(pump_head_mode)
+    if z_suc_sampled is not None:
+        limits_block["pump_suction_z_sampled_m"] = float(z_suc_sampled)
+    else:
+        limits_block.pop("pump_suction_z_sampled_m", None)
+
     source_id = _node_id(nodes, src_idx)
     props = _trunk_tree_edge_props(trunk_tree_payload)
     q_default_m3h = max(0.0, float(q_consumer_m3h))
@@ -336,9 +533,11 @@ def compute_trunk_irrigation_schedule_hydro(
         p = props.get((pid, cid), {})
         dmm = float(p.get("d_inner_mm", default_d_inner_mm) or default_d_inner_mm)
         chw = float(p.get("c_hw", default_c_hw) or default_c_hw)
-        sections = p.get("sections") if isinstance(p.get("sections"), list) else []
+        sections_raw = p.get("sections") if isinstance(p.get("sections"), list) else []
+        sections = _rescale_hw_section_tuples_to_edge_length(sections_raw, float(lm))
         if dmm <= 0:
             dmm = default_d_inner_mm
+        dz_m = _edge_dz_m_from_surface(nodes, int(u), int(v), surface_z_at_xy)
         tree_edges.append(
             TrunkTreeEdge(
                 parent_id=pid,
@@ -346,7 +545,7 @@ def compute_trunk_irrigation_schedule_hydro(
                 length_m=float(lm),
                 d_inner_mm=float(dmm),
                 c_hw=float(chw),
-                dz_m=0.0,
+                dz_m=float(dz_m),
                 sections=tuple(sections),
             )
         )
@@ -536,7 +735,7 @@ def compute_trunk_irrigation_schedule_hydro(
                 continue
             hs, res, iss = evaluate_at_given_pump_head(active, float(h_need))
         else:
-            hs, res, iss = evaluate_at_given_pump_head(active, pump_h)
+            hs, res, iss = evaluate_at_given_pump_head(active, eff_pump_h)
         if hs is None or res is None:
             per_slot[slot_i] = {
                 "issues": iss,
@@ -585,9 +784,9 @@ def compute_trunk_irrigation_schedule_hydro(
                 )
             else:
                 slot_issues.append(
-                    f"При заданому H_насос={pump_h:.2f} м мін. напір серед активних споживачів ≈ {mh_cons:.2f} м вод. ст.; "
+                    f"При H на джерелі={eff_pump_h:.2f} м (з поля «напір насоса»: {pump_h:.2f} м) мін. напір серед активних споживачів ≈ {mh_cons:.2f} м вод. ст.; "
                     f"є дефіцит до індивідуальних цілей (макс. ≈ {deficit_mx:.2f} м, найвища ціль ≈ {th_max:.1f} м). "
-                    f"Збільшіть діаметри труб або напір насоса."
+                    f"Збільшіть діаметри труб або напір насоса / скоригуйте рельєф всмоктування."
                 )
                 if min_req_src is not None:
                     slot_issues.append(
@@ -717,6 +916,187 @@ def compute_trunk_irrigation_schedule_hydro(
     return out, global_issues
 
 
+def _normalize_allowed_pipes_map_simple(ap: Any) -> Dict[str, Any]:
+    """Легка копія normalize_allowed_pipes_map без залежності від hydraulics_core (shapely)."""
+    out: Dict[str, Any] = {}
+    if not isinstance(ap, dict):
+        return out
+    for mat, pns in ap.items():
+        if not isinstance(pns, dict):
+            continue
+        mkey = str(mat).strip()
+        if not mkey:
+            continue
+        sub: Dict[str, Any] = {}
+        for pn, ods in pns.items():
+            if not isinstance(ods, list):
+                continue
+            pk = str(pn).strip()
+            olist = [str(o).strip() for o in ods if str(o).strip()]
+            sub[pk] = olist
+        if sub:
+            out[mkey] = sub
+    return out
+
+
+def _pn_sort_tuple_simple(pn_val: Any) -> Tuple[Any, Any]:
+    s = str(pn_val).replace(",", ".").strip()
+    try:
+        return (0, float(s))
+    except ValueError:
+        return (1, s)
+
+
+def _allowed_pipe_candidates_sorted_trunk(
+    eff_allowed: Mapping[str, Any], pipes_db: Mapping[str, Any]
+) -> List[Dict[str, Any]]:
+    """Плоский список дозволених позицій каталогу (як allowed_pipe_candidates_sorted), без shapely."""
+    out: List[Dict[str, Any]] = []
+    eff = _normalize_allowed_pipes_map_simple(eff_allowed) or {}
+    pdb = dict(pipes_db)
+    for mat, pns in eff.items():
+        mat_db = pdb.get(mat)
+        if not isinstance(mat_db, dict):
+            continue
+        if not isinstance(pns, dict):
+            continue
+        for pn, ods in pns.items():
+            if not isinstance(ods, list) or not ods:
+                continue
+            avail = mat_db.get(str(pn), {})
+            if not avail:
+                continue
+            allowed_set = {str(o).strip() for o in ods if str(o).strip()}
+            for d_nom, pipe_data in avail.items():
+                if str(d_nom).strip() not in allowed_set:
+                    continue
+                d_inner = float(
+                    pipe_data.get("id", float(d_nom))
+                    if isinstance(pipe_data, dict)
+                    else float(d_nom)
+                )
+                color = (
+                    pipe_data.get("color", "#FFFFFF")
+                    if isinstance(pipe_data, dict)
+                    else "#FFFFFF"
+                )
+                out.append(
+                    {
+                        "mat": str(mat),
+                        "pn": str(pn),
+                        "d": int(float(d_nom)),
+                        "inner": d_inner,
+                        "color": color,
+                        "c_hw": hazen_c_from_pipe_entry(pipe_data),
+                    }
+                )
+    out.sort(key=lambda c: (c["inner"], c["mat"], _pn_sort_tuple_simple(c["pn"]), c["d"]))
+    return out
+
+
+def estimate_min_pump_head_m_uniform_largest_allowed_pipe(
+    trunk_nodes: Sequence[Mapping[str, Any]],
+    trunk_segments: Sequence[Mapping[str, Any]],
+    irrigation_slots: Sequence[Sequence[str]],
+    *,
+    pipes_db: Mapping[str, Any],
+    eff_allowed_pipes: Mapping[str, Any],
+    q_consumer_m3h: float,
+    target_head_m: float,
+    max_pipe_velocity_mps: float = 0.0,
+    surface_z_at_xy: Optional[Callable[[float, float], float]] = None,
+) -> Optional[float]:
+    """
+    Оціночний мінімальний напір на джерелі (м вод. ст.), якщо усі ребра магістралі — одна труба
+    з найбільшим внутрішнім діаметром з перетину eff_allowed_pipes ∩ pipes_db.
+    Використовується для підстановки замість 0 у полі «Напір насоса (задано)».
+    """
+    eff = _normalize_allowed_pipes_map_simple(eff_allowed_pipes) or {}
+    cands = _allowed_pipe_candidates_sorted_trunk(eff, pipes_db)
+    if not cands:
+        return None
+    pick = cands[-1]
+    nodes = list(trunk_nodes)
+    segs = list(trunk_segments)
+    if len(nodes) < 2 or not segs:
+        return None
+    directed, o_err = build_oriented_edges(nodes, segs)
+    if directed is None or o_err or not directed:
+        return None
+    src_ok = False
+    for i in range(len(nodes)):
+        if str(nodes[i].get("kind", "")).strip().lower() == "source":
+            if str(_node_id(nodes, i)).strip():
+                src_ok = True
+            break
+    if not src_ok:
+        return None
+    edges_out: List[Dict[str, Any]] = []
+    for u, v in directed:
+        pid, cid = _node_id(nodes, u), _node_id(nodes, v)
+        si = _segment_index_for_uv(segs, int(u), int(v))
+        if si is None or si < 0 or si >= len(segs):
+            return None
+        lm = float(_segment_length_m(nodes, segs[si]))
+        if lm <= 1e-9:
+            continue
+        dn = float(pick["d"])
+        din = float(pick["inner"])
+        try:
+            chw = float(pick.get("c_hw") or 140.0)
+        except (TypeError, ValueError):
+            chw = 140.0
+        sec = [
+            {
+                "length_m": lm,
+                "d_nom_mm": dn,
+                "d_inner_mm": din,
+                "material": str(pick["mat"]),
+                "pn": str(pick["pn"]),
+                "c_hw": chw,
+                "head_loss_m": 0.0,
+                "weight_kg": 0.0,
+                "objective_cost": 0.0,
+            }
+        ]
+        edges_out.append(
+            {
+                "parent_id": pid,
+                "child_id": cid,
+                "length_m": lm,
+                "d_inner_mm": din,
+                "c_hw": chw,
+                "sections": copy.deepcopy(sec),
+                "telescoped_sections": copy.deepcopy(sec),
+            }
+        )
+    if not edges_out:
+        return None
+    payload = {"edges": edges_out}
+    cache, issues = compute_trunk_irrigation_schedule_hydro(
+        nodes,
+        segs,
+        irrigation_slots,
+        payload,
+        q_consumer_m3h=float(q_consumer_m3h),
+        target_head_m=float(target_head_m),
+        max_pipe_velocity_mps=float(max_pipe_velocity_mps),
+        pump_operating_head_m=220.0,
+        use_required_pump_head=False,
+        surface_z_at_xy=surface_z_at_xy,
+    )
+    if issues:
+        return None
+    env = cache.get("envelope") if isinstance(cache.get("envelope"), dict) else {}
+    mrs = env.get("min_required_source_head_m")
+    if mrs is None:
+        return None
+    try:
+        return max(0.0, float(mrs))
+    except (TypeError, ValueError):
+        return None
+
+
 def _pick_by_edge_id(picks: Sequence[Mapping[str, Any]], pa: str, ch: str) -> Optional[Dict[str, Any]]:
     key = f"{pa}->{ch}"
     for row in picks:
@@ -820,6 +1200,7 @@ def refine_trunk_picks_pressure_tightening(
     length_round_step_m: float,
     head_tol_m: float = 0.28,
     max_iters: int = 28,
+    surface_z_at_xy: Optional[Callable[[float, float], float]] = None,
 ) -> List[str]:
     """
     Після мінімізації вартості за бюджетом ΔH — «підтягнути» рішення до цільового напору на споживачах:
@@ -883,6 +1264,7 @@ def refine_trunk_picks_pressure_tightening(
             max_pipe_velocity_mps=float(max_pipe_velocity_mps),
             pump_operating_head_m=float(pump_operating_head_m),
             use_required_pump_head=False,
+            surface_z_at_xy=surface_z_at_xy,
         )
         if giss:
             return False
@@ -926,6 +1308,7 @@ def refine_trunk_picks_pressure_tightening(
             max_pipe_velocity_mps=float(max_pipe_velocity_mps),
             pump_operating_head_m=float(pump_operating_head_m),
             use_required_pump_head=False,
+            surface_z_at_xy=surface_z_at_xy,
         )
         if giss:
             return -1.0
@@ -975,6 +1358,7 @@ def refine_trunk_picks_pressure_tightening(
             max_pipe_velocity_mps=float(max_pipe_velocity_mps),
             pump_operating_head_m=float(pump_operating_head_m),
             use_required_pump_head=False,
+            surface_z_at_xy=surface_z_at_xy,
         )
         crit_slot: Optional[int] = None
         crit_nid: Optional[str] = None
@@ -1069,6 +1453,7 @@ def refine_trunk_picks_pressure_tightening(
                         }
                         for a in edge_opt.allocations
                     ]
+                    secs = _collapse_short_telescope_sections(secs)
                     er["sections"] = secs
                     er["telescoped_sections"] = copy.deepcopy(secs)
                     try:
@@ -1085,15 +1470,21 @@ def refine_trunk_picks_pressure_tightening(
             pick["telescoped_sections"] = copy.deepcopy(
                 tent_row.get("telescoped_sections", tent_row["sections"])
             )
-            pick["head_loss_m"] = float(edge_opt.total_head_loss_m)
-            pick["weight_kg"] = float(edge_opt.total_weight_kg)
-            pick["objective_cost"] = new_obj
+            sec_rows = pick.get("sections") if isinstance(pick.get("sections"), list) else []
+            pick["head_loss_m"] = sum(float(x.get("head_loss_m", 0.0) or 0.0) for x in sec_rows if isinstance(x, dict))
+            pick["weight_kg"] = sum(float(x.get("weight_kg", 0.0) or 0.0) for x in sec_rows if isinstance(x, dict))
+            pick["objective_cost"] = sum(
+                float(x.get("objective_cost", 0.0) or 0.0) for x in sec_rows if isinstance(x, dict)
+            )
             try:
                 pick["d_inner_mm"] = float(tent_row["d_inner_mm"])
             except (TypeError, ValueError, KeyError):
                 pass
-            if edge_opt.allocations:
-                pick["d_nom_mm"] = float(edge_opt.allocations[-1].d_nom_mm)
+            if sec_rows:
+                try:
+                    pick["d_nom_mm"] = float(sec_rows[-1].get("d_nom_mm", pick.get("d_nom_mm", 0.0)) or 0.0)
+                except (TypeError, ValueError):
+                    pass
             improved += 1
             progressed = True
             break
@@ -1122,6 +1513,7 @@ def optimize_trunk_diameters_by_weight(
     max_sections_per_edge: int = 2,
     pump_operating_head_m: Optional[float] = None,
     schedule_target_head_m: Optional[float] = None,
+    surface_z_at_xy: Optional[Callable[[float, float], float]] = None,
 ) -> Tuple[Dict[str, Any], List[str]]:
     """
     Рекомендація діаметрів магістралі за критерієм вартості (weight/money).
@@ -1317,7 +1709,7 @@ def optimize_trunk_diameters_by_weight(
                 ),
             )
             if edge_opt.feasible and edge_opt.allocations:
-                telescoped_sections = [
+                telescoped_sections = _collapse_short_telescope_sections([
                     {
                         "length_m": float(a.length_m),
                         "d_nom_mm": float(a.d_nom_mm),
@@ -1329,10 +1721,12 @@ def optimize_trunk_diameters_by_weight(
                         "objective_cost": float(a.objective_cost),
                     }
                     for a in edge_opt.allocations
-                ]
-                telescoped_hf = float(edge_opt.total_head_loss_m)
-                telescoped_weight = float(edge_opt.total_weight_kg)
-                telescoped_obj = float(edge_opt.total_objective_cost)
+                ])
+                telescoped_hf = sum(float(x.get("head_loss_m", 0.0) or 0.0) for x in telescoped_sections)
+                telescoped_weight = sum(float(x.get("weight_kg", 0.0) or 0.0) for x in telescoped_sections)
+                telescoped_obj = sum(
+                    float(x.get("objective_cost", 0.0) or 0.0) for x in telescoped_sections
+                )
         if not telescoped_sections and lm > 1e-9:
             # Fallback: single-line allocator не знайшов телескоп — кладемо одну секцію з picks top-level
             # (d_nom, d_inner, material, pn). Інакше ребро в JSON лишається без sections і UI/збереження
@@ -1389,6 +1783,7 @@ def optimize_trunk_diameters_by_weight(
             max_sections_per_edge=max_sections_per_edge,
             objective=str(objective_clean),
             length_round_step_m=float(length_round_step_m),
+            surface_z_at_xy=surface_z_at_xy,
         )
         if rmsgs:
             issues.extend(rmsgs)

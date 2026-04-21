@@ -1,5 +1,6 @@
 import tkinter as tk
 from tkinter import ttk, scrolledtext
+from typing import Optional
 
 from shapely.geometry import Polygon
 
@@ -1276,6 +1277,12 @@ class ControlPanel:
         if hasattr(self.app, "run_trunk_irrigation_schedule_hydro"):
             self.app.run_trunk_irrigation_schedule_hydro()
 
+    def _estimate_max_pump_head_from_largest_allowed_trunk_pipe(self) -> Optional[float]:
+        """Мінімальний орієнтовний напір насоса (м), якщо магістраль з однієї найтовстішої дозволеної труби."""
+        if hasattr(self.app, "estimate_max_pump_head_from_largest_allowed_trunk_pipe"):
+            return self.app.estimate_max_pump_head_from_largest_allowed_trunk_pipe()
+        return None
+
     def _schedule_apply_max_pump_head_from_entry(self) -> bool:
         """Зчитує поле «макс. напір насоса» у consumer_schedule. False — некоректне число."""
         self.app.normalize_consumer_schedule()
@@ -1284,16 +1291,29 @@ class ControlPanel:
         except (TypeError, ValueError, tk.TclError):
             silent_showwarning(self.app.root, 
                 "Розклад",
-                "Напір насоса (задано): введіть додатне число (метри водяного стовпа).",
+                "Напір насоса (задано): введіть число (метри водяного стовпа) або 0 для автопідстановки.",
             )
             return False
-        if v <= 0.0 or v > 400.0:
+        if v > 400.0:
             silent_showwarning(self.app.root, 
                 "Розклад",
-                "Напір насоса поза діапазоном: дозволено від 1 до 400 м вод. ст.",
+                "Напір насоса поза діапазоном: дозволено від 0 (авто) до 400 м вод. ст.",
             )
             return False
-        v = max(1.0, min(400.0, float(v)))
+        if v <= 0.0:
+            est = self._estimate_max_pump_head_from_largest_allowed_trunk_pipe()
+            if est is None:
+                silent_showwarning(
+                    self.app.root,
+                    "Розклад",
+                    "Напір насоса = 0 (авто): не вдалося оцінити потрібний напір. Потрібні магістраль "
+                    "(вузли й відрізки), непорожній слот поливу зі споживачами, дозволені діаметри магістралі "
+                    "з перетином каталогу труб та цілі H на споживачах.",
+                )
+                return False
+            v = max(1.0, min(400.0, float(est)))
+        else:
+            v = max(1.0, min(400.0, float(v)))
         if abs(v - round(v)) < 1e-6:
             disp = str(int(round(v)))
         else:
@@ -1311,8 +1331,10 @@ class ControlPanel:
             mph = float(mph)
         except (TypeError, ValueError):
             mph = 100.0
-        mph = max(1.0, min(400.0, mph))
-        if abs(mph - round(mph)) < 1e-6:
+        mph = max(0.0, min(400.0, mph))
+        if mph <= 0.0:
+            self.var_schedule_max_pump_head_m.set("0")
+        elif abs(mph - round(mph)) < 1e-6:
             self.var_schedule_max_pump_head_m.set(str(int(round(mph))))
         else:
             self.var_schedule_max_pump_head_m.set(f"{mph:.2f}".rstrip("0").rstrip("."))
@@ -1327,7 +1349,18 @@ class ControlPanel:
         except (TypeError, ValueError, tk.TclError):
             self._sync_schedule_max_pump_head_ui()
             return
-        v = max(1.0, min(400.0, float(v)))
+        if v > 400.0:
+            self._sync_schedule_max_pump_head_ui()
+            return
+        if v <= 0.0:
+            est = self._estimate_max_pump_head_from_largest_allowed_trunk_pipe()
+            if est is not None:
+                v = max(1.0, min(400.0, float(est)))
+            else:
+                self._sync_schedule_max_pump_head_ui()
+                return
+        else:
+            v = max(1.0, min(400.0, float(v)))
         self.app.consumer_schedule["max_pump_head_m"] = float(v)
         if abs(v - round(v)) < 1e-6:
             self.var_schedule_max_pump_head_m.set(str(int(round(v))))
@@ -1973,9 +2006,13 @@ class ControlPanel:
             insertbackground="white",
         )
         ent_max_pump.pack(anchor=tk.W, pady=(2, 0))
+        ent_max_pump.bind("<Return>", lambda _e: self._schedule_apply_max_pump_head_from_entry())
+        ent_max_pump.bind("<FocusOut>", lambda _e: self._flush_schedule_max_pump_head_to_app())
         self._attach_tooltip(
             ent_max_pump,
             "Робочий напір насоса (м вод. ст.), під який перевіряється магістраль. "
+            "0 — автоматично підставити орієнтовний мінімум: магістраль з однієї найтовстішої труби з дозволених, "
+            "розклад поливів і цілі H на споживачах (поле перезапишеться числом). "
             "Менше значення — менший тиск у трубах (м’якші вимоги до класу PN). "
             "Якщо при цьому H у споживачів < цілі — у звіті буде підказка мінімально потрібного H. "
             "Зберігається в проєкті.",
@@ -2074,7 +2111,7 @@ class ControlPanel:
         )
         btn_tr_hydro = tk.Button(
             calc,
-            text="▶ Розрахунок магістралі",
+            text="▶ Оптимізація",
             command=self._schedule_run_trunk_hydro,
             bg="#1565C0",
             fg="white",
@@ -2529,7 +2566,7 @@ class ControlPanel:
         btn_clear_topo.pack(pady=10)
         self._attach_tooltip(btn_clear_topo, "Прибрати з проєкту всі точки висоти та побудовані ізолінії.")
 
-        self.lbl_z_cursor = tk.Label(tab, text="Z під курсором: -- м", bg="#1e1e1e", fg="#00FFCC", font=("Consolas", 10, "bold"))
+        self.lbl_z_cursor = tk.Label(tab, text="Z= — м", bg="#1e1e1e", fg="#00FFCC", font=("Consolas", 20, "bold"))
         self.lbl_z_cursor.pack(pady=5)
 
         tk.Frame(tab, bg="#333", height=2).pack(fill=tk.X, padx=10, pady=10)
@@ -2595,6 +2632,32 @@ class ControlPanel:
         tk.Frame(tab, bg="#333", height=2).pack(fill=tk.X, padx=10, pady=10)
 
         tk.Label(tab, text="АВТОМАТИЧНИЙ РЕЛЬЄФ (SRTM)", bg="#1e1e1e", fg="#FFD700", font=("Arial", 9, "bold")).pack(pady=5)
+        zone_frame = tk.Frame(tab, bg="#1e1e1e")
+        zone_frame.pack(fill=tk.X, padx=8, pady=(0, 4))
+
+        def _activate_map_zone_tool() -> None:
+            try:
+                if hasattr(self.app, "view_notebook"):
+                    self.app.view_notebook.select(1)
+            except Exception:
+                pass
+            if hasattr(self.app, "route_embedded_map_tool"):
+                self.app.route_embedded_map_tool("project_zone_rect")
+
+        btn_zone_rect = tk.Button(
+            zone_frame,
+            text="▭ Зона проєкту (рамка) на карті",
+            command=_activate_map_zone_tool,
+            bg="#3d2a44",
+            fg="#FFE0F0",
+            font=("Arial", 9, "bold"),
+            width=30,
+        )
+        btn_zone_rect.pack(pady=(0, 4))
+        self._attach_tooltip(
+            btn_zone_rect,
+            "Перемикає на вкладку «Карта» і вмикає інструмент рамки зони проєкту.",
+        )
         
         btn_kml_srtm = tk.Button(
             tab,
@@ -2628,8 +2691,8 @@ class ControlPanel:
         )
         self.btn_prepare_zone = tk.Button(
             tab,
-            text="⬇ Тайли + висоти (зона)",
-            command=self.app.prepare_map_project_zone_pipeline,
+            text="⬇ Тайли",
+            command=self.app.download_srtm_tiles_for_project_zone,
             bg="#2a5538",
             fg="white",
             font=("Arial", 9, "bold"),
@@ -2638,7 +2701,7 @@ class ControlPanel:
         self.btn_prepare_zone.pack(pady=2)
         self._attach_tooltip(
             self.btn_prepare_zone,
-            "На карті: зона проєкту → завантажити тайли за потреби й заповнити DEM у межах зони (крок 5–90 м).",
+            "На карті: зона проєкту → лише завантажити відсутні .hgt у _srtm_. Висоти в модель — «Завантажити з супутника» (джерело у верхній панелі).",
         )
         self.btn_srtm_local_bbox = tk.Button(
             tab,
@@ -2656,8 +2719,8 @@ class ControlPanel:
         )
         tk.Label(
             tab,
-            text="Спочатку на карті: «Зона проєкту (рамка)», потім «Тайли + висоти» або кнопка тут. "
-            "Крок сітки висот — «Роздільна здатність» (5, 15, 30, 45, 90 м). «Лише висоти» — без завантаження тайлів.",
+            text="Спочатку на карті: «Зона проєкту (рамка)», потім «Тайли» тут або тайли за KML/полем. "
+            "Висоти в модель — «Завантажити з супутника»; крок сітки — «Роздільна здатність» (5–90 м). «Лише висоти з _srtm_» — без нового завантаження тайлів.",
             bg="#1e1e1e",
             fg="#888888",
             font=("Arial", 8),

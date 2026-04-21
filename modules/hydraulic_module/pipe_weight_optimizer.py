@@ -687,8 +687,12 @@ def optimize_single_line_allocation_by_weight(
                 need = (k_light * total_length_m - constraints.max_head_loss_m) / (k_light - k_heavy)
                 l_heavy = max(lmin, min(total_length_m - lmin, need))
                 l_light = total_length_m - l_heavy
+                # Аналітично l_light може бути < lmin, але фізично допустима комбінація — вузька мін. довжини lmin.
                 if l_light < lmin - 1e-9:
-                    continue
+                    l_light = float(lmin)
+                    l_heavy = float(total_length_m) - l_light
+                    if l_heavy < lmin - 1e-9:
+                        continue
                 hf = k_light * l_light + k_heavy * l_heavy
                 if hf > constraints.max_head_loss_m + 1e-6:
                     continue
