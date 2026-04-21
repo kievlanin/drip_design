@@ -364,6 +364,12 @@ class DripCAD:
 
         self.setup_menu()
         self.control_panel = ControlPanel(self)
+        from modules.geo_module import srtm_tiles as _srtm_earth_ui
+
+        _srtm_earth_ui.configure_earthdata_tk_bridge(
+            schedule_on_main=lambda fn: self.root.after(0, fn),
+            tk_master=self.root,
+        )
         self.var_active_block_idx = tk.IntVar(value=0)
         self.left_pane = tk.Frame(self.root, bg="#121212")
         self.left_pane.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)

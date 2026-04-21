@@ -9,6 +9,7 @@ import base64
 import gzip
 import math
 import os
+import queue
 import re
 import struct
 import threading
@@ -17,7 +18,7 @@ import urllib.error
 import urllib.request
 import zipfile
 from pathlib import Path
-from typing import Iterable, List, Optional, Tuple
+from typing import Callable, Iterable, List, Optional, Tuple
 
 from main_app.paths import SRTM_DIR, load_earthdata_credentials_from_project_file
 
@@ -86,6 +87,105 @@ def _earthdata_basic_auth_header() -> Optional[str]:
 _earthaccess_lock = threading.Lock()
 _earthaccess_login_ok = False
 
+# Діалог логіну (Tk): задається з DripCAD — schedule_on_main(fn) викликає fn у головному потоку.
+_schedule_on_main: Optional[Callable[[Callable[[], None]], None]] = None
+_tk_master = None
+
+
+def configure_earthdata_tk_bridge(
+    schedule_on_main: Optional[Callable[[Callable[[], None]], None]],
+    tk_master=None,
+) -> None:
+    """Підключити UI для запиту Earthdata при невдалому earthaccess.login (напр. з фонового потоку)."""
+    global _schedule_on_main, _tk_master
+    _schedule_on_main = schedule_on_main
+    _tk_master = tk_master
+
+
+def _earthdata_credentials_toplevel(master, hint: str) -> Tuple[Optional[str], Optional[str]]:
+    """Модальний діалог; викликати лише з головного потоку Tk."""
+    import tkinter as tk
+    from tkinter import ttk
+
+    out_u: List[Optional[str]] = [None]
+    out_p: List[Optional[str]] = [None]
+    top = tk.Toplevel(master)
+    top.title("NASA Earthdata")
+    top.configure(bg="#2b2b2b")
+    top.resizable(False, False)
+    msg = (hint or "").strip() or "Введіть логін і пароль NASA Earthdata Login (URS)."
+    tk.Label(
+        top,
+        text=msg,
+        bg="#2b2b2b",
+        fg="#e0e0e0",
+        wraplength=420,
+        justify=tk.LEFT,
+        font=("Segoe UI", 9),
+    ).pack(anchor=tk.W, padx=12, pady=(12, 6))
+    tk.Label(top, text="Логін:", bg="#2b2b2b", fg="#bdbdbd", font=("Segoe UI", 9)).pack(
+        anchor=tk.W, padx=12
+    )
+    e_user = ttk.Entry(top, width=44)
+    e_user.pack(padx=12, pady=(0, 6))
+    tk.Label(top, text="Пароль:", bg="#2b2b2b", fg="#bdbdbd", font=("Segoe UI", 9)).pack(
+        anchor=tk.W, padx=12
+    )
+    e_pass = ttk.Entry(top, width=44, show="*")
+    e_pass.pack(padx=12, pady=(0, 10))
+    ex_u = (os.getenv("EARTHDATA_USERNAME") or os.getenv("EARTHDATA_USER") or "").strip()
+    if ex_u:
+        e_user.insert(0, ex_u)
+
+    def _ok() -> None:
+        u = e_user.get().strip()
+        p = e_pass.get()
+        if not u or not p:
+            return
+        out_u[0], out_p[0] = u, p
+        top.destroy()
+
+    def _cancel() -> None:
+        out_u[0], out_p[0] = None, None
+        top.destroy()
+
+    bf = tk.Frame(top, bg="#2b2b2b")
+    bf.pack(pady=(0, 12))
+    ttk.Button(bf, text="OK", command=_ok).pack(side=tk.LEFT, padx=(12, 6))
+    ttk.Button(bf, text="Скасувати", command=_cancel).pack(side=tk.LEFT)
+    top.transient(master)
+    top.grab_set()
+    top.protocol("WM_DELETE_WINDOW", _cancel)
+    e_user.focus_set()
+    top.bind("<Return>", lambda _e: _ok())
+    top.wait_window()
+    return out_u[0], out_p[0]
+
+
+def _prompt_earthdata_credentials_from_any_thread(hint: str) -> Tuple[Optional[str], Optional[str]]:
+    if _schedule_on_main is None or _tk_master is None:
+        return None, None
+    q: "queue.Queue[Tuple[Optional[str], Optional[str]]]" = queue.Queue(maxsize=1)
+
+    def run_on_main() -> None:
+        try:
+            u, p = _earthdata_credentials_toplevel(_tk_master, hint)
+        except Exception:
+            u, p = None, None
+        try:
+            q.put((u, p), block=False)
+        except queue.Full:
+            pass
+
+    try:
+        _schedule_on_main(run_on_main)
+    except Exception:
+        return None, None
+    try:
+        return q.get(timeout=600)
+    except queue.Empty:
+        return None, None
+
 
 def _reset_earthaccess_login_state() -> None:
     """Для тестів або після явної зміни облікових даних Earthdata."""
@@ -93,12 +193,24 @@ def _reset_earthaccess_login_state() -> None:
     _earthaccess_login_ok = False
 
 
-def _ensure_earthaccess_login(earthaccess_mod) -> Tuple[bool, str]:
+def _earthaccess_pick_login_strategy() -> str:
+    """Без stdin з фонового потоку: у GUI — environment або netrc; інакше all."""
+    load_earthdata_credentials_from_project_file()
+    pw = (os.getenv("EARTHDATA_PASSWORD") or "").strip()
+    u = (os.getenv("EARTHDATA_USER") or os.getenv("EARTHDATA_USERNAME") or "").strip()
+    if pw and u:
+        return "environment"
+    if _schedule_on_main is not None and _tk_master is not None:
+        return "netrc"
+    return "all"
+
+
+def _ensure_earthaccess_login(earthaccess_mod, strategy: str) -> Tuple[bool, str]:
     global _earthaccess_login_ok
     if _earthaccess_login_ok:
         return True, ""
     try:
-        earthaccess_mod.login(strategy="all", persist=True)
+        earthaccess_mod.login(strategy=strategy, persist=True)
         _earthaccess_login_ok = True
         return True, ""
     except Exception as e:
@@ -154,17 +266,28 @@ def _download_tile_payload_earthaccess(
 
     stem_core = name[:-4] if name.lower().endswith(".hgt") else name
 
-    load_earthdata_credentials_from_project_file()
-
-    with _earthaccess_lock:
-        ok_login, err_login = _ensure_earthaccess_login(earthaccess)
-        if not ok_login:
+    err_login = ""
+    while True:
+        strat = _earthaccess_pick_login_strategy()
+        with _earthaccess_lock:
+            ok_login, err_login = _ensure_earthaccess_login(earthaccess, strat)
+        if ok_login:
+            break
+        u, p = _prompt_earthdata_credentials_from_any_thread(
+            f"Earthdata (earthaccess): не вдалося увійти.\n{err_login}"
+        )
+        if not u or not p:
             return (
                 False,
-                f"Earthdata (earthaccess): не вдалося увійти ({err_login}). "
-                "Задайте EARTHDATA_USER/EARTHDATA_PASSWORD або .netrc, або виконайте earthaccess.login() у консолі.",
+                f"Earthdata (earthaccess): не вдалося увійти ({err_login}). Скасовано або не задано UI.",
                 None,
             )
+        os.environ["EARTHDATA_USER"] = u.strip()
+        os.environ["EARTHDATA_USERNAME"] = u.strip()
+        os.environ["EARTHDATA_PASSWORD"] = p
+        _reset_earthaccess_login_state()
+
+    with _earthaccess_lock:
         try:
             granules = earthaccess.search_data(
                 short_name="SRTMGL1",

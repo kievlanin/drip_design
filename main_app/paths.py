@@ -55,17 +55,29 @@ def _pick_earthdata_block(blocks: List[Tuple[str, str, str]]) -> Optional[Tuple[
     return (u, p)
 
 
+def _sync_earthdata_user_username_env() -> None:
+    """earthaccess очікує EARTHDATA_USERNAME; решта коду — EARTHDATA_USER."""
+    u = (os.getenv("EARTHDATA_USER") or "").strip()
+    un = (os.getenv("EARTHDATA_USERNAME") or "").strip()
+    if u and not un:
+        os.environ.setdefault("EARTHDATA_USERNAME", u)
+    elif un and not u:
+        os.environ.setdefault("EARTHDATA_USER", un)
+
+
 def load_earthdata_credentials_from_project_file() -> None:
     """
-    Якщо в середовищі ще немає пари EARTHDATA_USER + EARTHDATA_PASSWORD,
+    Якщо в середовищі ще немає пари логін+пароль (EARTHDATA_USER або EARTHDATA_USERNAME + PASSWORD),
     читає з кореня проєкту EarthData.txt (або earthdata.txt) у стилі .netrc:
     machine … / login … / password …
     Значення з env мають пріоритет (функція ідемпотентна).
     """
     global _EARTHDATA_TXT_LOADED
-    if (os.getenv("EARTHDATA_USER") or "").strip() and (
-        os.getenv("EARTHDATA_PASSWORD") or ""
-    ).strip():
+    pw = (os.getenv("EARTHDATA_PASSWORD") or "").strip()
+    u_legacy = (os.getenv("EARTHDATA_USER") or "").strip()
+    u_edl = (os.getenv("EARTHDATA_USERNAME") or "").strip()
+    if pw and (u_legacy or u_edl):
+        _sync_earthdata_user_username_env()
         _EARTHDATA_TXT_LOADED = True
         return
     if _EARTHDATA_TXT_LOADED:
@@ -85,7 +97,9 @@ def load_earthdata_credentials_from_project_file() -> None:
             u, p = picked
             if u and p:
                 os.environ.setdefault("EARTHDATA_USER", u)
+                os.environ.setdefault("EARTHDATA_USERNAME", u)
                 os.environ.setdefault("EARTHDATA_PASSWORD", p)
+                _sync_earthdata_user_username_env()
         _EARTHDATA_TXT_LOADED = True
         return
     # Файлу ще немає — не кешуємо «пропуск», щоб пізніше доданий EarthData.txt підхопився.
