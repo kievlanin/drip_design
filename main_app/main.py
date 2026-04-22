@@ -10,7 +10,6 @@ if str(_repo_root) not in sys.path:
     sys.path.insert(0, str(_repo_root))
 
 from main_app.paths import PROJECT_ROOT
-
 assert PROJECT_ROOT == _repo_root  # bootstrap path must match paths.py
 
 from main_app.ui.app_ui import DripCADUI

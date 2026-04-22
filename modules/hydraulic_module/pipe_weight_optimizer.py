@@ -477,7 +477,17 @@ def optimize_fixed_topology_by_weight(
                 o.pn,
             )
         )
-        by_seg.append(filtered)
+        # Дедублікація по d_inner: з усіх варіантів одного d_inner (різні PN)
+        # залишаємо лише найдешевший. Дозволяє жадібному алгоритму не "застрягати"
+        # на переходах між PN одного діаметра (dh=0 → алгоритм не міг просуватись).
+        deduped: List[PipeOption] = []
+        seen_inner: set = set()
+        for o in filtered:
+            key_d = round(float(o.d_inner_mm), 4)
+            if key_d not in seen_inner:
+                seen_inner.add(key_d)
+                deduped.append(o)
+        by_seg.append(deduped)
 
     idx = [0 for _ in segments]
 

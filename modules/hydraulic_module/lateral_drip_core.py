@@ -81,11 +81,10 @@ def _hw_backwards_sweep_once(
     has_emitter: List[bool],
     q_lph: List[float],
     H: List[float],
-    z_at_x: Callable[[float], float],
     d_inner_m: float,
     C_hw: float,
 ) -> None:
-    """Один зворотний прохід HW + dz; оновлює H[0..M-1], H[-1] не змінює."""
+    """Один зворотний прохід HW. H — п'єзометричний (p/ρg + z), тому H_u = H_d + h_f; рельєф уже в H."""
     n_seg = len(chain) - 1
     strict_chain = n_seg > 0 and all(
         chain[j + 1] > chain[j] + 1e-12 for j in range(n_seg)
@@ -114,8 +113,7 @@ def _hw_backwards_sweep_once(
             )
         Q_m3s = lph_to_m3s(Q_lph)
         hf = hazen_williams_hloss_m(Q_m3s, dx, d_inner_m, C_hw)
-        dz = z_at_x(x_lo) - z_at_x(x_hi)
-        H[j] = H[j + 1] + hf + dz
+        H[j] = H[j + 1] + hf
 
 
 def backwards_step_method(
@@ -204,9 +202,7 @@ def backwards_step_method(
     if comp and flat_elev:
         H_fast = list(H)
         q_fast = list(q_lph)
-        _hw_backwards_sweep_once(
-            chain, M, has_emitter, q_fast, H_fast, z_at_x, d_inner_m, C_hw
-        )
+        _hw_backwards_sweep_once(chain, M, has_emitter, q_fast, H_fast, d_inner_m, C_hw)
         for k in range(len(chain)):
             if has_emitter[k]:
                 q_fast[k] = emitter_flow_lph(
@@ -249,9 +245,7 @@ def backwards_step_method(
         for it in range(max_picard):
             H_start = tuple(H)
             q_before = list(q_lph)
-            _hw_backwards_sweep_once(
-                chain, M, has_emitter, q_lph, H, z_at_x, d_inner_m, C_hw
-            )
+            _hw_backwards_sweep_once(chain, M, has_emitter, q_lph, H, d_inner_m, C_hw)
             for k in range(len(chain)):
                 if has_emitter[k]:
                     q_lph[k] = emitter_flow_lph(

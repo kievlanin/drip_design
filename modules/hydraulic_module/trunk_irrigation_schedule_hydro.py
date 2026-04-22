@@ -20,10 +20,13 @@ import copy
 import math
 from typing import Any, Callable, Dict, FrozenSet, List, Mapping, Optional, Sequence, Set, Tuple
 
-from .trunk_map_graph import build_oriented_edges
+from .trunk_map_graph import KIND_BEND, build_oriented_edges
 from .pipe_weight_optimizer import (
     OptimizationConstraints,
     SegmentDemand,
+    _hf_m,
+    _option_objective_cost_per_m,
+    _velocity_m_s,
     build_pipe_options_from_db,
     optimize_fixed_topology_by_weight,
     optimize_single_line_allocation_by_weight,
@@ -43,6 +46,58 @@ def _node_id(nodes: Sequence[Mapping[str, Any]], i: int) -> str:
     if i < 0 or i >= len(nodes):
         return ""
     return str(nodes[i].get("id", "")).strip() or f"T{i}"
+
+
+def _trunk_bend_only_chain_coalesce(
+    nodes: Sequence[Mapping[str, Any]],
+    directed: Sequence[Tuple[int, int]],
+    edge_len: Mapping[Tuple[str, str], float],
+) -> Dict[Tuple[str, str], Tuple[str, str]]:
+    """
+    Проміжні пікети (kind=bend) не змінюють Q — труба з точки зору гідравліки одна; усі
+    сегменти вздовж ланцюга «тільки bend між двома не-bend» зливаються в перше ребро ланцюга.
+
+    Кожне (неперше) ребро l у ланцюгу отримує coalesce[l] = rep (ключ першого ребра).
+    Ребра поза ланцюгами не з’являються в dict (для них rep = self).
+    """
+    n = len(nodes)
+
+    def ek(ui: int, vi: int) -> Tuple[str, str]:
+        return (_node_id(nodes, ui), _node_id(nodes, vi))
+
+    def is_bend(i: int) -> bool:
+        if i < 0 or i >= n:
+            return False
+        k = str(nodes[i].get("kind", "")).strip().lower()
+        return k == KIND_BEND
+
+    child_by: Dict[int, List[int]] = {}
+    for u, v in directed:
+        child_by.setdefault(int(u), []).append(int(v))
+    out: Dict[Tuple[str, str], Tuple[str, str]] = {}
+    for n0 in range(n):
+        if is_bend(n0):
+            continue
+        for v in child_by.get(n0, []):
+            if not is_bend(v):
+                continue
+            chain: List[Tuple[int, int]] = []
+            cur_p, cur_c = n0, v
+            while True:
+                if ek(cur_p, cur_c) not in edge_len:
+                    break
+                chain.append((cur_p, cur_c))
+                nxt_l = child_by.get(cur_c, [])
+                if len(nxt_l) != 1:
+                    break
+                w = nxt_l[0]
+                cur_p, cur_c = cur_c, w
+            if len(chain) < 2:
+                continue
+            rep = ek(*chain[0])
+            for tu, tv in chain[1:]:
+                out[ek(tu, tv)] = rep
+    return out
 
 
 def _segment_length_m(nodes: Sequence[Mapping[str, Any]], seg: Mapping[str, Any]) -> float:
@@ -128,6 +183,230 @@ def _collapse_short_telescope_sections(
         if not changed:
             break
     return out
+
+
+def _split_telescope_to_chain_edges(
+    chain_secs: Sequence[Mapping[str, Any]],
+    chain_edge_lengths: Sequence[float],
+) -> List[List[Dict[str, Any]]]:
+    """
+    Розподіляє результат одного телескопного розрахунку (chain_secs) по фізичних ребрах ланцюга.
+
+    chain_secs          – секції від source до consumer (upstream heavy first).
+    chain_edge_lengths  – довжини фізичних ребер у тому ж порядку (від source).
+    Повертає список списків секцій (один список per ребро).
+    """
+    n = len(chain_edge_lengths)
+    result: List[List[Dict[str, Any]]] = [[] for _ in range(n)]
+    if not chain_secs or not chain_edge_lengths:
+        return result
+    # cumulative edge start positions
+    edge_starts: List[float] = []
+    acc = 0.0
+    for lm in chain_edge_lengths:
+        edge_starts.append(acc)
+        acc += float(lm)
+    total_chain = acc
+    sec_pos = 0.0
+    for sec in chain_secs:
+        lm_sec = float(sec.get("length_m", 0.0) or 0.0)
+        if lm_sec <= 1e-12:
+            sec_pos += lm_sec
+            continue
+        sec_end = min(sec_pos + lm_sec, total_chain + 1e-9)
+        for ei in range(n):
+            es = edge_starts[ei]
+            ee = edge_starts[ei + 1] if ei + 1 < n else total_chain
+            ovlp_s = max(sec_pos, es)
+            ovlp_e = min(sec_end, ee)
+            if ovlp_e <= ovlp_s + 1e-9:
+                continue
+            ovlp_len = ovlp_e - ovlp_s
+            frac = ovlp_len / max(1e-12, lm_sec)
+            new_sec: Dict[str, Any] = dict(sec)
+            new_sec["length_m"] = float(ovlp_len)
+            for k in ("head_loss_m", "weight_kg", "objective_cost"):
+                v = new_sec.get(k)
+                if v is not None:
+                    try:
+                        new_sec[k] = float(v) * frac
+                    except (TypeError, ValueError):
+                        pass
+            result[ei].append(new_sec)
+        sec_pos = sec_end
+    return result
+
+
+def _order_chain_keys_from_rep(
+    rep: Tuple[str, str],
+    chain_keys: Sequence[Tuple[str, str]],
+) -> List[Tuple[str, str]]:
+    """
+    Упорядкувати ключі ребер ланцюга у напрямку потоку (upstream -> downstream),
+    починаючи з репрезентативного ребра rep.
+    """
+    if not chain_keys:
+        return []
+    pending = [(str(a), str(b)) for a, b in chain_keys]
+    child_to_edge: Dict[str, Tuple[str, str]] = {}
+    parent_to_edge: Dict[str, Tuple[str, str]] = {}
+    for ek in pending:
+        parent_to_edge[str(ek[0])] = ek
+        child_to_edge[str(ek[1])] = ek
+    ordered: List[Tuple[str, str]] = []
+    cur = (str(rep[0]), str(rep[1]))
+    used: Set[Tuple[str, str]] = set()
+    # Якщо rep не потрапив у chain_keys (пошкоджений набір), знайдемо старт:
+    # parent, який сам не є child у цьому ж наборі.
+    if cur not in pending:
+        start = None
+        for ek in pending:
+            if ek[0] not in child_to_edge:
+                start = ek
+                break
+        if start is not None:
+            cur = start
+        else:
+            cur = pending[0]
+    while cur not in used and cur in pending:
+        ordered.append(cur)
+        used.add(cur)
+        nxt = parent_to_edge.get(cur[1])
+        if nxt is None:
+            break
+        cur = nxt
+    if len(ordered) == len(pending):
+        return ordered
+    # fallback: додаємо все, що не потрапило (стабільно, без втрати ребер)
+    for ek in pending:
+        if ek not in used:
+            ordered.append(ek)
+    return ordered
+
+
+def _optimize_chain_telescope_node_snapped(
+    chain_edge_lengths: Sequence[float],
+    q_m3s: float,
+    options: Sequence[Any],
+    max_head_loss_m: float,
+    max_velocity_mps: float,
+    max_active_segments: int,
+    objective: str,
+) -> Optional[List[List[Dict[str, Any]]]]:
+    """
+    Телескоп по ланцюгу з переходами ТІЛЬКИ на вузлах-пікетах (фізичні межі ребер).
+
+    Кожне ребро ланцюга отримує один діаметр; перехід діаметра стається лише
+    на межі між ребрами (де стоятимуть муфти/коліна). Монотонно: upstream важче.
+
+    chain_edge_lengths  — довжини ребер ланцюга від джерела до споживача.
+    Повертає per-ребро список секцій (по одній секції на ребро) або None, якщо
+    жодна комбінація діаметрів не задовольняє бюджет ΔH / швидкість / max_segs.
+    """
+    from itertools import product
+
+    n = len(chain_edge_lengths)
+    if n == 0:
+        return None
+    lens = [float(L) for L in chain_edge_lengths]
+    if sum(lens) <= 1e-9:
+        return None
+
+    # Дедуплікація PipeOption по d_inner — для кожного внутрішнього діаметра беремо
+    # найдешевший варіант PN (гідравліка однакова, вага/ціна можуть відрізнятись).
+    dedup: Dict[float, Any] = {}
+    for opt in options:
+        try:
+            key = round(float(opt.d_inner_mm), 4)
+        except (TypeError, ValueError):
+            continue
+        cur = dedup.get(key)
+        if (
+            cur is None
+            or _option_objective_cost_per_m(opt, objective)
+            < _option_objective_cost_per_m(cur, objective) - 1e-9
+        ):
+            dedup[key] = opt
+    sorted_opts = sorted(dedup.values(), key=lambda o: float(o.d_inner_mm))
+    if not sorted_opts:
+        return None
+
+    budget = float(max_head_loss_m)
+    v_lim = float(max_velocity_mps)
+    max_segs = max(1, int(max_active_segments or 2))
+    num_opts = len(sorted_opts)
+
+    best: Optional[Tuple[float, Tuple[int, ...]]] = None
+    for combo in product(range(num_opts), repeat=n):
+        # upstream → downstream монотонно non-increasing по d_inner (важке вгору за потоком)
+        bad = False
+        for i in range(n - 1):
+            if combo[i] < combo[i + 1]:
+                bad = True
+                break
+        if bad:
+            continue
+        # Кількість унікальних діаметрів ≤ max_segs (межа на загальну "складність" телескопа)
+        distinct: List[int] = []
+        for ci in combo:
+            if not distinct or distinct[-1] != ci:
+                distinct.append(ci)
+        if len(distinct) > max_segs:
+            continue
+        # Обмеження швидкості
+        if v_lim > 1e-12:
+            vbad = False
+            for ci in distinct:
+                if _velocity_m_s(q_m3s, float(sorted_opts[ci].d_inner_mm)) > v_lim + 1e-6:
+                    vbad = True
+                    break
+            if vbad:
+                continue
+        # Бюджет ΔH
+        hf_total = 0.0
+        over = False
+        for i, ci in enumerate(combo):
+            hf_total += _hf_m(
+                q_m3s,
+                lens[i],
+                float(sorted_opts[ci].d_inner_mm),
+                float(sorted_opts[ci].c_hw),
+            )
+            if hf_total > budget + 1e-6:
+                over = True
+                break
+        if over:
+            continue
+        # Мета (weight / money)
+        obj_total = 0.0
+        for i, ci in enumerate(combo):
+            obj_total += _option_objective_cost_per_m(sorted_opts[ci], objective) * lens[i]
+        if best is None or obj_total < best[0] - 1e-9:
+            best = (obj_total, tuple(combo))
+
+    if best is None:
+        return None
+
+    _, combo = best
+    per_edge: List[List[Dict[str, Any]]] = []
+    for i, ci in enumerate(combo):
+        opt = sorted_opts[ci]
+        L = lens[i]
+        hf = _hf_m(q_m3s, L, float(opt.d_inner_mm), float(opt.c_hw))
+        w = float(opt.weight_kg_m) * L
+        obj = _option_objective_cost_per_m(opt, objective) * L
+        sec = {
+            "length_m": float(L),
+            "d_nom_mm": float(opt.d_nom_mm),
+            "d_inner_mm": float(opt.d_inner_mm),
+            "material": str(opt.material),
+            "pn": str(opt.pn),
+            "head_loss_m": float(hf),
+            "weight_kg": float(w),
+            "objective_cost": float(obj),
+        }
+        per_edge.append([sec])
+    return per_edge
 
 
 def _rescale_hw_section_tuples_to_edge_length(
@@ -1201,6 +1480,7 @@ def refine_trunk_picks_pressure_tightening(
     head_tol_m: float = 0.28,
     max_iters: int = 28,
     surface_z_at_xy: Optional[Callable[[float, float], float]] = None,
+    bend_chain_edges: Optional[Set[Tuple[str, str]]] = None,
 ) -> List[str]:
     """
     Після мінімізації вартості за бюджетом ΔH — «підтягнути» рішення до цільового напору на споживачах:
@@ -1417,6 +1697,12 @@ def refine_trunk_picks_pressure_tightening(
                 continue
             old_obj = float(pick.get("objective_cost", 1e18) or 1e18)
             new_budget = float(hf_now) + float(step)
+            # Для ребер bend-ланцюга НЕ чіпаємо результат базової оптимізації:
+            # він уже знайдений як один телескоп на весь ланцюг і лише розкладений по трасі.
+            is_chain_edge = bool(bend_chain_edges) and ((pa, ch) in (bend_chain_edges or set()))
+            if is_chain_edge:
+                continue
+            edge_max_sections = max(1, int(max_sections_per_edge))
             edge_opt = optimize_single_line_allocation_by_weight(
                 total_length_m=lm,
                 q_m3s=qv,
@@ -1425,7 +1711,7 @@ def refine_trunk_picks_pressure_tightening(
                     max_head_loss_m=float(new_budget),
                     max_velocity_m_s=float(max_pipe_velocity_mps),
                     min_segment_length_m=float(min_segment_length_m),
-                    max_active_segments=max(1, int(max_sections_per_edge)),
+                    max_active_segments=edge_max_sections,
                     objective=str(objective),
                     length_round_step_m=float(length_round_step_m),
                 ),
@@ -1605,31 +1891,49 @@ def optimize_trunk_diameters_by_weight(
     if issues:
         return {"feasible": False, "message": "Помилки геометрії/топології."}, issues
 
+    # Пікети (bend) — лише геометрія труби; Q одна вздовж ланцюга → агрегація в одне «логічне» ребро
+    # перед короткими сегментами та top-level optimize.
+    bend_coalesce = _trunk_bend_only_chain_coalesce(nodes, directed, edge_len)
+
+    def _after_bend(k: Tuple[str, str]) -> Tuple[str, str]:
+        return bend_coalesce.get(k, k)
+
+    agg_bend: Dict[Tuple[str, str], float] = {}
+    for k, lm in edge_len.items():
+        r0 = _after_bend(k)
+        agg_bend[r0] = agg_bend.get(r0, 0.0) + float(lm)
+
     absorbed_by: Dict[Tuple[str, str], Tuple[str, str]] = {}
-    for key, lm in edge_len.items():
-        if min_seg <= 1e-9 or lm + 1e-9 >= min_seg:
+    for r, tlen in agg_bend.items():
+        if min_seg <= 1e-9 or tlen + 1e-9 >= min_seg:
             continue
-        parent = parent_edge_by_child.get(key[0])
+        parent = parent_edge_by_child.get(r[0])
         if parent is None:
             continue
         while parent in absorbed_by:
             parent = absorbed_by[parent]
-        absorbed_by[key] = parent
+        absorbed_by[r] = parent
+
+    def _group_root_key(k: Tuple[str, str]) -> Tuple[str, str]:
+        t = _after_bend(k)
+        while t in absorbed_by:
+            t = absorbed_by[t]
+        return t
 
     agg_len: Dict[Tuple[str, str], float] = {}
     for key, lm in edge_len.items():
-        root = key
-        while root in absorbed_by:
-            root = absorbed_by[root]
+        root = _group_root_key(key)
         agg_len[root] = agg_len.get(root, 0.0) + float(lm)
 
     demands: List[SegmentDemand] = []
+    roots_for_demands: Set[Tuple[str, str]] = set()
     for u, v in directed:
         pid, cid = _node_id(nodes, u), _node_id(nodes, v)
         key = (pid, cid)
-        if key in absorbed_by:
-            continue
-        lm = float(agg_len.get(key, edge_len.get(key, 0.0)))
+        roots_for_demands.add(_group_root_key(key))
+    for pid, cid in sorted(roots_for_demands, key=str):
+        tkey = (pid, cid)
+        lm = float(agg_len.get(tkey, 0.0))
         if lm <= 1e-9:
             continue
         demands.append(
@@ -1666,15 +1970,80 @@ def optimize_trunk_diameters_by_weight(
         pid, cid = _node_id(nodes, u), _node_id(nodes, v)
         key = (pid, cid)
         total_edge_len_m += float(edge_len.get(key, 0.0))
+    # === Один телескоп на весь ланцюг bend-пікетів (один на А→B→C, а не окремо A→B і B→C) ===
+    # Групуємо фізичні ребра за _after_bend — ребра одного ланцюга отримують однаковий rep.
+    chains_by_rep: Dict[Tuple[str, str], List[Tuple[str, str]]] = {}
+    for u, v in directed:
+        pid, cid = _node_id(nodes, u), _node_id(nodes, v)
+        key = (pid, cid)
+        rep = _after_bend(key)
+        chains_by_rep.setdefault(rep, []).append(key)
+    # chain_secs_for_key: попередньо обчислені секції для ребер у bend-ланцюгах (len>1)
+    chain_secs_for_key: Dict[Tuple[str, str], List[Dict[str, Any]]] = {}
+    for rep, chain_keys in chains_by_rep.items():
+        if len(chain_keys) < 2:
+            continue  # одне ребро — стандартний шлях
+        ch_rep = chosen.get(f"{rep[0]}->{rep[1]}")
+        if ch_rep is None:
+            continue
+        ordered_chain_keys = _order_chain_keys_from_rep(rep, chain_keys)
+        chain_lens = [float(edge_len.get(k, 0.0)) for k in ordered_chain_keys]
+        total_chain_len = sum(chain_lens)
+        if total_chain_len <= 1e-9:
+            continue
+        chain_q = max((float(edge_peak_q.get(k, 0.0)) for k in ordered_chain_keys), default=0.0)
+        # Бюджет: пропорційна частина ch_rep.head_loss_m + глобальний slack на весь ланцюг
+        base_chain_budget = max(0.0, float(ch_rep.head_loss_m))
+        chain_slack = (
+            global_slack_hf * (total_chain_len / max(1e-9, total_edge_len_m))
+            if total_edge_len_m > 1e-9
+            else 0.0
+        )
+        chain_budget_hf = float(base_chain_budget) + float(chain_slack)
+        # Оптимізація виконується по всьому ланцюгу як по одному логічному ребру.
+        # Пікети (bend) впливають лише на геометричне розбиття/підписи після оптимізації.
+        chain_opt = optimize_single_line_allocation_by_weight(
+            total_length_m=total_chain_len,
+            q_m3s=chain_q,
+            options=options,
+            constraints=OptimizationConstraints(
+                max_head_loss_m=chain_budget_hf,
+                max_velocity_m_s=float(max_velocity_mps),
+                min_segment_length_m=float(min_seg),
+                max_active_segments=max(1, int(max_sections_per_edge)),
+                objective=str(objective_clean),
+                length_round_step_m=float(length_round_step_m),
+            ),
+        )
+        if not chain_opt.feasible or not chain_opt.allocations:
+            continue
+        chain_secs_full = _collapse_short_telescope_sections([
+            {
+                "length_m": float(a.length_m),
+                "d_nom_mm": float(a.d_nom_mm),
+                "d_inner_mm": float(a.d_inner_mm),
+                "material": str(a.material),
+                "pn": str(a.pn),
+                "head_loss_m": float(a.head_loss_m),
+                "weight_kg": float(a.weight_kg),
+                "objective_cost": float(a.objective_cost),
+            }
+            for a in chain_opt.allocations
+        ])
+        per_edge = _split_telescope_to_chain_edges(chain_secs_full, chain_lens)
+        for ek, esecs in zip(ordered_chain_keys, per_edge):
+            if esecs:
+                # Важливо: це лише "укладання" вже оптимізованого телескопа по трасі.
+                # Не перераховуємо/не переоптимізуємо локально секції на ребрі.
+                chain_secs_for_key[ek] = [dict(s) for s in esecs if isinstance(s, Mapping)]
+
     picks: List[Dict[str, Any]] = []
     total_weight = 0.0
     total_objective_cost = 0.0
     for u, v in directed:
         pid, cid = _node_id(nodes, u), _node_id(nodes, v)
         key = (pid, cid)
-        root = key
-        while root in absorbed_by:
-            root = absorbed_by[root]
+        root = _group_root_key(key)
         ch = chosen.get(f"{root[0]}->{root[1]}")
         if ch is None:
             continue
@@ -1694,7 +2063,13 @@ def optimize_trunk_diameters_by_weight(
         telescoped_hf = edge_budget_hf
         telescoped_weight = unit_w * lm
         telescoped_obj = float(ch.objective_cost / max(1e-9, float(agg_len.get(root, lm if lm > 0 else 1.0)))) * lm
-        if lm > 1e-9:
+        # Якщо ребро є частиною bend-ланцюга — використати попередньо обчислений chain-телескоп.
+        if key in chain_secs_for_key:
+            telescoped_sections = chain_secs_for_key[key]
+            telescoped_hf = sum(float(x.get("head_loss_m", 0.0) or 0.0) for x in telescoped_sections)
+            telescoped_weight = sum(float(x.get("weight_kg", 0.0) or 0.0) for x in telescoped_sections)
+            telescoped_obj = sum(float(x.get("objective_cost", 0.0) or 0.0) for x in telescoped_sections)
+        elif lm > 1e-9:
             edge_opt = optimize_single_line_allocation_by_weight(
                 total_length_m=lm,
                 q_m3s=float(edge_peak_q.get((pid, cid), 0.0)),
@@ -1766,6 +2141,17 @@ def optimize_trunk_diameters_by_weight(
         and pump_operating_head_m is not None
         and schedule_target_head_m is not None
     ):
+        # Набір ребер, що входять у многоланкові bend-ланцюги — їм не можна робити
+        # внутрішньосегментний телескоп під час підтягування тиску (переходи лише на пікетах).
+        bend_chain_edge_set: Set[Tuple[str, str]] = set()
+        try:
+            for _rep_k, _chain_list in (chains_by_rep or {}).items():
+                if isinstance(_chain_list, (list, tuple)) and len(_chain_list) >= 2:
+                    for _ek in _chain_list:
+                        if isinstance(_ek, tuple) and len(_ek) == 2:
+                            bend_chain_edge_set.add((str(_ek[0]), str(_ek[1])))
+        except Exception:
+            bend_chain_edge_set = set()
         rmsgs = refine_trunk_picks_pressure_tightening(
             nodes,
             segs,
@@ -1784,6 +2170,7 @@ def optimize_trunk_diameters_by_weight(
             objective=str(objective_clean),
             length_round_step_m=float(length_round_step_m),
             surface_z_at_xy=surface_z_at_xy,
+            bend_chain_edges=bend_chain_edge_set,
         )
         if rmsgs:
             issues.extend(rmsgs)
@@ -1792,6 +2179,8 @@ def optimize_trunk_diameters_by_weight(
             float(p.get("objective_cost", 0.0) or 0.0) for p in picks if isinstance(p, dict)
         )
     msg = str(res.message)
+    if bend_coalesce:
+        msg = f"{msg} Злито сегментів пікетів (bend) у логічні труби: {len(bend_coalesce)}."
     if absorbed_by:
         msg = f"{msg} Короткі сегменти поглинуто попередніми: {len(absorbed_by)}."
     return {

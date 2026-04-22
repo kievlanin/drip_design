@@ -475,6 +475,14 @@ def _collect_project_data(app, force_georeferenced=False):
             and app.var_valve_h_max_optimize.get(),
             "show_emitter_flow_on_map": getattr(app, "var_show_emitter_flow", None)
             and app.var_show_emitter_flow.get(),
+            "show_contours": bool(getattr(app, "show_contours", None) and app.show_contours.get()),
+            "show_topo_points": bool(getattr(app, "show_topo_points", None) and app.show_topo_points.get()),
+            "show_topo_computation_zone": bool(
+                getattr(app, "show_topo_computation_zone", None) and app.show_topo_computation_zone.get()
+            ),
+            "show_srtm_boundary_overlay": bool(
+                getattr(app, "show_srtm_boundary_overlay", None) and app.show_srtm_boundary_overlay.get()
+            ),
             "mat": app.pipe_material.get(),
             "pn": app.pipe_pn.get(),
             "lateral_solver_mode": getattr(app, "var_lateral_solver_mode", None)
@@ -499,6 +507,9 @@ def _collect_project_data(app, force_georeferenced=False):
             "emitter_h_press_max_m": getattr(app, "var_emit_h_press_max", None)
             and app.var_emit_h_press_max.get()
             or "0",
+            "terrain_surface_scale": getattr(app, "var_terrain_surface_scale", None)
+            and app.var_terrain_surface_scale.get()
+            or "1.0",
             "submain_topo_in_headloss": bool(getattr(app, "_submain_topo_in_headloss", True)),
             **(
                 {
@@ -1094,6 +1105,14 @@ def load_project(app):
             app.var_valve_h_max_optimize.set(bool(p.get("valve_h_max_optimize", True)))
         if hasattr(app, "var_show_emitter_flow"):
             app.var_show_emitter_flow.set(bool(p.get("show_emitter_flow_on_map", True)))
+        if hasattr(app, "show_contours"):
+            app.show_contours.set(bool(p.get("show_contours", True)))
+        if hasattr(app, "show_topo_points"):
+            app.show_topo_points.set(bool(p.get("show_topo_points", False)))
+        if hasattr(app, "show_topo_computation_zone"):
+            app.show_topo_computation_zone.set(bool(p.get("show_topo_computation_zone", False)))
+        if hasattr(app, "show_srtm_boundary_overlay"):
+            app.show_srtm_boundary_overlay.set(bool(p.get("show_srtm_boundary_overlay", False)))
         
         # ОНОВЛЮЄМО МЕНЮШКИ ПІСЛЯ ЗАВАНТАЖЕННЯ БАЗИ ТРУБ
         avail = list(app.pipe_db.keys())
@@ -1106,7 +1125,7 @@ def load_project(app):
 
         if hasattr(app, "var_lateral_solver_mode"):
             m = str(p.get("lateral_solver_mode", "bisection")).strip().lower()
-            if m not in ("compare", "bisection", "newton"):
+            if m not in ("compare", "bisection", "newton", "trickle_nr"):
                 m = "bisection"
             app.var_lateral_solver_mode.set(m)
 
@@ -1122,6 +1141,8 @@ def load_project(app):
             app.var_emit_h_press_min.set(str(p.get("emitter_h_press_min_m", "0")))
         if hasattr(app, "var_emit_h_press_max"):
             app.var_emit_h_press_max.set(str(p.get("emitter_h_press_max_m", "0")))
+        if hasattr(app, "var_terrain_surface_scale"):
+            app.var_terrain_surface_scale.set(str(p.get("terrain_surface_scale", "1.0")))
         app._submain_topo_in_headloss = bool(p.get("submain_topo_in_headloss", True))
 
         if hasattr(app, "var_lat_disp_step"):

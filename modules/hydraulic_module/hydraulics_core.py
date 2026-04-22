@@ -9,6 +9,7 @@ from shapely.ops import substring, nearest_points
 from main_app.paths import PIPES_DB_PATH
 
 from . import lateral_solver as lat_sol
+from . import trickle_line_nr_solver as trickle_nr
 from .dripperline_catalog import load_dripperlines_catalog
 from .hydraulics_constants import DEFAULT_HAZEN_WILLIAMS_C, hazen_c_from_pipe_entry
 
@@ -611,7 +612,7 @@ class HydraulicEngine:
         topo = data.get("topo", None)
 
         lat_mode = str(data.get("lateral_solver_mode") or "bisection").strip().lower()
-        if lat_mode not in ("compare", "bisection", "newton"):
+        if lat_mode not in ("compare", "bisection", "newton", "trickle_nr"):
             lat_mode = "bisection"
         lateral_collect_exact = bool(data.get("lateral_collect_exact", False))
         try:
@@ -834,6 +835,7 @@ class HydraulicEngine:
         wing_solves = 0
         sum_it_bi = 0
         sum_it_nr = 0
+        sum_it_trickle = 0
 
         vs_geom = [coords for coords in submain_lines if len(coords) > 1]
         sm_multi_geom = MultiLineString(vs_geom) if vs_geom else None
@@ -873,7 +875,7 @@ class HydraulicEngine:
 
         def iterate_laterals(profiles_src: dict, collect_loads: bool):
             """collect_loads=True: лише накопичити lateral_loads_for_sm; інакше — зібрати emitters."""
-            nonlocal max_dH_tip, max_dQ_m3s, max_dQ_rel, wing_solves, sum_it_bi, sum_it_nr
+            nonlocal max_dH_tip, max_dQ_m3s, max_dQ_rel, wing_solves, sum_it_bi, sum_it_nr, sum_it_trickle
             out_emitters = {}
             c_hw = float(DEFAULT_HAZEN_WILLIAMS_C)
 
@@ -908,7 +910,7 @@ class HydraulicEngine:
                     )
 
                 def calc_wing(length: float, is_l1: bool, _es=e_step_i, _ef=e_flow_i):
-                    nonlocal max_dH_tip, max_dQ_m3s, max_dQ_rel, wing_solves, sum_it_bi, sum_it_nr
+                    nonlocal max_dH_tip, max_dQ_m3s, max_dQ_rel, wing_solves, sum_it_bi, sum_it_nr, sum_it_trickle
                     if length < 0.1:
                         return [], 0.0
 
@@ -929,6 +931,32 @@ class HydraulicEngine:
 
                     # Збір Q(s): за замовчуванням швидка номінальна оцінка (без бісекції); exact — стара бісекція.
                     if collect_loads:
+                        if (
+                            lat_mode == "trickle_nr"
+                            and not bool(emitter_opts.get("compensated"))
+                        ):
+                            if lateral_collect_exact:
+                                _p, _q_tr, _, _ = trickle_nr.solve_wing_trickle_nr(
+                                    H_sub,
+                                    length,
+                                    _es,
+                                    _ef,
+                                    z_at_x,
+                                    d_in,
+                                    c_hw,
+                                    h_ref_m=h_ref_m,
+                                    emitter_opts=emitter_opts,
+                                )
+                                return [], float(_q_tr)
+                            q_wing_m3s = lat_sol.approx_wing_q_m3s_nominal(
+                                length,
+                                _es,
+                                _ef,
+                                H_sub,
+                                h_ref_m=h_ref_m,
+                                emitter_opts=emitter_opts,
+                            )
+                            return [], float(q_wing_m3s)
                         if lateral_collect_exact:
                             aff = lat_sol.try_compensated_affine_tip(
                                 H_sub,
@@ -985,6 +1013,24 @@ class HydraulicEngine:
                     nodes_affine = None
                     q_affine = None
 
+                    if (
+                        lat_mode == "trickle_nr"
+                        and not bool(emitter_opts.get("compensated"))
+                    ):
+                        prof_tr, q_wing_m3s, it_tr, _ = trickle_nr.solve_wing_trickle_nr(
+                            H_sub,
+                            length,
+                            _es,
+                            _ef,
+                            z_at_x,
+                            d_in,
+                            c_hw,
+                            h_ref_m=h_ref_m,
+                            emitter_opts=emitter_opts,
+                        )
+                        sum_it_trickle += it_tr
+                        return prof_tr, q_wing_m3s
+
                     if lat_mode == "compare":
                         H_bi, it_bi = lat_sol.solve_lateral_shooting_bisection(
                             H_sub,
@@ -1037,7 +1083,7 @@ class HydraulicEngine:
                         r_bi = abs(h0_bi - H_sub)
                         r_nr = abs(h0_nr - H_sub)
                         H_use = H_nr if r_nr <= r_bi else H_bi
-                    elif lat_mode == "bisection":
+                    elif lat_mode == "bisection" or lat_mode == "trickle_nr":
                         aff = lat_sol.try_compensated_affine_tip(
                             H_sub,
                             length,
@@ -1117,6 +1163,24 @@ class HydraulicEngine:
                 if n_lat > 0 and not collect_loads:
                     _tap("Латералі: профіль (крило 1)…")
                 d2, q2 = calc_wing(max(0, lat.length - conn_dist), False)
+                # Фізично в обох крилах один і той самий вузол врізки в сабмейн:
+                # стартовий напір на x=0 має бути спільним (H_sub).
+                # Нормалізуємо лише відображуваний профіль, не змінюючи розрахунок витрат.
+                try:
+                    h_conn_vis = round(float(H_sub), 2)
+                except (TypeError, ValueError):
+                    h_conn_vis = None
+                if h_conn_vis is not None:
+                    if isinstance(d1, list) and d1:
+                        try:
+                            d1[0]["h"] = h_conn_vis
+                        except Exception:
+                            pass
+                    if isinstance(d2, list) and d2:
+                        try:
+                            d2[0]["h"] = h_conn_vis
+                        except Exception:
+                            pass
                 if collect_loads:
                     lateral_loads_for_sm.append(
                         {"sm_idx": int(sm_i), "s": float(s_along), "q_m3s": float(q1 + q2)}
@@ -1490,6 +1554,77 @@ class HydraulicEngine:
                         {"s": 0.0, "z": round(z0, 3), "h": round(float(h_required), 4), "q_m3h": round(q0, 2)},
                         {"s": round(L_total, 3), "z": round(z1, 3), "h": round(float(h_required), 4), "q_m3h": 0.0},
                     ]
+
+                # Для проходу за фактичними навантаженнями формуємо Q(s) по вузлах відбору латералей.
+                # Це дає фізично коректний ступінчастий профіль витрати (а не майже пряму).
+                if use_lat_q and profile:
+                    loads_sm = [
+                        (float(L["s"]), float(L["q_m3s"]))
+                        for L in lateral_loads_for_sm
+                        if int(L.get("sm_idx", -1)) == int(sm_idx)
+                    ]
+                    if loads_sm:
+                        loads_sm.sort(key=lambda t: t[0])
+                        total_q_load_m3s = sum(q for _s, q in loads_sm)
+                        # Вузли профілю: наявні точки + точки врізок латералей.
+                        knot_s = {max(0.0, min(float(L_total), float(r.get("s", 0.0) or 0.0))) for r in profile}
+                        for ls, _lq in loads_sm:
+                            knot_s.add(max(0.0, min(float(L_total), float(ls))))
+                        knot_s_sorted = sorted(knot_s)
+
+                        prof_sorted = sorted(
+                            (
+                                {
+                                    "s": float(r.get("s", 0.0) or 0.0),
+                                    "z": float(r.get("z", 0.0) or 0.0),
+                                    "h": float(r.get("h", 0.0) or 0.0),
+                                }
+                                for r in profile
+                            ),
+                            key=lambda rr: rr["s"],
+                        )
+
+                        def _interp_hz_at(sq: float) -> Tuple[float, float]:
+                            if not prof_sorted:
+                                return (0.0, 0.0)
+                            if sq <= prof_sorted[0]["s"] + 1e-9:
+                                return (prof_sorted[0]["h"], prof_sorted[0]["z"])
+                            if sq >= prof_sorted[-1]["s"] - 1e-9:
+                                return (prof_sorted[-1]["h"], prof_sorted[-1]["z"])
+                            for j in range(len(prof_sorted) - 1):
+                                a = prof_sorted[j]
+                                b = prof_sorted[j + 1]
+                                sa = float(a["s"])
+                                sb = float(b["s"])
+                                if sa - 1e-9 <= sq <= sb + 1e-9:
+                                    ds = max(1e-12, sb - sa)
+                                    t = max(0.0, min(1.0, (sq - sa) / ds))
+                                    hq = float(a["h"]) + (float(b["h"]) - float(a["h"])) * t
+                                    zq = float(a["z"]) + (float(b["z"]) - float(a["z"])) * t
+                                    return (hq, zq)
+                            return (prof_sorted[-1]["h"], prof_sorted[-1]["z"])
+
+                        # Двовказівниковий кумулятив: Q_downstream(s) = total - sum(loads with s_load <= s)
+                        q_prefix = 0.0
+                        li = 0
+                        nld = len(loads_sm)
+                        profile_refined = []
+                        for sq in knot_s_sorted:
+                            while li < nld and loads_sm[li][0] <= sq + 1e-9:
+                                q_prefix += float(loads_sm[li][1])
+                                li += 1
+                            q_down = max(0.0, total_q_load_m3s - q_prefix)
+                            hh, zz = _interp_hz_at(float(sq))
+                            profile_refined.append(
+                                {
+                                    "s": round(float(sq), 3),
+                                    "z": round(float(zz), 3),
+                                    "h": round(float(hh), 4),
+                                    "q_m3h": round(float(q_down * 3600.0), 2),
+                                }
+                            )
+                        if profile_refined:
+                            profile = profile_refined
                 calc_results["submain_profiles"][str(sm_idx)] = profile
                 v_key = str((round(sm_coords[0][0], 2), round(sm_coords[0][1], 2)))
                 if v_key in calc_results["valves"]:
@@ -1744,6 +1879,7 @@ class HydraulicEngine:
         wing_solves = 0
         sum_it_bi = 0
         sum_it_nr = 0
+        sum_it_trickle = 0
         project_emitters = iterate_laterals(dict(calc_results.get("submain_profiles") or {}), False)
 
         if valve_h_max_m > 1e-9:
@@ -1776,7 +1912,12 @@ class HydraulicEngine:
         if wing_solves > 0:
             ab = sum_it_bi / wing_solves
             an = sum_it_nr / wing_solves
-            report_lines.append(f"--- Латералі (режим: {lat_mode}) — прямий HW ---")
+            _lat_hdr = (
+                "багатовузловий Ньютон (q∼(Δh/C)^0.54, вилив K(H−E)^x)"
+                if lat_mode == "trickle_nr"
+                else "прямий HW"
+            )
+            report_lines.append(f"--- Латералі (режим: {lat_mode}) — {_lat_hdr} ---")
             if lat_mode == "compare":
                 report_lines.append(
                     f"Порівняння бісекція vs Ньютон: макс. |ΔH_тупик| = {max_dH_tip:.4f} м; "
@@ -1791,6 +1932,51 @@ class HydraulicEngine:
                 report_lines.append(
                     f"Лише бісекція: сумарно ітерацій {sum_it_bi}, середнє на крило {ab:.1f}."
                 )
+            elif lat_mode == "trickle_nr":
+                at = sum_it_trickle / wing_solves if wing_solves else 0.0
+                report_lines.append(
+                    f"Багатовузловий Ньютон по лінії: сумарно ітерацій {sum_it_trickle}, середнє на крило {at:.1f}."
+                )
+                if bool(emitter_opts.get("compensated")):
+                    report_lines.append(
+                        "  (Компенсовані крапельниці: профіль рахується як прямий HW + бісекція.)"
+                    )
+                else:
+                    _q_all: list = []
+                    _q_by_block: dict = {}
+                    for _idx, _gl in enumerate(lat_geom):
+                        _pay = project_emitters.get(f"lat_{_idx}") or {}
+                        try:
+                            _bi0 = int(lateral_block_idx[_idx]) if _idx < len(lateral_block_idx) else 0
+                        except (TypeError, ValueError, IndexError):
+                            _bi0 = 0
+                        _lst = _q_by_block.setdefault(_bi0, [])
+                        for _wing in (_pay.get("L1") or [], _pay.get("L2") or []):
+                            for _row in _wing:
+                                _qe = float(_row.get("q_emit", 0))
+                                if _qe > 1e-9:
+                                    _q_all.append(_qe)
+                                    _lst.append(_qe)
+                    calc_results["block_emitter_uniformity"] = {}
+                    for _bi0, _ql in sorted(_q_by_block.items(), key=lambda t: int(t[0])):
+                        if len(_ql) >= 2:
+                            _bm = trickle_nr.emitter_flow_uniformity_metrics(_ql)
+                            calc_results["block_emitter_uniformity"][str(_bi0)] = {
+                                "du_low_quarter_pct": round(_bm["du_low_quarter_pct"], 4),
+                                "christiansen_cu": round(_bm["christiansen_cu"], 6),
+                                "n_emitters": int(len(_ql)),
+                            }
+                    if len(_q_all) >= 2:
+                        _um = trickle_nr.emitter_flow_uniformity_metrics(_q_all)
+                        report_lines.append(
+                            f"  Рівномірність виливу (усі крапельниці): DU (низькі ¼) = "
+                            f"{_um['du_low_quarter_pct']:.2f} %; Christiansen CU = {_um['christiansen_cu']:.4f}."
+                        )
+                        calc_results["lateral_emitter_uniformity"] = {
+                            "du_low_quarter_pct": round(_um["du_low_quarter_pct"], 4),
+                            "christiansen_cu": round(_um["christiansen_cu"], 6),
+                            "n_emitters": int(len(_q_all)),
+                        }
             else:
                 report_lines.append(
                     f"Лише Ньютон–Рафсон: сумарно ітерацій {sum_it_nr}, середнє на крило {an:.1f}."
@@ -2059,6 +2245,7 @@ class HydraulicEngine:
                         f"  Блок {int(bk) + 1}: {calc_results['block_avg_emit_lph'][bk]:.3f} л/год"
                     )
 
+        _lu_snap = calc_results.get("lateral_emitter_uniformity")
         calc_results["lateral_solver_stats"] = {
             "mode": lat_mode,
             "lateral_collect_exact": lateral_collect_exact,
@@ -2080,11 +2267,21 @@ class HydraulicEngine:
             "wings_solved": wing_solves,
             "sum_bisection_iters": sum_it_bi,
             "sum_newton_iters": sum_it_nr,
+            "sum_trickle_nr_iters": sum_it_trickle,
             "avg_bisection_iters": round(sum_it_bi / wing_solves, 3) if wing_solves else 0.0,
             "avg_newton_iters": round(sum_it_nr / wing_solves, 3) if wing_solves else 0.0,
+            "avg_trickle_nr_iters": round(sum_it_trickle / wing_solves, 3)
+            if wing_solves
+            else 0.0,
             "max_delta_H_tip_m": round(max_dH_tip, 6),
             "max_delta_Q_m3s": round(max_dQ_m3s, 8),
             "max_delta_Q_relative": round(max_dQ_rel, 8),
+            "emitter_du_low_quarter_pct": (
+                float(_lu_snap["du_low_quarter_pct"]) if _lu_snap else None
+            ),
+            "emitter_christiansen_cu": (
+                float(_lu_snap["christiansen_cu"]) if _lu_snap else None
+            ),
         }
 
         return "\n".join(report_lines), calc_results

@@ -463,7 +463,7 @@ class ControlPanel:
             fg="#00FFCC",
             font=("Arial", 9, "bold"),
         )
-        sec_disp.pack(fill=tk.X, padx=10, pady=(12, 8))
+        sec_disp.pack(fill=tk.X, padx=10, pady=(8, 4))
 
         cb_kw = dict(
             bg="#1e1e1e",
@@ -567,30 +567,6 @@ class ControlPanel:
             justify=tk.LEFT,
         ).pack(padx=8, anchor=tk.W)
 
-        tk.Checkbutton(
-            sec_disp,
-            text="Діаграма виливу (ізолінії по діапазонах тиску)",
-            variable=self.app.var_show_emitter_flow,
-            bg="#1e1e1e",
-            fg="#88DDFF",
-            selectcolor="#333",
-            activebackground="#1e1e1e",
-            activeforeground="#88DDFF",
-            font=("Arial", 9),
-        ).pack(padx=8, pady=(4, 2), anchor=tk.W)
-        tk.Label(
-            sec_disp,
-            text="Діаграма виливу автономна від фільтрів видимості ліній («кожну N-ту», «від крана», «з кінця»). "
-            "Показуються ізолінії виливу (6 рівнів, IDW, спрощені контури) для трьох зон: норма, недолив, перелив. "
-            "Якщо увімкнено «Маски переливу/недоливу на мапі», ізолінії на полотні приховані, щоб лишилися лише контури зон. "
-            "За замовчуванням вимкнено (важке перемальовування); увімкніть за потреби. Розрахунок не скидається — лише перемальовування.",
-            bg="#1e1e1e",
-            fg="#777777",
-            font=("Arial", 8),
-            wraplength=270,
-            justify=tk.LEFT,
-        ).pack(padx=8, pady=(0, 6), anchor=tk.W)
-
         tk.Label(
             sec_disp,
             text="Ручні латералі завжди на полотні (товщіша лінія).",
@@ -601,11 +577,47 @@ class ControlPanel:
             justify=tk.CENTER,
         ).pack(padx=8, pady=(8, 10))
 
-        wrap_bad = tk.Frame(tab, bg="#1e1e1e")
-        wrap_bad.pack(fill=tk.BOTH, expand=True, padx=10, pady=(4, 8))
-        cb_bad_col = tk.Frame(wrap_bad, bg="#1e1e1e")
-        cb_bad_col.pack(side=tk.LEFT, padx=(0, 8), anchor=tk.N, pady=(4, 0))
-        _cb_kw = dict(
+        sec_emit_preview = tk.LabelFrame(
+            tab,
+            text="Діаграма виливу (прев'ю)",
+            bg="#1e1e1e",
+            fg="#88DDFF",
+            font=("Arial", 9, "bold"),
+        )
+        sec_emit_preview.pack(fill=tk.BOTH, expand=True, padx=10, pady=(2, 12))
+        emit_ctrl = tk.Frame(sec_emit_preview, bg="#1e1e1e")
+        emit_ctrl.pack(fill=tk.X, padx=8, pady=(6, 2))
+        emit_flow_row = tk.Frame(emit_ctrl, bg="#1e1e1e")
+        emit_flow_row.pack(fill=tk.X, pady=(0, 2))
+        tk.Checkbutton(
+            emit_flow_row,
+            text="Діаграма виливу",
+            variable=self.app.var_show_emit_diagram_panel,
+            command=lambda: self.app._schedule_emit_preview_redraw(60),
+            bg="#1e1e1e",
+            fg="#88DDFF",
+            selectcolor="#333",
+            activebackground="#1e1e1e",
+            activeforeground="#88DDFF",
+            font=("Arial", 9),
+        ).pack(side=tk.LEFT, anchor=tk.W)
+        tk.Checkbutton(
+            emit_ctrl,
+            text="Ізолінії виливу",
+            variable=self.app.var_show_emitter_flow,
+            command=lambda: self.app._schedule_emit_preview_redraw(60),
+            bg="#1e1e1e",
+            fg="#88DDFF",
+            selectcolor="#333",
+            activebackground="#1e1e1e",
+            activeforeground="#88DDFF",
+            font=("Arial", 8),
+        ).pack(anchor=tk.W, pady=(0, 2))
+        tk.Checkbutton(
+            emit_ctrl,
+            text="Маски переливу / недоливу на мапі блоку (контури)",
+            variable=self.app.var_show_press_zone_outlines_on_map,
+            command=lambda: self.app._schedule_emit_preview_redraw(60),
             bg="#1e1e1e",
             fg="#CCCCCC",
             selectcolor="#333333",
@@ -613,38 +625,18 @@ class ControlPanel:
             activeforeground="#CCCCCC",
             font=("Arial", 8),
             justify=tk.LEFT,
+            wraplength=420,
+        ).pack(anchor=tk.W, pady=(0, 2))
+        self.block_emit_preview_canvas = tk.Canvas(
+            sec_emit_preview,
+            bg="#222",
+            highlightthickness=0,
+            height=260,
         )
-        tk.Checkbutton(
-            cb_bad_col,
-            text="Маски переливу / недоливу\nна мапі блоку (контури)",
-            variable=self.app.var_show_press_zone_outlines_on_map,
-            command=self.app.redraw,
-            wraplength=118,
-            **_cb_kw,
-        ).pack(anchor=tk.W)
-        sec_bad_emit = tk.LabelFrame(
-            wrap_bad,
-            text="Крапельниці поза діапазоном тиску (активний блок)",
-            bg="#1e1e1e",
-            fg="#FFAA66",
-            font=("Arial", 9, "bold"),
-        )
-        sec_bad_emit.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        tk.Label(
-            sec_bad_emit,
-            text="Перелік емітерів з H мін/макс з «Гідравліка»; той самий допуск ±0,02 м, що в розрахунку. "
-            "Нумерація латераля — як у глобальному списку (лат. 1, 2, …). "
-            "На карті: лише контури масок переливу (червоний) та недоливу (жовтий), обрізка активним блоком. "
-            "Поки маски увімкнені, ізолінії «Діаграма виливу» на полотні не малюються (вони будуються з точок емітера і виглядають як сітка крапельниць).",
-            bg="#1e1e1e",
-            fg="#999999",
-            font=("Arial", 8),
-            wraplength=280,
-            justify=tk.LEFT,
-        ).pack(padx=6, pady=(4, 0), anchor=tk.W)
+        self.block_emit_preview_canvas.pack(fill=tk.BOTH, expand=True, padx=8, pady=(2, 6))
         self.txt_block_bad_emitters = scrolledtext.ScrolledText(
-            sec_bad_emit,
-            height=10,
+            sec_emit_preview,
+            height=6,
             wrap=tk.WORD,
             bg="#252525",
             fg="#E8E0D5",
@@ -652,19 +644,13 @@ class ControlPanel:
             insertbackground="white",
             state=tk.DISABLED,
         )
-        self.txt_block_bad_emitters.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+        self.txt_block_bad_emitters.pack(fill=tk.X, padx=8, pady=(0, 8))
+        self.block_emit_preview_canvas.bind(
+            "<Configure>",
+            lambda _e: self.app._schedule_emit_preview_redraw(220),
+            add="+",
+        )
 
-        sec_more = tk.LabelFrame(tab, text="Далі", bg="#1e1e1e", fg="#666666", font=("Arial", 9, "bold"))
-        sec_more.pack(fill=tk.BOTH, expand=True, padx=10, pady=(4, 12))
-        tk.Label(
-            sec_more,
-            text="Подальші секції параметрів блоку можна додати тут.",
-            bg="#1e1e1e",
-            fg="#555555",
-            font=("Arial", 9),
-            wraplength=280,
-            justify=tk.CENTER,
-        ).pack(pady=24)
 
     def build_geo_tab(self):
         tab = tk.Frame(self.notebook, bg="#1e1e1e")
@@ -885,7 +871,7 @@ class ControlPanel:
 
         lat_sol_fr = tk.LabelFrame(
             tab,
-            text="Розрахунок латералів (прямий HW)",
+            text="Розрахунок латералів (HW / вузловий Ньютон)",
             bg="#1e1e1e",
             fg="#00FFCC",
             font=("Arial", 9, "bold"),
@@ -895,6 +881,10 @@ class ControlPanel:
             ("Порівняти бісекцію та Ньютона", "compare"),
             ("Лише бісекція (shooting)", "bisection"),
             ("Лише Ньютон–Рафсон", "newton"),
+            (
+                "Ньютон по вузлах лінії (q∼(Δh/C)^0.54)",
+                "trickle_nr",
+            ),
         ):
             tk.Radiobutton(
                 lat_sol_fr,
@@ -913,6 +903,8 @@ class ControlPanel:
             lat_sol_fr,
             text=(
                 "У звіті: ітерації та (у режимі порівняння) макс. розбіжності ΔH_tip, ΔQ.\n"
+                "Режим «Ньютон по вузлах лінії» — окрема модель втрат між випусками (інверсія HW); "
+                "для компенсованих крапельниць автоматично лишається HW+бісекція.\n"
                 "Перемикання режиму не змінює вже зроблений розрахунок на карті й у звіті — "
                 "новий варіант піде лише в наступний «▶ РОЗРАХУНОК» (активний блок)."
             ),

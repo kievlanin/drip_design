@@ -1,5 +1,6 @@
 import tkinter as tk
 from tkinter import ttk, colorchooser, simpledialog
+import tkinter.font as tkfont
 import colorsys
 import copy
 import ast
@@ -160,6 +161,7 @@ class DripCAD:
         self._last_mouse_world, self._pan_start = (0, 0), None
         self._full_redraw_idle_id = None
         self.calc_results = {"sections": [], "valves": {}, "emitters": {}, "submain_profiles": {}}
+        self._graph_lateral_h_markers: Optional[Dict[str, Any]] = None
         self._submain_topo_in_headloss = True
         self._submain_preview_world = None
         self._submain_end_snapped = False
@@ -282,14 +284,19 @@ class DripCAD:
         self.var_valve_h_max_m = tk.StringVar(value="0")
         self.var_valve_h_max_optimize = tk.BooleanVar(value=True)
         # Увімкніть за потреби: IDW + ізолінії навантажують CPU; типово вимкнено для плавнішого UI.
+        self.var_show_emit_diagram_panel = tk.BooleanVar(value=False)
         self.var_show_emitter_flow = tk.BooleanVar(value=False)
+        # Діаграма виливу рендериться лише в окремому вікні, не на полотні блоку.
+        self._emit_flow_draw_on_canvas = False
         self.var_show_press_zone_outlines_on_map = tk.BooleanVar(value=False)
         self.var_emit_iso_method = tk.StringVar(value="idw")
-        # Латералі: compare | bisection | newton (див. lateral_solver_stats у звіті)
+        # Латералі: compare | bisection | newton | trickle_nr (див. lateral_solver_stats у звіті)
         self.var_lateral_solver_mode = tk.StringVar(value="bisection")
         
         self.var_topo_step = tk.StringVar(value="1.0")
         self.var_topo_grid = tk.StringVar(value="5.0")
+        # Вертикальне перебільшення ΔZ/рельєфу лише на графіках; гідравліка без змін.
+        self.var_terrain_surface_scale = tk.StringVar(value="1.0")
         self.show_contours = tk.BooleanVar(value=True)
         self.show_topo_points = tk.BooleanVar(value=True)
         self.show_topo_computation_zone = tk.BooleanVar(value=True)
@@ -331,6 +338,7 @@ class DripCAD:
         self.var_v_min.trace_add("write", lambda *a: self.reset_calc())
         self.var_v_max.trace_add("write", lambda *a: self.reset_calc())
         self.var_submain_lateral_snap_m.trace_add("write", lambda *a: self.redraw())
+        self.var_terrain_surface_scale.trace_add("write", self._on_terrain_surface_scale_changed)
         self.var_valve_h_max_m.trace_add(
             "write", lambda *a: self._invalidate_hydro_ui_active_block_or_all()
         )
@@ -410,6 +418,24 @@ class DripCAD:
         attach_tooltip(
             self._btn_top_zoom_extents,
             "Умістити весь проєкт у вікні: на полотні — локальна геометрія; на карті — увімкнені шари overlay.",
+        )
+        self._btn_top_zoom_visible = tk.Button(
+            self.top_bar,
+            text="Зум візібл",
+            command=self._top_bar_zoom_visible,
+            bg="#2d333b",
+            fg="#e8e8e8",
+            activebackground="#3d4a55",
+            activeforeground="#ffffff",
+            relief=tk.FLAT,
+            padx=8,
+            pady=2,
+            font=("Segoe UI", 9),
+        )
+        self._btn_top_zoom_visible.pack(side=tk.LEFT, padx=(0, 6), pady=4)
+        attach_tooltip(
+            self._btn_top_zoom_visible,
+            "Умістити у вікні лише видимі на полотні шари (з урахуванням чекбоксів рельєфу).",
         )
         tk.Label(
             self.top_bar,
@@ -1263,7 +1289,7 @@ class DripCAD:
                             dns.append(str(int(float(str(dn).replace(",", ".")))))
                         except (TypeError, ValueError):
                             pass
-        if m and p and len(dns) >= 2:
+        if m and p and len(dns) >= 1:
             return f"{m} PN{p} Ø{'→'.join(dns)}"
         o = str(seg.get("pipe_od", "")).strip()
         if m and p and o:
@@ -2232,6 +2258,164 @@ class DripCAD:
         except tk.TclError:
             pass
 
+    @staticmethod
+    def _trunk_map_segment_index_for_node_pair(
+        segs: list, u: int, v: int
+    ) -> Optional[int]:
+        """Ребро графа з рівно двома вузлами: індекс запису в trunk_map_segments."""
+        uu, vv = int(u), int(v)
+        for k, s in enumerate(segs):
+            if not isinstance(s, dict):
+                continue
+            ni = s.get("node_indices")
+            if not isinstance(ni, list) or len(ni) != 2:
+                continue
+            try:
+                a, b = int(ni[0]), int(ni[1])
+            except (TypeError, ValueError):
+                continue
+            if {a, b} == {uu, vv}:
+                return int(k)
+        return None
+
+    @staticmethod
+    def _trunk_point_equal(p: Tuple[float, float], q: Tuple[float, float], eps: float = 1e-4) -> bool:
+        return (
+            abs(float(p[0]) - float(q[0])) <= eps
+            and abs(float(p[1]) - float(q[1])) <= eps
+        )
+
+    def _trunk_combined_path_from_pump_for_segment(self, seg_index: int) -> Optional[dict]:
+        """
+        Повна трас однієї труби від насоса вниз по гілці, що проходить через вибране ребро:
+        пікети (bend) не «ріжуть» логіку — усі рёбра ланцюга зшиваються в одну path_world.
+
+        Повертає dict: path_world, total_len_m, n_edges, node_chain (індекси вузлів), seg_indices; або
+        mode='single' для зворотної сумісності, якщо вузлів >2 в одному записі; None — тільки прямий відрізок.
+        """
+        segs = list(getattr(self, "trunk_map_segments", []) or [])
+        nodes = list(getattr(self, "trunk_map_nodes", []) or [])
+        try:
+            si0 = int(seg_index)
+        except (TypeError, ValueError):
+            return None
+        if not (0 <= si0 < len(segs)) or not nodes:
+            return None
+        seg0 = segs[si0]
+        if not isinstance(seg0, dict):
+            return None
+        ni0 = seg0.get("node_indices")
+        if not isinstance(ni0, list) or len(ni0) < 2:
+            return None
+        if len(ni0) > 2:
+            pl = self._trunk_segment_world_path(seg0)
+            if len(pl) < 2:
+                return None
+            return {
+                "mode": "single",
+                "path_world": pl,
+                "total_len_m": float(self._polyline_length_m(pl)),
+                "n_edges": 1,
+                "node_chain": [int(ni0[0]), int(ni0[-1])],
+                "seg_indices": [si0],
+            }
+        try:
+            a, b = int(ni0[0]), int(ni0[1])
+        except (TypeError, ValueError):
+            return None
+        if not (0 <= a < len(nodes) and 0 <= b < len(nodes)):
+            return None
+
+        directed, _o_err = build_oriented_edges(nodes, segs)
+        if not directed:
+            return None
+        parent: dict = {}
+        children: dict = {}
+        for u, v in directed:
+            parent[int(v)] = int(u)
+            children.setdefault(int(u), []).append(int(v))
+
+        src = next(
+            (
+                i
+                for i, row in enumerate(nodes)
+                if isinstance(row, dict) and is_trunk_root_kind(str(row.get("kind", "")).strip().lower())
+            ),
+            None,
+        )
+        if src is None:
+            return None
+
+        if parent.get(b) == a:
+            up, down = a, b
+        elif parent.get(a) == b:
+            up, down = b, a
+        else:
+            return None
+
+        def _deepest_leaf_in_sub(u0: int) -> int:
+            smax, dmax = u0, 0
+
+            def dfs(u: int, d: int) -> None:
+                nonlocal smax, dmax
+                chx = list(children.get(u) or [])
+                if not chx:
+                    if d > dmax or (d == dmax and u < smax):
+                        smax, dmax = u, d
+                for w in chx:
+                    dfs(w, d + 1)
+
+            dfs(int(u0), 0)
+            return int(smax)
+
+        leaf = _deepest_leaf_in_sub(int(down))
+        chain_r: list = [leaf]
+        pcur = parent.get(leaf)
+        while pcur is not None:
+            chain_r.append(int(pcur))
+            pcur = parent.get(pcur)
+        if not chain_r or int(chain_r[-1]) != int(src):
+            return None
+        chain: List[int] = list(reversed(chain_r))
+        on_path = False
+        for j in range(len(chain) - 1):
+            uj, vj = chain[j], chain[j + 1]
+            if {uj, vj} == {a, b}:
+                on_path = True
+                break
+        if not on_path:
+            return None
+
+        path_full: list = []
+        k_order: list = []
+        for j in range(len(chain) - 1):
+            uj, vj = int(chain[j]), int(chain[j + 1])
+            k = DripCAD._trunk_map_segment_index_for_node_pair(segs, uj, vj)
+            if k is None:
+                return None
+            k_order.append(int(k))
+            pl = self._trunk_segment_world_path(segs[k])
+            if len(pl) < 2:
+                return None
+            if not path_full:
+                path_full.extend(pl)
+            else:
+                if DripCAD._trunk_point_equal(path_full[-1], pl[0]):
+                    if len(pl) > 1:
+                        path_full.extend(pl[1:])
+                else:
+                    path_full.extend(pl)
+        if len(path_full) < 2:
+            return None
+        return {
+            "mode": "branch",
+            "path_world": path_full,
+            "total_len_m": float(self._polyline_length_m(path_full)),
+            "n_edges": int(len(k_order)),
+            "node_chain": [int(c) for c in chain],
+            "seg_indices": k_order,
+        }
+
     def _trunk_segment_world_path(self, seg) -> list:
         """Геометрія в локальних м: ребро з двома індексами — один прямий відрізок між вузлами;
         ланцюг з >2 індексів — полілінія через вузли; інакше — path_local, якщо валідний."""
@@ -2376,6 +2560,49 @@ class DripCAD:
             return [p0, p1] if (abs(p0[0] - p1[0]) > drool or abs(p0[1] - p1[1]) > drool) else []
         return thin
 
+    def _trunk_sections_rows_align_to_ni0(
+        self,
+        seg: dict,
+        rows: List[dict],
+    ) -> List[dict]:
+        """
+        Секції телескопа зберігаються в порядку parent→child (upstream heavy first).
+        Полілінія `_trunk_segment_world_path` будується в порядку ni[0]→ni[-1], який може йти
+        від child до parent. Якщо ni[0] = child (downstream), реверсуємо rows, щоб
+        sections[0] відповідав сторінці ni[0] полілінії (менший d_inner до початку).
+        Перевірка за trunk_tree_data.edges — не потребує повторного обходу графа.
+        """
+        if not rows or not isinstance(seg, dict):
+            return rows
+        ni = seg.get("node_indices")
+        if not isinstance(ni, list) or len(ni) < 2:
+            return rows
+        try:
+            ia, ib = int(ni[0]), int(ni[-1])
+        except (TypeError, ValueError):
+            return rows
+        nodes = list(getattr(self, "trunk_map_nodes", []) or [])
+        if ia < 0 or ia >= len(nodes) or ib < 0 or ib >= len(nodes):
+            return rows
+        id_a = str(nodes[ia].get("id", "")).strip() or f"T{ia}"
+        id_b = str(nodes[ib].get("id", "")).strip() or f"T{ib}"
+
+        td = getattr(self, "trunk_tree_data", {})
+        td_edges = (td.get("edges") or []) if isinstance(td, dict) else []
+        for e in td_edges:
+            if not isinstance(e, dict):
+                continue
+            pa = str(e.get("parent_id", "")).strip()
+            ch = str(e.get("child_id", "")).strip()
+            if {pa, ch} != {id_a, id_b}:
+                continue
+            # ni[0] = child → sections зараз parent→child, але pl[0] = child:
+            # потрібно перевернути rows, щоб sections[0] відповідав pl[0].
+            if ch == id_a:
+                return list(reversed(rows))
+            return rows  # ni[0] = parent → все вже вірно
+        return rows
+
     def _trunk_segment_telescope_path_chunks(
         self, seg: dict, pl: List[Tuple[float, float]]
     ) -> List[Tuple[List[Tuple[float, float]], Optional[dict]]]:
@@ -2402,8 +2629,13 @@ class DripCAD:
                     continue
                 if lm > 1e-9 and sd > 1e-9:
                     rows.append(dict(row))
-        if len(rows) < 2:
+        if len(rows) == 1:
+            # Для односекційного ребра теж передаємо секцію в рендер,
+            # інакше колір береться з базового d_inner кешу та може бути хибним.
+            return [(pl, rows[0])]
+        if len(rows) < 1:
             return [(pl, None)]
+        rows = self._trunk_sections_rows_align_to_ni0(seg, rows)
         path_len = float(self._polyline_length_m(pl))
         sum_l = sum(float(r.get("length_m", 0.0) or 0.0) for r in rows)
         if sum_l > 1e-9 and path_len > 1e-9 and abs(sum_l - path_len) > max(0.05, 0.01 * path_len):
@@ -2432,11 +2664,24 @@ class DripCAD:
         """Колір лінії для фрагмента телескопа: за d_inner секції з каталогу; інакше колір ребра."""
         base = self.trunk_hydro_segment_line_color(seg_index) or _TRUNK_CANVAS_PATH_COLOR
         if isinstance(sec, dict):
+            sm = str(sec.get("material", "")).strip()
+            sp = str(sec.get("pn", "")).strip()
+            sdn = sec.get("d_nom_mm")
+            # Спочатку точний збіг із секції телескопа.
+            if sm and sp and sdn is not None:
+                c_sec_exact = self._pipe_color_from_db(sm, sp, sdn)
+                if c_sec_exact:
+                    return c_sec_exact
             try:
                 dmm = float(sec.get("d_inner_mm", 0.0) or 0.0)
             except (TypeError, ValueError):
                 dmm = 0.0
             if dmm > 1e-6:
+                # Далі — найближчий inner в межах material/PN секції.
+                c_sec_inner = self._trunk_pipe_color_from_db_by_inner(dmm, mat=sm or None, pn=sp or None)
+                if c_sec_inner:
+                    return c_sec_inner
+                # Фолбек — старий шлях через дозволений каталог.
                 c = self._trunk_segment_pipe_color_from_catalog_inner(dmm)
                 if c:
                     return c
@@ -2911,13 +3156,22 @@ class DripCAD:
         if not (0 <= si < len(segs)):
             silent_showwarning(self.root, "Профіль прокладки", "Вибраний сегмент не знайдено.")
             return
-        path = self._trunk_segment_world_path(segs[si])
+        br = self._trunk_combined_path_from_pump_for_segment(si)
+        if br and isinstance(br.get("path_world"), list) and len(br["path_world"]) >= 2:
+            path = list(br["path_world"])
+            total_len = float(br["total_len_m"])
+            branch_multi = str(br.get("mode")) == "branch" and int(br.get("n_edges", 1) or 0) > 1
+        else:
+            path = self._trunk_segment_world_path(segs[si])
+            total_len = self._polyline_length_m(path)
+            branch_multi = False
         if len(path) < 2:
             silent_showwarning(self.root, "Профіль прокладки", "Сегмент має некоректну геометрію.")
             return
-        total_len = self._polyline_length_m(path)
         if total_len <= 1e-6:
-            silent_showwarning(self.root, "Профіль прокладки", "Довжина сегмента ≈ 0 м.")
+            total_len = self._polyline_length_m(path)
+        if total_len <= 1e-6:
+            silent_showwarning(self.root, "Профіль прокладки", "Довжина траси ≈ 0 м.")
             return
         if not getattr(self.topo, "elevation_points", None):
             silent_showwarning(
@@ -2945,7 +3199,11 @@ class DripCAD:
         z_span = max(1e-6, z_max - z_min)
 
         win = tk.Toplevel(self.root)
-        win.title(f"Профіль прокладки · сегмент #{si + 1}")
+        if branch_multi:
+            ne = int(br.get("n_edges", 1) or 0)  # type: ignore[union-attr]
+            win.title(f"Профіль прокладки · гілка {ne} рёбр (від насоса), L≈{total_len:.0f} м")
+        else:
+            win.title(f"Профіль прокладки · сегмент #{si + 1}")
         win.transient(self.root)
         win.configure(bg="#1e1e1e")
         win.geometry("900x500")
@@ -3047,8 +3305,8 @@ class DripCAD:
                 ml + pw / 2,
                 h - 18,
                 text=(
-                    f"Довжина сегмента: {total_len:.1f} м   ·   крок: {step_m:.0f} м   ·   "
-                    f"верт. масштаб: ×{vscale:.3g}   ·   Zmin={z_min:.2f} м, Zmax={z_max:.2f} м"
+                    (f"Траса: суцільна гілка від насоса, L={total_len:.1f} м" if branch_multi else f"Довжина: {total_len:.1f} м")
+                    + f"   ·   крок: {step_m:.0f} м   ·   верт. масштаб: ×{vscale:.3g}   ·   Zmin={z_min:.2f} м, Zmax={z_max:.2f} м"
                 ),
                 anchor=tk.CENTER,
                 fill="#CFD8DC",
@@ -3496,8 +3754,41 @@ class DripCAD:
         if not (0 <= si < len(segs)):
             silent_showwarning(self.root, "Напір вздовж ребра", "Відрізок не знайдено.")
             return
-        seg = segs[si] if isinstance(segs[si], dict) else {}
-        path = self._trunk_segment_world_path(seg)
+        nodes = list(getattr(self, "trunk_map_nodes", []) or [])
+        raw_seg = segs[si] if isinstance(segs[si], dict) else {}
+        seg = raw_seg
+        br = self._trunk_combined_path_from_pump_for_segment(si)
+        pressure_branch_multi = False
+        if (
+            br
+            and str(br.get("mode")) == "branch"
+            and int(br.get("n_edges", 1) or 0) > 1
+            and isinstance(br.get("node_chain"), list)
+            and len(br["node_chain"]) >= 2
+        ):
+            nch = [int(c) for c in br["node_chain"]]
+            path_v: List[Tuple[float, float]] = []
+            _ok = True
+            for idx in nch:
+                if not (0 <= idx < len(nodes)):
+                    _ok = False
+                    break
+                row = nodes[idx]
+                if not isinstance(row, dict):
+                    _ok = False
+                    break
+                try:
+                    path_v.append((float(row["x"]), float(row["y"])))
+                except (KeyError, TypeError, ValueError):
+                    _ok = False
+                    break
+            if _ok and len(path_v) >= 2 and len(path_v) == len(nch):
+                seg = {"node_indices": nch}
+                path = path_v
+                pressure_branch_multi = True
+        if not pressure_branch_multi:
+            seg = raw_seg
+            path = self._trunk_segment_world_path(raw_seg)
         if len(path) < 2:
             silent_showwarning(self.root, "Напір вздовж ребра", "Некоректна геометрія відрізка.")
             return
@@ -3531,7 +3822,6 @@ class DripCAD:
         if not isinstance(slot_row, dict):
             silent_showwarning(self.root, "Напір вздовж ребра", f"Немає даних для слота {dom_slot + 1}.")
             return
-        nodes = list(getattr(self, "trunk_map_nodes", []) or [])
         heads = self._trunk_segment_pressure_heads_polyline_order_m(seg, slot_row, nodes)
         if heads is None:
             silent_showwarning(
@@ -3690,7 +3980,13 @@ class DripCAD:
             return lf
 
         win = tk.Toplevel(self.root)
-        win.title(f"Напір вздовж ребра · відрізок #{si + 1} · полив #{int(dom_slot) + 1}")
+        if pressure_branch_multi and br and int(br.get("n_edges", 1) or 0) > 1:
+            ne = int(br.get("n_edges", 1) or 0)  # type: ignore[union-attr]
+            win.title(
+                f"Напір вздовж гілки · {ne} рёбр (від насоса) · L≈{total_len:.0f} м · полив #{int(dom_slot) + 1}"
+            )
+        else:
+            win.title(f"Напір вздовж ребра · відрізок #{si + 1} · полив #{int(dom_slot) + 1}")
         win.transient(self.root)
         win.configure(bg="#1e1e1e")
         win.geometry("1000x720")
@@ -4346,6 +4642,53 @@ class DripCAD:
         if best is None:
             return None
         return self._pipe_color_from_db(best["mat"], best["pn"], best["d"])
+
+    def _trunk_pipe_color_from_db_by_inner(
+        self,
+        d_inner_mm: float,
+        *,
+        mat: Optional[str] = None,
+        pn: Optional[str] = None,
+    ) -> Optional[str]:
+        """Колір із pipe_db за найближчим inner; з фільтром по material/PN, якщо задано."""
+        try:
+            d_tgt = float(d_inner_mm)
+        except (TypeError, ValueError):
+            return None
+        if d_tgt <= 1e-6:
+            return None
+        db = getattr(self, "pipe_db", None) or {}
+        mat_req = str(mat or "").strip()
+        pn_req = str(pn or "").strip()
+        best_diff = 1e18
+        best_color: Optional[str] = None
+        if not isinstance(db, dict):
+            return None
+        for m_key, by_pn in db.items():
+            if mat_req and str(m_key).strip() != mat_req:
+                continue
+            if not isinstance(by_pn, dict):
+                continue
+            for p_key, by_od in by_pn.items():
+                if pn_req and str(p_key).strip() != pn_req:
+                    continue
+                if not isinstance(by_od, dict):
+                    continue
+                for od_key, row in by_od.items():
+                    if not isinstance(row, dict):
+                        continue
+                    try:
+                        din = float(row.get("id", od_key))
+                    except (TypeError, ValueError):
+                        continue
+                    c = row.get("color")
+                    if not isinstance(c, str) or not c.strip():
+                        continue
+                    diff = abs(din - d_tgt)
+                    if diff < best_diff:
+                        best_diff = diff
+                        best_color = c.strip()
+        return best_color
 
     def _trunk_topology_dominant_slot_for_segment(self, seg_index: int) -> Optional[int]:
         """
@@ -6968,9 +7311,21 @@ class DripCAD:
             return clipped
 
     def refresh_block_out_of_range_emitters_panel(self):
-        """Вкладка «Блок»: перелік крапельниць активного блоку з H поза діапазоном (як у гідравліці)."""
+        """Вкладка «Блок»: коротке зведення крапельниць активного блоку поза діапазоном."""
         cp = getattr(self, "control_panel", None)
         txtw = getattr(cp, "txt_block_bad_emitters", None) if cp is not None else None
+        def _fit_txt_height():
+            try:
+                n_lines = int(float(txtw.index("end-1c").split(".")[0]))
+            except Exception:
+                n_lines = 8
+            # Підлаштовуємо панель під текст: компактно для короткого зведення,
+            # але не обрізаємо, якщо повідомлення довше.
+            target = max(7, min(16, n_lines + 1))
+            try:
+                txtw.config(height=target)
+            except tk.TclError:
+                pass
         if txtw is None:
             return
         try:
@@ -6980,6 +7335,7 @@ class DripCAD:
             return
         if not self.field_blocks:
             txtw.insert(tk.END, "Немає блоків поля.")
+            _fit_txt_height()
             txtw.config(state=tk.DISABLED)
             return
         b = self._bad_pressure_emitter_details_active_block()
@@ -6990,15 +7346,18 @@ class DripCAD:
                 "Задайте H мін. / H макс. на панелі «Гідравліка» (робочий діапазон тиску на крапельниці), "
                 "щоб перевіряти відхилення.",
             )
+            _fit_txt_height()
             txtw.config(state=tk.DISABLED)
             return
         if not b["has_calc"]:
             txtw.insert(tk.END, "Ще немає гідравлічного розрахунку — список з’явиться після «Розрахунок».")
+            _fit_txt_height()
             txtw.config(state=tk.DISABLED)
             return
         hdr = (
-            f"Активний блок {bi + 1}. Допуск ±{b['tol']} м (як у звіті розрахунку).\n"
-            f"Діапазон: [{b['h_lo']:.2f} … {b['h_hi']:.2f}] м.\n\n"
+            f"Активний блок {bi + 1}\n"
+            f"Діапазон тиску: [{b['h_lo']:.2f} … {b['h_hi']:.2f}] м\n"
+            f"Допуск: ±{b['tol']:.2f} м\n"
         )
         if not b["items"]:
             blk = self.field_blocks[bi]
@@ -7007,18 +7366,32 @@ class DripCAD:
                 txtw.insert(
                     tk.END,
                     hdr
-                    + "Немає даних крапельниць для цього блоку в поточному розрахунку "
-                    "(виконайте «Розрахунок» для активного блоку або повне поле).",
+                    + "\nНемає даних крапельниць у поточному розрахунку.\n"
+                    + "Запустіть «Розрахунок» для активного блоку або всього поля.",
                 )
             else:
-                txtw.insert(tk.END, hdr + "Усі крапельниці цього блоку в межах діапазону.")
+                txtw.insert(tk.END, hdr + "\nУсі крапельниці в межах діапазону.")
         else:
-            txtw.insert(tk.END, hdr + "\n".join(it["line"] for it in b["items"]))
+            items = b["items"]
+            n_ov = sum(1 for it in items if bool(it.get("overflow")) and not bool(it.get("underflow")))
+            n_un = sum(1 for it in items if bool(it.get("underflow")) and not bool(it.get("overflow")))
+            n_both = sum(1 for it in items if bool(it.get("overflow")) and bool(it.get("underflow")))
+            msg = (
+                hdr
+                + "\nПоза діапазоном: "
+                + f"{len(items)} крап.\n"
+                + f"Перелив: {n_ov} | Недолив: {n_un} | Обидва: {n_both}\n"
+                + "Детальний список приховано."
+            )
+            txtw.insert(tk.END, msg)
         try:
             txtw.see("1.0")
         except tk.TclError:
             pass
+        _fit_txt_height()
         txtw.config(state=tk.DISABLED)
+        # Важливо: не тригерити перемальовку прев'ю з цього апдейту,
+        # бо ця функція може викликатись у загальному циклі redraw().
 
     @staticmethod
     def _decimate_closed_ring_xy(
@@ -8373,6 +8746,7 @@ class DripCAD:
         self.redraw()
 
     def reset_calc(self):
+        self._graph_lateral_h_markers = None
         self._pressure_zone_geom_cache = OrderedDict()
         cr = self.calc_results
         if (cr.get("sections") or cr.get("valves") or cr.get("emitters")):
@@ -8448,6 +8822,10 @@ class DripCAD:
         bae = dict(cr.get("block_avg_emit_lph") or {})
         bae.pop(str(bi), None)
         cr["block_avg_emit_lph"] = bae
+        bu = dict(cr.get("block_emitter_uniformity") or {})
+        bu.pop(str(bi), None)
+        cr["block_emitter_uniformity"] = bu
+        cr.pop("lateral_emitter_uniformity", None)
         cr["section_label_pos"] = {}
 
     def _remap_partial_hydro_results(self, partial: dict, orig_sm_indices: list, lat_lo: int) -> dict:
@@ -8512,6 +8890,11 @@ class DripCAD:
         bae = dict(cr.get("block_avg_emit_lph") or {})
         bae.update(remapped.get("block_avg_emit_lph") or {})
         cr["block_avg_emit_lph"] = bae
+        bu = dict(cr.get("block_emitter_uniformity") or {})
+        bu.update(remapped.get("block_emitter_uniformity") or {})
+        cr["block_emitter_uniformity"] = bu
+        if "lateral_emitter_uniformity" in remapped:
+            cr["lateral_emitter_uniformity"] = remapped["lateral_emitter_uniformity"]
         for key in ("valve_h_max_m_spec", "valve_pressure_within_spec", "lateral_solver_stats"):
             if key in remapped:
                 cr[key] = remapped[key]
@@ -8547,6 +8930,10 @@ class DripCAD:
         self.calc_results["emitters"] = em
         self.calc_results["section_label_pos"] = {}
         self.calc_results["submain_profiles"] = {}
+        bu = dict(self.calc_results.get("block_emitter_uniformity") or {})
+        bu.pop(str(bi), None)
+        self.calc_results["block_emitter_uniformity"] = bu
+        self.calc_results.pop("lateral_emitter_uniformity", None)
         self.redraw()
 
     def _merged_sections_display(self, sections: list) -> list:
@@ -8833,8 +9220,11 @@ class DripCAD:
             if d < min_dist: min_dist = d; closest_pt = (tx, ty)
         return closest_pt
 
-    def start_pan(self, event):
-        self._pan_start = (event.x, event.y)
+    def start_pan(self, event=None, *, scr_x: Optional[int] = None, scr_y: Optional[int] = None):
+        if scr_x is not None and scr_y is not None:
+            self._pan_start = (int(scr_x), int(scr_y))
+        elif event is not None:
+            self._pan_start = (int(event.x), int(event.y))
 
     def handle_pan(self, event):
         if self._pan_start:
@@ -8868,6 +9258,49 @@ class DripCAD:
                 self.redraw(skip_heavy_canvas_layers=False)
 
         self._full_redraw_idle_id = self.root.after(delay_ms, _go)
+
+    def _cancel_emit_preview_redraw(self):
+        tid = getattr(self, "_emit_preview_idle_id", None)
+        if tid is not None:
+            try:
+                self.root.after_cancel(tid)
+            except Exception:
+                pass
+            self._emit_preview_idle_id = None
+
+    def _schedule_emit_preview_redraw(self, delay_ms: int = 180) -> None:
+        self._cancel_emit_preview_redraw()
+        cp = getattr(self, "control_panel", None)
+        prev_canvas = getattr(cp, "block_emit_preview_canvas", None) if cp is not None else None
+        if prev_canvas is None or not prev_canvas.winfo_exists():
+            return
+        # Не прив'язувати прев'ю до загального рендерингу: лише на вкладці "Блок".
+        try:
+            nb = getattr(cp, "notebook", None)
+            cur = nb.select() if nb is not None else ""
+            cur_text = str(nb.tab(cur, "text")) if nb is not None and cur else ""
+        except Exception:
+            cur_text = ""
+        if cur_text != "Блок":
+            return
+        if not bool(
+            getattr(self, "var_show_emit_diagram_panel", None)
+            and self.var_show_emit_diagram_panel.get()
+        ):
+            try:
+                prev_canvas.delete("all")
+            except Exception:
+                pass
+            return
+
+        def _go():
+            self._emit_preview_idle_id = None
+            try:
+                self._draw_emitter_flow_graph_canvas(target_canvas=prev_canvas)
+            except Exception:
+                pass
+
+        self._emit_preview_idle_id = self.root.after(max(50, int(delay_ms)), _go)
 
     def _on_heavy_emitter_param_changed(self, *_args) -> None:
         """
@@ -8957,6 +9390,273 @@ class DripCAD:
                             return
         self.redraw()
 
+    def _block_lat_by_global_index(self, gidx: int) -> Optional[Tuple[int, LineString]]:
+        li = 0
+        for bi, b in enumerate(self.field_blocks):
+            for _lat in b.get("auto_laterals") or []:
+                if li == gidx:
+                    return bi, _lat
+                li += 1
+            for _lat in b.get("manual_laterals") or []:
+                if li == gidx:
+                    return bi, _lat
+                li += 1
+        return None
+
+    def _world_xy_lateral_wing_x(
+        self, lat: LineString, conn: float, wing_l1: bool, x_from_conn: float
+    ) -> Optional[Tuple[float, float]]:
+        if lat is None or lat.is_empty or lat.length < 1e-9:
+            return None
+        L = float(lat.length)
+        conn = max(0.0, min(L, float(conn)))
+        x_from_conn = max(0.0, float(x_from_conn))
+        s_along = (conn - x_from_conn) if wing_l1 else (conn + x_from_conn)
+        s_along = max(0.0, min(L, s_along))
+        try:
+            p = lat.interpolate(s_along)
+            return (float(p.x), float(p.y))
+        except Exception:
+            return None
+
+    def _update_graph_lateral_h_markers(
+        self, lat_idx0: Optional[int], l1_data: list, l2_data: list
+    ) -> None:
+        self._graph_lateral_h_markers = None
+        if lat_idx0 is None or not self.field_blocks:
+            return
+        pair = self._block_lat_by_global_index(int(lat_idx0))
+        if pair is None:
+            return
+        _bi, lat = pair
+        if lat is None or lat.is_empty:
+            return
+        sm = self._hydraulic_submain_lines()
+        is_calc = bool(
+            self.calc_results.get("sections") or self.calc_results.get("emitters")
+        )
+        if not is_calc or not sm:
+            return
+        try:
+            conn = float(
+                lat_sol.connection_distance_along_lateral(
+                    lat, sm, snap_m=self._submain_lateral_snap_m()
+                )
+            )
+        except Exception:
+            conn = 0.0
+        conn = max(0.0, min(float(lat.length), conn))
+        cands: List[Tuple[str, float, float, float]] = []
+        for wname, wlist in (("L1", l1_data), ("L2", l2_data)):
+            for d in wlist or []:
+                if not isinstance(d, dict):
+                    continue
+                try:
+                    qe = float(d.get("q_emit", 0) or 0.0)
+                except (TypeError, ValueError):
+                    qe = 0.0
+                if qe < 1e-5:
+                    continue
+                try:
+                    xh = float(d["x"])
+                    hm = float(d["h"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                cands.append((wname, xh, hm, qe))
+        if not cands:
+            return
+        min_row = min(cands, key=lambda t: (t[2], t[0], t[1]))
+        max_row = max(cands, key=lambda t: (t[2], t[0], t[1]))
+        wing_m = min_row[0] == "L1"
+        wing_M = max_row[0] == "L1"
+        xy_m = self._world_xy_lateral_wing_x(lat, conn, wing_m, min_row[1])
+        xy_M = self._world_xy_lateral_wing_x(lat, conn, wing_M, max_row[1])
+        if xy_m is None and xy_M is None:
+            return
+        one_spot = (
+            str(min_row[0]) == str(max_row[0])
+            and abs(float(min_row[1]) - float(max_row[1])) < 1e-3
+            and abs(float(min_row[2]) - float(max_row[2])) < 1e-3
+        )
+
+        def _ent(row: Tuple[str, float, float, float], xy: Optional[Tuple[float, float]]) -> Optional[Dict[str, Any]]:
+            if xy is None:
+                return None
+            return {
+                "wx": float(xy[0]),
+                "wy": float(xy[1]),
+                "h_m": float(row[2]),
+                "q_lph": float(row[3]),
+            }
+
+        if one_spot and xy_m is not None:
+            self._graph_lateral_h_markers = {
+                "mode": "one",
+                "m": _ent(min_row, xy_m),
+                "lat_idx": int(lat_idx0),
+            }
+            return
+        self._graph_lateral_h_markers = {
+            "mode": "minmax",
+            "m": _ent(min_row, xy_m),
+            "M": _ent(max_row, xy_M),
+            "lat_idx": int(lat_idx0),
+        }
+
+    def _draw_lateral_h_graph_markers_on_canvas(self) -> None:
+        pack = getattr(self, "_graph_lateral_h_markers", None)
+        if not pack or not self.field_blocks:
+            return
+        is_calc = bool(
+            self.calc_results.get("emitters") or self.calc_results.get("sections")
+        )
+        if not is_calc:
+            return
+        fs = max(6, min(10, int(8 * self.zoom)))
+        fnt = ("Arial", fs, "bold")
+        fnt_s = ("Arial", max(5, fs - 1))
+        r = 7
+        c_min = "#FF4444"
+        c_max = "#E8C547"
+
+        def _dot(entry: Dict[str, Any], color: str, tag: str) -> None:
+            sx, sy = self.to_screen(float(entry["wx"]), float(entry["wy"]))
+            self.canvas.create_oval(
+                sx - r,
+                sy - r,
+                sx + r,
+                sy + r,
+                fill=color,
+                outline="#FFFFFF",
+                width=1,
+                tags="graph_lateral_h_markers",
+            )
+            qe = float(entry.get("q_lph", 0.0))
+            self.canvas.create_text(
+                sx,
+                sy + r + 10,
+                text=f"Q = {qe:.2f} л/г",
+                fill="#E0E0E0",
+                font=fnt,
+                anchor=tk.N,
+                tags="graph_lateral_h_markers",
+            )
+            self.canvas.create_text(
+                sx,
+                sy - r - 2,
+                text=tag,
+                fill=color,
+                font=fnt_s,
+                anchor=tk.S,
+                tags="graph_lateral_h_markers",
+            )
+
+        if pack.get("mode") == "one" and isinstance(pack.get("m"), dict):
+            _dot(pack["m"], c_min, "H мін=макс")
+            return
+        m = pack.get("m")
+        M = pack.get("M")
+        if not isinstance(m, dict):
+            return
+        _dot(m, c_min, "мін. H")
+        if not isinstance(M, dict):
+            return
+        same_xy = abs(float(m["wx"]) - float(M["wx"])) < 1e-3 and abs(
+            float(m["wy"]) - float(M["wy"])
+        ) < 1e-3
+        if same_xy:
+            return
+        _dot(M, c_max, "макс. H")
+
+    def _terrain_surface_viz_scale(self) -> float:
+        """Множник для відображення рельєфу (ΔZ) на гідравлічних профілях; розрахунок залишає фізичні метри."""
+        try:
+            k = float(self.var_terrain_surface_scale.get().replace(",", "."))
+        except (TypeError, ValueError, AttributeError):
+            return 1.0
+        if not math.isfinite(k) or k <= 0.0:
+            return 1.0
+        return k
+
+    def _on_terrain_surface_scale_changed(self, *_):
+        self.redraw()
+        try:
+            m = getattr(self, "_graph_mode", None)
+            if m == "lateral" and getattr(self, "_graph_lateral_id", None):
+                self.show_graph(self._graph_lateral_id)
+            elif m == "submain" and getattr(self, "_graph_submain_idx", None) is not None:
+                self.show_submain_graph(int(self._graph_submain_idx))
+        except Exception:
+            pass
+
+    def _schedule_graph_redraw(self, *_):
+        """Дебаунс-перемальовка активного графіка при resize вікна."""
+        try:
+            aid = getattr(self, "_graph_resize_after_id", None)
+            if aid:
+                self.root.after_cancel(aid)
+        except Exception:
+            pass
+
+        def _do():
+            self._graph_resize_after_id = None
+            try:
+                m = getattr(self, "_graph_mode", None)
+                if m == "lateral" and getattr(self, "_graph_lateral_id", None):
+                    self.show_graph(self._graph_lateral_id)
+                elif m == "submain" and getattr(self, "_graph_submain_idx", None) is not None:
+                    self.show_submain_graph(int(self._graph_submain_idx))
+            except Exception:
+                pass
+
+        self._graph_resize_after_id = self.root.after(90, _do)
+
+    def _fill_graph_terrain_toolbar(self, fr: tk.Frame) -> None:
+        tk.Label(fr, text="Масштаб поверхні (ΔZ):", bg="#1e1e1e", fg="#DDDDDD", font=("Arial", 9)).pack(
+            side=tk.LEFT
+        )
+        tk.Entry(
+            fr,
+            textvariable=self.var_terrain_surface_scale,
+            bg="#333",
+            fg="white",
+            width=6,
+            justify=tk.CENTER,
+            font=("Consolas", 10, "bold"),
+            insertbackground="white",
+        ).pack(side=tk.LEFT, padx=(6, 2))
+        tk.Label(fr, text="×", bg="#1e1e1e", fg="#888888", font=("Arial", 9)).pack(side=tk.LEFT)
+        self._graph_terrain_dz_lbl = tk.Label(fr, text="", bg="#1e1e1e", fg="#8B6914", font=("Arial", 8))
+        self._graph_terrain_dz_lbl.pack(side=tk.LEFT, padx=(10, 0))
+
+    def _migrate_graph_window_add_terrain_toolbar(self) -> None:
+        """Старе вікно графіка без панелі — вставляємо рядок над полотном."""
+        if getattr(self, "_graph_terrain_toolbar", None) is not None:
+            try:
+                if self._graph_terrain_toolbar.winfo_exists():
+                    return
+            except tk.TclError:
+                pass
+        if not hasattr(self, "graph_window") or not self.graph_window.winfo_exists():
+            return
+        if not hasattr(self, "graph_canvas") or not self.graph_canvas.winfo_exists():
+            return
+        try:
+            self.graph_canvas.pack_forget()
+        except tk.TclError:
+            return
+        try:
+            if hasattr(self, "graph_info_label") and self.graph_info_label.winfo_exists():
+                self.graph_info_label.pack_forget()
+        except tk.TclError:
+            pass
+        self._graph_terrain_toolbar = tk.Frame(self.graph_window, bg="#1e1e1e")
+        self._graph_terrain_toolbar.pack(fill=tk.X, padx=20, pady=(12, 0))
+        self._fill_graph_terrain_toolbar(self._graph_terrain_toolbar)
+        self.graph_canvas.pack(padx=20, pady=(4, 12))
+        if hasattr(self, "graph_info_label"):
+            self.graph_info_label.pack(fill=tk.X, padx=16)
+
     def show_graph(self, lat_id):
         emitters_db = self.calc_results.get("emitters", {})
         if not emitters_db or lat_id not in emitters_db:
@@ -8967,13 +9667,24 @@ class DripCAD:
         l1_data = data.get("L1", [])
         l2_data = data.get("L2", [])
         if not l1_data and not l2_data: return
+        lat_idx0 = None
+        if isinstance(lat_id, str) and lat_id.startswith("lat_"):
+            try:
+                lat_idx0 = int(lat_id.split("_", 1)[1])
+            except ValueError:
+                lat_idx0 = None
+        self._update_graph_lateral_h_markers(lat_idx0, l1_data, l2_data)
         
         if not hasattr(self, 'graph_window') or not self.graph_window.winfo_exists():
             self.graph_window = tk.Toplevel(self.root)
-            self.graph_window.geometry("850x640")
+            self.graph_window.geometry("850x700")
             self.graph_window.configure(bg="#1e1e1e")
+            self._graph_terrain_toolbar = tk.Frame(self.graph_window, bg="#1e1e1e")
+            self._graph_terrain_toolbar.pack(fill=tk.X, padx=20, pady=(12, 0))
+            self._fill_graph_terrain_toolbar(self._graph_terrain_toolbar)
             self.graph_canvas = tk.Canvas(self.graph_window, width=800, height=500, bg="#222", highlightthickness=0)
-            self.graph_canvas.pack(padx=20, pady=20)
+            self.graph_canvas.pack(padx=20, pady=(4, 12))
+            self.graph_canvas.bind("<Configure>", self._schedule_graph_redraw, add="+")
             self.graph_info_label = tk.Label(
                 self.graph_window,
                 bg="#1e1e1e",
@@ -8983,14 +9694,9 @@ class DripCAD:
                 wraplength=780,
             )
             self.graph_info_label.pack(fill=tk.X, padx=16)
-            
+
         top = self.graph_window
-        lat_idx0 = None
-        if isinstance(lat_id, str) and lat_id.startswith("lat_"):
-            try:
-                lat_idx0 = int(lat_id.split("_", 1)[1])
-            except ValueError:
-                lat_idx0 = None
+        self._migrate_graph_window_add_terrain_toolbar()
         lat_human_n = (lat_idx0 + 1) if lat_idx0 is not None else None
         top.title(
             f"Латераль №{lat_human_n}: гідравлічний профіль ({lat_id})"
@@ -9004,6 +9710,20 @@ class DripCAD:
             pass
         top.attributes("-topmost", True)
         top.after(150, lambda w=top: w.attributes("-topmost", False))
+
+        def _close_lateral_graph():
+            self._graph_lateral_h_markers = None
+            self._graph_mode = None
+            try:
+                self.redraw()
+            except Exception:
+                pass
+            try:
+                top.destroy()
+            except Exception:
+                pass
+
+        top.protocol("WM_DELETE_WINDOW", _close_lateral_graph)
         canvas = self.graph_canvas
         try:
             canvas.delete("all")
@@ -9014,17 +9734,23 @@ class DripCAD:
         total_width = max_x1 + max_x2
         if total_width == 0: return
         
-        plot_w = 700
-        plot_h = 400
+        cw = max(420, int(canvas.winfo_width() or 800))
+        ch = max(300, int(canvas.winfo_height() or 500))
         pad_left = 50
-        pad_top = 50
+        pad_top = 44
+        pad_right = 18
+        pad_bottom = 56
+        plot_w = max(220, cw - pad_left - pad_right)
+        plot_h = max(160, ch - pad_top - pad_bottom)
         
         zero_x = pad_left + (max_x1 / total_width) * plot_w if total_width > 0 else pad_left
 
         all_h = [float(d["h"]) for d in l1_data + l2_data]
         # q — витрата в трубі до тупика (л/год), для кривої на одному масштабі
         all_q = [float(d.get("q", 0)) for d in l1_data + l2_data]
-        all_elev = [float(d.get("elev", 0.0)) for d in l1_data + l2_data]
+        k_terr = self._terrain_surface_viz_scale()
+        # Фізичні відносні висоти (м); масштаб k_terr змінює лише амплітуду кривої, не смугу [min,max] у квадраті.
+        all_elev_raw = [float(d.get("elev", 0.0)) for d in l1_data + l2_data]
 
         try:
             hpmin = float(self.var_emit_h_press_min.get().replace(",", "."))
@@ -9033,7 +9759,9 @@ class DripCAD:
             hpmin, hpmax = 0.0, 0.0
         band_h_active = (hpmin > 1e-9) or (hpmax > 1e-9)
 
-        y_samples = all_h + all_elev
+        # H (напір) — окрема вертикальна шкала. На відміну від змішання H+ΔZ на одній осі,
+        # тоді сантиметровий рельєф стискався внизу і виглядав як «пряма».
+        y_samples = list(all_h)
         if band_h_active:
             if hpmin > 1e-9:
                 y_samples.append(hpmin)
@@ -9048,16 +9776,40 @@ class DripCAD:
         if y_hi <= y_lo:
             y_hi = y_lo + 12.0
 
-        def y_screen(yv: float) -> float:
+        def y_screen_h(yv: float) -> float:
             return pad_top + plot_h - ((yv - y_lo) / (y_hi - y_lo)) * plot_h
+
+        if all_elev_raw:
+            e_min, e_max = min(all_elev_raw), max(all_elev_raw)
+            e_span = e_max - e_min
+            if e_span < 1e-6:
+                e_c = e_min
+                e_lo, e_hi = e_c - 0.02, e_c + 0.02
+            else:
+                e_pad = max(1e-3, e_span * 0.08)
+                e_lo, e_hi = e_min - e_pad, e_max + e_pad
+        else:
+            e_lo, e_hi = -0.1, 0.1
+        if e_hi <= e_lo:
+            e_hi = e_lo + 0.04
+
+        def y_screen_e_raw(el_phys: float) -> float:
+            """Мапінг тільки фізичного ΔZ; k_terr перебільшує відхилення від e_lo, не змінюючи межі вісі."""
+            span = e_hi - e_lo
+            if span < 1e-12:
+                return pad_top + plot_h * 0.5
+            m = (el_phys - e_lo) / span
+            dy = m * plot_h * k_terr
+            yp = pad_top + plot_h - dy
+            return min(pad_top + plot_h, max(pad_top, yp))
 
         axis_bottom = pad_top + plot_h
         canvas.create_line(pad_left, axis_bottom, pad_left + plot_w, axis_bottom, fill="white", width=2)
         canvas.create_line(zero_x, pad_top, zero_x, axis_bottom, fill="gray", width=2, dash=(4, 4))
 
         if band_h_active and hpmin > 1e-9 and hpmax > 1e-9 and hpmax > hpmin + 1e-9:
-            y_a = y_screen(hpmax)
-            y_b = y_screen(hpmin)
+            y_a = y_screen_h(hpmax)
+            y_b = y_screen_h(hpmin)
             canvas.create_rectangle(
                 pad_left,
                 min(y_a, y_b),
@@ -9068,7 +9820,7 @@ class DripCAD:
                 stipple="gray25",
             )
         if band_h_active and hpmin > 1e-9:
-            yl = y_screen(hpmin)
+            yl = y_screen_h(hpmin)
             canvas.create_line(
                 pad_left, yl, pad_left + plot_w, yl, dash=(6, 5), fill="#66FF88", width=2
             )
@@ -9081,7 +9833,7 @@ class DripCAD:
                 font=("Arial", 8, "bold"),
             )
         if band_h_active and hpmax > 1e-9:
-            yl2 = y_screen(hpmax)
+            yl2 = y_screen_h(hpmax)
             canvas.create_line(
                 pad_left, yl2, pad_left + plot_w, yl2, dash=(6, 5), fill="#FF8866", width=2
             )
@@ -9097,46 +9849,6 @@ class DripCAD:
         qmax = max(all_q) if all_q else 0.0
         max_q_val = max(qmax * 1.08 if qmax > 1e-9 else 0.0, 1.5)
 
-        pts_e_1, pts_h_1, pts_q_1 = [], [], []
-        for d in l1_data:
-            sx = zero_x - (d["x"] / total_width) * plot_w
-            el = float(d.get("elev", 0.0))
-            pts_e_1.append((sx, y_screen(el)))
-            pts_h_1.append((sx, y_screen(float(d["h"]))))
-            qv = float(d.get("q", 0))
-            pts_q_1.append((sx, pad_top + plot_h - (qv / max_q_val) * plot_h))
-            
-        pts_e_2, pts_h_2, pts_q_2 = [], [], []
-        for d in l2_data:
-            sx = zero_x + (d["x"] / total_width) * plot_w
-            el = float(d.get("elev", 0.0))
-            pts_e_2.append((sx, y_screen(el)))
-            pts_h_2.append((sx, y_screen(float(d["h"]))))
-            qv = float(d.get("q", 0))
-            pts_q_2.append((sx, pad_top + plot_h - (qv / max_q_val) * plot_h))
-            
-        if len(pts_e_1) > 1:
-            canvas.create_line(pts_e_1, fill="#8B6914", width=2, smooth=True)
-        if len(pts_e_2) > 1:
-            canvas.create_line(pts_e_2, fill="#8B6914", width=2, smooth=True)
-        if len(pts_h_1) > 1:
-            canvas.create_line(pts_h_1, fill="#FFD700", width=3, smooth=True)
-            canvas.create_line(pts_q_1, fill="#00FFCC", width=2, smooth=True)
-        if len(pts_h_2) > 1:
-            canvas.create_line(pts_h_2, fill="#FFD700", width=3, smooth=True)
-            canvas.create_line(pts_q_2, fill="#00FFCC", width=2, smooth=True)
-
-        emit_strip_h = 36
-        y_es = pad_top + plot_h - emit_strip_h
-        canvas.create_line(pad_left, y_es, pad_left + plot_w, y_es, fill="#444444", width=1)
-        canvas.create_text(
-            pad_left + 2,
-            y_es - 10,
-            text="Вилив кр. (л/г)",
-            fill="#FFAA66",
-            anchor=tk.SW,
-            font=("Arial", 7, "bold"),
-        )
         try:
             eof = float(self.var_emit_flow.get().replace(",", "."))
             h_min_work = float(self.var_emit_h_min.get().replace(",", "."))
@@ -9173,28 +9885,106 @@ class DripCAD:
             else 0.0
         )
 
-        def y_qstrip(qv: float) -> float:
+        def y_qemit(qv: float) -> float:
             if q_em_max < 1e-9:
-                return y_es + emit_strip_h * 0.5
-            t = max(0.0, min(1.0, qv / q_em_max))
-            return y_es + emit_strip_h - t * (emit_strip_h - 3)
+                return pad_top + plot_h * 0.5
+            t = max(0.0, min(1.0, float(qv) / q_em_max))
+            return pad_top + plot_h - t * plot_h
+
+        try:
+            h_conn = float(data.get("H_submain_conn_m"))
+        except (TypeError, ValueError):
+            h_conn = None
+        if h_conn is None:
+            h_starts = []
+            if l1_data:
+                try:
+                    h_starts.append(float(l1_data[0]["h"]))
+                except Exception:
+                    pass
+            if l2_data:
+                try:
+                    h_starts.append(float(l2_data[0]["h"]))
+                except Exception:
+                    pass
+            h_conn = (sum(h_starts) / len(h_starts)) if h_starts else 10.0
+
+        pts_e_1, pts_h_1, pts_q_1 = [], [], []
+        if l1_data:
+            pts_h_1.append((zero_x, y_screen_h(float(h_conn))))
+        for d in l1_data:
+            sx = zero_x - (d["x"] / total_width) * plot_w
+            el = float(d.get("elev", 0.0))
+            pts_e_1.append((sx, y_screen_e_raw(el)))
+            pts_h_1.append((sx, y_screen_h(float(d["h"]))))
+            qv = float(d.get("q", 0))
+            pts_q_1.append((sx, pad_top + plot_h - (qv / max_q_val) * plot_h))
+            
+        pts_e_2, pts_h_2, pts_q_2 = [], [], []
+        if l2_data:
+            pts_h_2.append((zero_x, y_screen_h(float(h_conn))))
+        for d in l2_data:
+            sx = zero_x + (d["x"] / total_width) * plot_w
+            el = float(d.get("elev", 0.0))
+            pts_e_2.append((sx, y_screen_e_raw(el)))
+            pts_h_2.append((sx, y_screen_h(float(d["h"]))))
+            qv = float(d.get("q", 0))
+            pts_q_2.append((sx, pad_top + plot_h - (qv / max_q_val) * plot_h))
+            
+        if len(pts_e_1) > 1:
+            canvas.create_line(pts_e_1, fill="#8B6914", width=2, smooth=True)
+        if len(pts_e_2) > 1:
+            canvas.create_line(pts_e_2, fill="#8B6914", width=2, smooth=True)
+        _h_profile_color = "#1EE3FF"
+        _h_profile_width = 4
+        if len(pts_h_1) > 1:
+            canvas.create_line(pts_h_1, fill=_h_profile_color, width=_h_profile_width, smooth=True)
+            canvas.create_line(pts_q_1, fill="#00FFCC", width=2, smooth=True)
+        if len(pts_h_2) > 1:
+            canvas.create_line(pts_h_2, fill=_h_profile_color, width=_h_profile_width, smooth=True)
+            canvas.create_line(pts_q_2, fill="#00FFCC", width=2, smooth=True)
+
+        try:
+            if getattr(self, "_graph_terrain_dz_lbl", None) and self._graph_terrain_dz_lbl.winfo_exists():
+                _dzt = f"фіз. ΔZ: {e_lo:.2f}…{e_hi:.2f} м (від врізки; верт. ×{k_terr:g} у межах цієї смуги)"
+                self._graph_terrain_dz_lbl.config(text=_dzt)
+        except Exception:
+            pass
 
         if band_h_active and q_em_max > 1e-9:
+            y_q_lo = y_qemit(q_lo_b)
             canvas.create_line(
                 pad_left,
-                y_qstrip(q_lo_b),
+                y_q_lo,
                 pad_left + plot_w,
-                y_qstrip(q_lo_b),
+                y_q_lo,
                 dash=(4, 3),
                 fill="#AA6633",
             )
+            canvas.create_text(
+                pad_left + plot_w - 4,
+                y_q_lo - 2,
+                text=f"Q@Hmin={q_lo_b:.2f}",
+                fill="#FFB074",
+                anchor=tk.E,
+                font=("Arial", 8, "bold"),
+            )
+            y_q_hi = y_qemit(q_hi_b)
             canvas.create_line(
                 pad_left,
-                y_qstrip(q_hi_b),
+                y_q_hi,
                 pad_left + plot_w,
-                y_qstrip(q_hi_b),
+                y_q_hi,
                 dash=(4, 3),
                 fill="#AA6633",
+            )
+            canvas.create_text(
+                pad_left + plot_w - 4,
+                y_q_hi - 2,
+                text=f"Q@Hmax={q_hi_b:.2f}",
+                fill="#FFB074",
+                anchor=tk.E,
+                font=("Arial", 8, "bold"),
             )
 
         pts_em = []
@@ -9202,35 +9992,108 @@ class DripCAD:
             qe = float(d.get("q_emit", 0))
             if qe > 1e-4:
                 sx = zero_x - (d["x"] / total_width) * plot_w
-                pts_em.append((sx, y_qstrip(qe)))
+                pts_em.append((sx, y_qemit(qe)))
         for d in l2_data:
             qe = float(d.get("q_emit", 0))
             if qe > 1e-4:
                 sx = zero_x + (d["x"] / total_width) * plot_w
-                pts_em.append((sx, y_qstrip(qe)))
+                pts_em.append((sx, y_qemit(qe)))
         if len(pts_em) > 1:
             canvas.create_line(pts_em, fill="#FFAA44", width=2, smooth=True)
         elif len(pts_em) == 1:
             sx, sy = pts_em[0]
             canvas.create_oval(sx - 3, sy - 3, sx + 3, sy + 3, fill="#FFAA44", outline="")
 
+        leg_x = pad_left + plot_w - 120
+        leg_y = pad_top + 6
+        x_r_callout = leg_x - 2
+
+        def _mid_profile_pt(pts: list) -> Optional[Tuple[float, float]]:
+            if not pts or len(pts) < 2:
+                return None
+            return pts[len(pts) // 2]
+
+        def _lateral_line_callout(
+            x_p: float, y_p: float, y_label: float, color: str, text: str
+        ) -> None:
+            x_elb = max(min(x_p + 28.0, x_r_callout - 10.0), x_p + 4.0)
+            if x_elb < x_p + 3.0:
+                x_elb = x_p + 3.0
+            canvas.create_line(
+                x_p,
+                y_p,
+                x_elb,
+                y_p,
+                x_elb,
+                y_label,
+                x_r_callout,
+                y_label,
+                fill=color,
+                width=1,
+            )
+            canvas.create_text(
+                x_r_callout,
+                y_label,
+                text=text,
+                fill=color,
+                anchor=tk.E,
+                font=("Arial", 8, "bold"),
+            )
+
+        _callout_specs: List[Tuple[Tuple[float, float], str, str]] = []
+        _mp_h = _mid_profile_pt(pts_h_1) if len(pts_h_1) > 1 else _mid_profile_pt(pts_h_2)
+        _mp_e = _mid_profile_pt(pts_e_1) if len(pts_e_1) > 1 else _mid_profile_pt(pts_e_2)
+        _mp_q = _mid_profile_pt(pts_q_1) if len(pts_q_1) > 1 else _mid_profile_pt(pts_q_2)
+        if _mp_h:
+            _callout_specs.append((_mp_h, _h_profile_color, "H, м (тиск)"))
+        if _mp_e:
+            _callout_specs.append((_mp_e, "#8B6914", "ΔZ, м (рельєф)"))
+        if _mp_q:
+            _callout_specs.append((_mp_q, "#00FFCC", "Q у трубі, л/г"))
+        if len(pts_em) > 1:
+            _mpe = _mid_profile_pt(pts_em)
+            if _mpe:
+                _callout_specs.append((_mpe, "#FFAA44", "Вилив кр., л/г"))
+        elif len(pts_em) == 1:
+            _callout_specs.append((pts_em[0], "#FFAA44", "Вилив кр., л/г"))
+        _callout_specs.sort(key=lambda t: t[0][1])
+        _yl_prev: Optional[float] = None
+        for (xa, ya), col, s_txt in _callout_specs:
+            y_l = float(ya)
+            if _yl_prev is not None and abs(y_l - _yl_prev) < 12.0:
+                y_l = _yl_prev + 12.0
+            _lateral_line_callout(float(xa), float(ya), y_l, col, s_txt)
+            _yl_prev = y_l
+
         canvas.create_text(zero_x, pad_top + plot_h + 20, text="0 м\n(Сабмейн)", fill="white", anchor=tk.N, justify=tk.CENTER)
         if max_x1 > 0: canvas.create_text(pad_left, pad_top + plot_h + 20, text=f"-{max_x1:.1f} м", fill="white", anchor=tk.N)
         if max_x2 > 0: canvas.create_text(pad_left + plot_w, pad_top + plot_h + 20, text=f"+{max_x2:.1f} м", fill="white", anchor=tk.N)
         
-        submain_h = float(l1_data[0]["h"]) if l1_data else (float(l2_data[0]["h"]) if l2_data else 10.0)
+        submain_h = float(h_conn) if h_conn is not None else (
+            float(l1_data[0]["h"]) if l1_data else (float(l2_data[0]["h"]) if l2_data else 10.0)
+        )
         sub_q_parts = []
         if l1_data:
             sub_q_parts.append(float(l1_data[0].get("q", 0)))
         if l2_data:
             sub_q_parts.append(float(l2_data[0].get("q", 0)))
         submain_q = sum(sub_q_parts) if sub_q_parts else 0.0
-        submain_sy = y_screen(submain_h)
+        submain_sy = y_screen_h(submain_h)
         
         canvas.create_oval(zero_x-4, submain_sy-4, zero_x+4, submain_sy+4, fill="red")
-        txt_submain = f"Сабмейн\nH: {submain_h:.1f} м\nQ труби: {submain_q:.0f} л/г"
+        txt_submain = f"Сабмейн\nH: {submain_h:.1f} м\nQ сум. лат.: {submain_q:.0f} л/г"
         canvas.create_text(zero_x + 10, submain_sy - 10, text=txt_submain, fill="white", anchor=tk.W, font=("Arial", 9, "bold"), justify=tk.LEFT)
         
+        def _first_emit_q_emit(wing_rows: list) -> float:
+            for d in wing_rows:
+                try:
+                    qe = float(d.get("q_emit", 0))
+                except (TypeError, ValueError):
+                    qe = 0.0
+                if qe > 1e-4:
+                    return qe
+            return 0.0
+
         def _last_emit_q_emit(wing_rows: list) -> float:
             qe = 0.0
             for d in wing_rows:
@@ -9243,16 +10106,13 @@ class DripCAD:
             end_y1 = pts_h_1[-1][1]
             end_d1 = l1_data[-1]
             end_h1 = float(end_d1["h"])
-            end_qp1 = float(end_d1.get("q", 0))
+            first_em1 = _first_emit_q_emit(l1_data)
             end_em1 = _last_emit_q_emit(l1_data)
             canvas.create_oval(end_x1-4, end_y1-4, end_x1+4, end_y1+4, fill="red")
-            if end_em1 > 1e-4:
-                txt_l1 = (
-                    f"Тупик\nH: {end_h1:.1f} м\nQ труби: {end_qp1:.0f}\n"
-                    f"Вилив ост. крап.: {end_em1:.2f} л/г"
-                )
+            if end_em1 > 1e-4 or first_em1 > 1e-4:
+                txt_l1 = f"Тупик\nH: {end_h1:.1f} м\nQfirst: {first_em1:.2f} л/г\nQlast: {end_em1:.2f} л/г"
             else:
-                txt_l1 = f"Тупик\nH: {end_h1:.1f} м\nQ труби: {end_qp1:.0f} л/г"
+                txt_l1 = f"Тупик\nH: {end_h1:.1f} м"
             canvas.create_text(end_x1, end_y1 - 10, text=txt_l1, fill="white", anchor=tk.S, font=("Arial", 9, "bold"), justify=tk.CENTER)
 
         if l2_data:
@@ -9260,50 +10120,78 @@ class DripCAD:
             end_y2 = pts_h_2[-1][1]
             end_d2 = l2_data[-1]
             end_h2 = float(end_d2["h"])
-            end_qp2 = float(end_d2.get("q", 0))
+            first_em2 = _first_emit_q_emit(l2_data)
             end_em2 = _last_emit_q_emit(l2_data)
             canvas.create_oval(end_x2-4, end_y2-4, end_x2+4, end_y2+4, fill="red")
-            if end_em2 > 1e-4:
-                txt_l2 = (
-                    f"Тупик\nH: {end_h2:.1f} м\nQ труби: {end_qp2:.0f}\n"
-                    f"Вилив ост. крап.: {end_em2:.2f} л/г"
-                )
+            if end_em2 > 1e-4 or first_em2 > 1e-4:
+                txt_l2 = f"Тупик\nH: {end_h2:.1f} м\nQfirst: {first_em2:.2f} л/г\nQlast: {end_em2:.2f} л/г"
             else:
-                txt_l2 = f"Тупик\nH: {end_h2:.1f} м\nQ труби: {end_qp2:.0f} л/г"
+                txt_l2 = f"Тупик\nH: {end_h2:.1f} м"
             canvas.create_text(end_x2, end_y2 - 10, text=txt_l2, fill="white", anchor=tk.S, font=("Arial", 9, "bold"), justify=tk.CENTER)
 
-        canvas.create_text(pad_left, pad_top - 30, text="--- Тиск (H, м)", fill="#FFD700", anchor=tk.W, font=("Arial", 11, "bold"))
-        canvas.create_text(pad_left + 150, pad_top - 30, text="--- Поверхня ΔZ (м)", fill="#C4A35A", anchor=tk.W, font=("Arial", 11, "bold"))
-        canvas.create_text(
-            pad_left + 330,
-            pad_top - 30,
-            text="--- Q у трубі (л/г)",
-            fill="#00FFCC",
-            anchor=tk.W,
-            font=("Arial", 11, "bold"),
-        )
-
-        if lat_human_n is not None:
-            canvas.create_text(
-                pad_left + plot_w - 6,
-                pad_top + 6,
-                text=f"Латераль №{lat_human_n}",
-                fill="#FFFFFF",
-                anchor=tk.NE,
-                font=("Arial", 10, "bold"),
-            )
-        leg_x = pad_left + plot_w - 120
-        leg_y = pad_top + 24 if lat_human_n is not None else pad_top + 6
         legend_rows = [
             ("#90EE90", "Норма"),
             ("#E8C547", "Недолив"),
             ("#FF4444", "Перелив"),
         ]
-        row_h = 15
+        legend_font = tkfont.Font(root=self.root, family="Arial", size=8)
+        row_h = max(13, int(legend_font.metrics("linespace")) + 3)
+        # Адаптивний бокс під фактичні метрики тексту (+ невеликий запас).
+        swatch_w = 10
+        text_gap = 4
+        legend_pad_x = 4
+        legend_pad_y = 3
+        label_w_px = max((legend_font.measure(str(lbl)) for _c, lbl in legend_rows), default=42)
+        legend_w = legend_pad_x * 2 + swatch_w + text_gap + label_w_px
+        legend_h = legend_pad_y * 2 + row_h * len(legend_rows)
+        leg_x = pad_left + plot_w - legend_w - 6
+        leg_y = pad_top + 6
+        # Safe-zone: якщо у правому верхньому куті проходять криві/підписи, зсуваємо легенду вниз.
+        _legend_margin = 6
+        _legend_min_y = pad_top + 6
+        _legend_max_y = pad_top + plot_h - legend_h - 6
+        _legend_y = float(leg_y)
+        _all_curve_pts = (
+            list(pts_h_1)
+            + list(pts_h_2)
+            + list(pts_q_1)
+            + list(pts_q_2)
+            + list(pts_e_1)
+            + list(pts_e_2)
+            + list(pts_em)
+        )
+        for _ in range(4):
+            x0 = float(leg_x - _legend_margin)
+            x1 = float(leg_x + legend_w + _legend_margin)
+            y0 = float(_legend_y - _legend_margin)
+            y1 = float(_legend_y + legend_h + _legend_margin)
+            conflict_y = [float(py) for (px, py) in _all_curve_pts if x0 <= float(px) <= x1 and y0 <= float(py) <= y1]
+            if not conflict_y:
+                break
+            _legend_y = min(float(_legend_max_y), max(float(_legend_min_y), max(conflict_y) + 10.0))
+        leg_y = int(round(_legend_y))
+        canvas.create_rectangle(
+            leg_x,
+            leg_y,
+            leg_x + legend_w,
+            leg_y + legend_h,
+            fill="#151515",
+            outline="#5A5A5A",
+            width=1,
+        )
         for i, (col, label) in enumerate(legend_rows):
-            yy = leg_y + i * row_h
-            canvas.create_rectangle(leg_x, yy, leg_x + 10, yy + 10, fill=col, outline="#555555")
-            canvas.create_text(leg_x + 14, yy + 5, text=label, fill="#DDDDDD", anchor=tk.W, font=("Arial", 8))
+            yy = leg_y + legend_pad_y + i * row_h
+            sw_x0 = leg_x + legend_pad_x
+            sw_y0 = yy + max(1, (row_h - swatch_w) // 2)
+            canvas.create_rectangle(sw_x0, sw_y0, sw_x0 + swatch_w, sw_y0 + swatch_w, fill=col, outline="#555555")
+            canvas.create_text(
+                sw_x0 + swatch_w + text_gap,
+                yy + row_h / 2.0,
+                text=label,
+                fill="#DDDDDD",
+                anchor=tk.W,
+                font=legend_font,
+            )
         
         emit_rates = [
             float(d.get("q_emit", 0))
@@ -9321,7 +10209,32 @@ class DripCAD:
             qmin_over_qmax_pct = None
             spread_pct = None
 
-        info = ""
+        try:
+            _q0 = float(l1_data[0].get("q", 0) or 0.0) if l1_data else 0.0
+        except (TypeError, ValueError, KeyError):
+            _q0 = 0.0
+        try:
+            _q1 = float(l2_data[0].get("q", 0) or 0.0) if l2_data else 0.0
+        except (TypeError, ValueError, KeyError):
+            _q1 = 0.0
+        _qsum = _q0 + _q1
+        _tip_parts: List[str] = []
+        if l1_data:
+            try:
+                _tip_parts.append(f"L1: {float(l1_data[-1]['h']):.2f} м")
+            except (TypeError, ValueError, KeyError, IndexError):
+                pass
+        if l2_data:
+            try:
+                _tip_parts.append(f"L2: {float(l2_data[-1]['h']):.2f} м")
+            except (TypeError, ValueError, KeyError, IndexError):
+                pass
+        _hdr = (
+            f"Сумарна Q латераля (сум витрат з крил біля врізки): {_qsum:.1f} л/г. "
+            f"H біля тупиків: {', '.join(_tip_parts) if _tip_parts else '—'}.\n"
+            f"Червоний маркер — мін. H, жовтий — макс. H; підпис: витрата Q крапельниці (л/г).\n\n"
+        )
+        info = _hdr
         if lat_idx0 is not None:
             aud_st = (self.calc_results.get("lateral_pressure_audit") or {}).get(f"lat_{lat_idx0}")
             if aud_st:
@@ -9369,7 +10282,99 @@ class DripCAD:
                 f"\nРекоменд. H біля врізки: {float(aud['h_sub_target_m']):.2f} м "
                 f"(зараз {float(aud.get('h_sub_actual_m', 0)):.2f})"
             )
+
+        # Hover-підказка: пояснення ліній та значення під курсором.
+        try:
+            canvas.delete("graph_hover_tip")
+        except Exception:
+            pass
+
+        hover_series = []
+        if pts_h_1 or pts_h_2:
+            h_samples = []
+            for d in l1_data:
+                sx = zero_x - (d["x"] / total_width) * plot_w
+                h_samples.append((sx, y_screen_h(float(d["h"])), float(d["h"])))
+            for d in l2_data:
+                sx = zero_x + (d["x"] / total_width) * plot_w
+                h_samples.append((sx, y_screen_h(float(d["h"])), float(d["h"])))
+            hover_series.append(("H (тиск)", "#1EE3FF", "м", h_samples))
+        if pts_q_1 or pts_q_2:
+            q_samples = []
+            for d in l1_data:
+                sx = zero_x - (d["x"] / total_width) * plot_w
+                qv = float(d.get("q", 0))
+                q_samples.append((sx, pad_top + plot_h - (qv / max_q_val) * plot_h, qv))
+            for d in l2_data:
+                sx = zero_x + (d["x"] / total_width) * plot_w
+                qv = float(d.get("q", 0))
+                q_samples.append((sx, pad_top + plot_h - (qv / max_q_val) * plot_h, qv))
+            hover_series.append(("Q у трубі", "#00FFCC", "л/г", q_samples))
+        if pts_e_1 or pts_e_2:
+            e_samples = []
+            for d in l1_data:
+                sx = zero_x - (d["x"] / total_width) * plot_w
+                ev = float(d.get("elev", 0.0))
+                e_samples.append((sx, y_screen_e_raw(ev), ev))
+            for d in l2_data:
+                sx = zero_x + (d["x"] / total_width) * plot_w
+                ev = float(d.get("elev", 0.0))
+                e_samples.append((sx, y_screen_e_raw(ev), ev))
+            hover_series.append(("ΔZ (рельєф)", "#8B6914", "м", e_samples))
+        if pts_em:
+            em_samples = []
+            for d in l1_data:
+                qe = float(d.get("q_emit", 0))
+                if qe > 1e-4:
+                    sx = zero_x - (d["x"] / total_width) * plot_w
+                    em_samples.append((sx, y_qemit(qe), qe))
+            for d in l2_data:
+                qe = float(d.get("q_emit", 0))
+                if qe > 1e-4:
+                    sx = zero_x + (d["x"] / total_width) * plot_w
+                    em_samples.append((sx, y_qemit(qe), qe))
+            hover_series.append(("Вилив крап.", "#FFAA44", "л/г", em_samples))
+
+        def _graph_hover_motion(ev):
+            try:
+                canvas.delete("graph_hover_tip")
+            except Exception:
+                pass
+            best = None
+            best_d2 = 1e18
+            for name, col, unit, samples in hover_series:
+                for sx, sy, val in samples:
+                    dx = float(ev.x) - float(sx)
+                    dy = float(ev.y) - float(sy)
+                    d2 = dx * dx + dy * dy
+                    if d2 < best_d2:
+                        best_d2 = d2
+                        best = (name, col, unit, sx, sy, val)
+            if best is None or best_d2 > 12.0 * 12.0:
+                return
+            name, col, unit, sx, sy, val = best
+            txt = f"{name}: {float(val):.2f} {unit}"
+            tx = min(int(pad_left + plot_w - 180), int(ev.x) + 12)
+            ty = max(int(pad_top + 8), int(ev.y) - 22)
+            canvas.create_rectangle(tx - 4, ty - 3, tx + 170, ty + 16, fill="#101820", outline=col, width=1, tags="graph_hover_tip")
+            canvas.create_text(tx, ty + 6, text=txt, fill="#E8EEF2", anchor=tk.W, font=("Arial", 8, "bold"), tags="graph_hover_tip")
+            canvas.create_oval(float(sx) - 3, float(sy) - 3, float(sx) + 3, float(sy) + 3, fill=col, outline="", tags="graph_hover_tip")
+
+        def _graph_hover_leave(_ev):
+            try:
+                canvas.delete("graph_hover_tip")
+            except Exception:
+                pass
+
+        canvas.bind("<Motion>", _graph_hover_motion)
+        canvas.bind("<Leave>", _graph_hover_leave)
+        self._graph_mode = "lateral"
+        self._graph_lateral_id = lat_id
         self.graph_info_label.config(text=info)
+        try:
+            self.redraw()
+        except Exception:
+            pass
 
     def show_submain_graph(self, sm_idx: int):
         """Графік H(s), Q(s) та рельєфу ΔZ(s) вздовж сабмейну після розрахунку."""
@@ -9377,13 +10382,22 @@ class DripCAD:
         if not prof:
             silent_showinfo(self.root, "Інфо", "Немає профілю сабмейну — спочатку виконайте гідравлічний розрахунок.")
             return
+        self._graph_lateral_h_markers = None
+        try:
+            self.redraw()
+        except Exception:
+            pass
 
         if not hasattr(self, "graph_window") or not self.graph_window.winfo_exists():
             self.graph_window = tk.Toplevel(self.root)
-            self.graph_window.geometry("900x620")
+            self.graph_window.geometry("900x700")
             self.graph_window.configure(bg="#1e1e1e")
+            self._graph_terrain_toolbar = tk.Frame(self.graph_window, bg="#1e1e1e")
+            self._graph_terrain_toolbar.pack(fill=tk.X, padx=20, pady=(12, 0))
+            self._fill_graph_terrain_toolbar(self._graph_terrain_toolbar)
             self.graph_canvas = tk.Canvas(self.graph_window, width=840, height=520, bg="#222", highlightthickness=0)
-            self.graph_canvas.pack(padx=20, pady=16)
+            self.graph_canvas.pack(padx=20, pady=(4, 12))
+            self.graph_canvas.bind("<Configure>", self._schedule_graph_redraw, add="+")
             self.graph_info_label = tk.Label(
                 self.graph_window,
                 bg="#1e1e1e",
@@ -9395,6 +10409,7 @@ class DripCAD:
             self.graph_info_label.pack(fill=tk.X, padx=16)
 
         top = self.graph_window
+        self._migrate_graph_window_add_terrain_toolbar()
         top.title(f"Сабмейн {int(sm_idx) + 1}: H, Q, рельєф (№ латераля — врізка)")
         top.lift(self.root)
         try:
@@ -9409,19 +10424,24 @@ class DripCAD:
 
         s_max = max(float(p["s"]) for p in prof) or 1.0
         z_ref = float(prof[0]["z"])
+        k_terr = self._terrain_surface_viz_scale()
         all_h = [float(p["h"]) for p in prof]
         all_q = [float(p["q_m3h"]) for p in prof]
-        z_rel = [float(p["z"]) - z_ref for p in prof]
+        z_raw = [float(p["z"]) - z_ref for p in prof]
 
-        plot_w = 720
-        plot_h = 420
+        cw = max(480, int(canvas.winfo_width() or 840))
+        ch = max(320, int(canvas.winfo_height() or 520))
         pad_left = 56
         pad_top = 44
+        pad_right = 20
+        pad_bottom = 60
+        plot_w = max(240, cw - pad_left - pad_right)
+        plot_h = max(170, ch - pad_top - pad_bottom)
 
         def x_screen(s: float) -> float:
             return pad_left + (float(s) / s_max) * plot_w
 
-        y_samples = all_h + z_rel
+        y_samples = all_h + z_raw
         y_min = min(y_samples) if y_samples else 0.0
         y_max = max(y_samples) if y_samples else 12.0
         y_span = y_max - y_min
@@ -9434,10 +10454,36 @@ class DripCAD:
         def y_screen(yv: float) -> float:
             return pad_top + plot_h - ((yv - y_lo) / (y_hi - y_lo)) * plot_h
 
+        if z_raw:
+            _zm, _zM = min(z_raw), max(z_raw)
+            _zsp = _zM - _zm
+            if _zsp < 1e-6:
+                ez_lo = _zm - 0.02
+                ez_hi = _zm + 0.02
+            else:
+                _zp = max(1e-3, _zsp * 0.08)
+                ez_lo, ez_hi = _zm - _zp, _zM + _zp
+        else:
+            ez_lo, ez_hi = -0.1, 0.1
+        if ez_hi <= ez_lo:
+            ez_hi = ez_lo + 0.04
+
+        def y_screen_ez_sub(zr_phys: float) -> float:
+            span = ez_hi - ez_lo
+            if span < 1e-12:
+                return pad_top + plot_h * 0.5
+            m = (zr_phys - ez_lo) / span
+            dy = m * plot_h * k_terr
+            yp = pad_top + plot_h - dy
+            return min(pad_top + plot_h, max(pad_top, yp))
+
         max_q_val = max(max(all_q) * 1.1 if all_q else 1.0, 1.0)
 
         pts_h = [(x_screen(float(p["s"])), y_screen(float(p["h"]))) for p in prof]
-        pts_z = [(x_screen(float(p["s"])), y_screen(zr)) for p, zr in zip(prof, z_rel)]
+        pts_z = [
+            (x_screen(float(p["s"])), y_screen_ez_sub(zr))
+            for p, zr in zip(prof, z_raw)
+        ]
         pts_q = [
             (x_screen(float(p["s"])), pad_top + plot_h - (float(p["q_m3h"]) / max_q_val) * plot_h)
             for p in prof
@@ -9482,7 +10528,12 @@ class DripCAD:
             canvas.create_text(leg_x + 14, yy + 5, text=label, fill="#DDDDDD", anchor=tk.W, font=("Arial", 8))
 
         canvas.create_text(pad_left, pad_top - 28, text="— H, м (на початку відрізка)", fill="#FFD700", anchor=tk.W, font=("Arial", 10, "bold"))
-        canvas.create_text(pad_left + 260, pad_top - 28, text="— ΔZ відносно початку, м", fill="#C4A35A", anchor=tk.W, font=("Arial", 10, "bold"))
+        _sm_dz_leg = (
+            f"— ΔZ відносно початку, м (масштаб ×{k_terr:g})"
+            if abs(k_terr - 1.0) > 1e-6
+            else "— ΔZ відносно початку, м"
+        )
+        canvas.create_text(pad_left + 260, pad_top - 28, text=_sm_dz_leg, fill="#C4A35A", anchor=tk.W, font=("Arial", 10, "bold"))
         canvas.create_text(pad_left + 520, pad_top - 28, text="— Q, м³/г (масштаб по висоті)", fill="#00FFCC", anchor=tk.W, font=("Arial", 10, "bold"))
 
         canvas.create_text(
@@ -9492,6 +10543,16 @@ class DripCAD:
             fill="white",
             font=("Arial", 10, "bold"),
         )
+
+        try:
+            if getattr(self, "_graph_terrain_dz_lbl", None) and self._graph_terrain_dz_lbl.winfo_exists():
+                if z_raw:
+                    zm, zM = min(z_raw), max(z_raw)
+                    self._graph_terrain_dz_lbl.config(
+                        text=f"фіз. ΔZ: {ez_lo:.2f}…{ez_hi:.2f} м (від сабмейну; верт. ×{k_terr:g} у цій смузі)"
+                    )
+        except Exception:
+            pass
 
         h_end = all_h[-1] if all_h else 0.0
         info = (
@@ -9509,7 +10570,431 @@ class DripCAD:
             info += (
                 "\n\nТурбулентна модель: вилив залежить від H; колір — за порівнянням H з вашим коридором на «Гідравліці»."
             )
+        self._graph_mode = "submain"
+        self._graph_submain_idx = int(sm_idx)
         self.graph_info_label.config(text=info)
+
+    def _collect_emitter_flow_points_for_window(self) -> list[tuple[float, float, float, float]]:
+        """Збір (x, y, q_emit, h_emit) для окремого вікна, якщо кеш ізоліній ще не готовий."""
+        em_db = self.calc_results.get("emitters") or {}
+        if not em_db:
+            return []
+        lat_list = self._flatten_all_lats()
+        if not lat_list:
+            return []
+        sm_for_conn = self._hydraulic_submain_lines()
+        sample_pts: list[tuple[float, float, float, float]] = []
+
+        def _append_wing_rows(lat, wing_rows, conn, sign_xa: float):
+            for row in wing_rows or []:
+                try:
+                    qe = float(row.get("q_emit", 0.0))
+                except (TypeError, ValueError):
+                    qe = 0.0
+                if qe <= 1e-4:
+                    continue
+                try:
+                    xa = float(row.get("x", 0.0))
+                except (TypeError, ValueError):
+                    xa = 0.0
+                along = conn + sign_xa * xa
+                along = max(0.0, min(float(lat.length), float(along)))
+                try:
+                    pt = lat.interpolate(along)
+                except Exception:
+                    continue
+                try:
+                    h_em = float(row.get("h", 0.0))
+                except (TypeError, ValueError):
+                    h_em = 0.0
+                sample_pts.append((float(pt.x), float(pt.y), qe, h_em))
+
+        for key, pay in em_db.items():
+            if not str(key).startswith("lat_"):
+                continue
+            try:
+                li = int(str(key).split("_", 1)[1])
+            except (ValueError, IndexError):
+                continue
+            if li < 0 or li >= len(lat_list):
+                continue
+            lat = lat_list[li]
+            if lat.is_empty or lat.length < 1e-6:
+                continue
+            try:
+                conn = lat_sol.connection_distance_along_lateral(
+                    lat, sm_for_conn, snap_m=self._submain_lateral_snap_m()
+                )
+            except Exception:
+                conn = 0.0
+            conn = max(0.0, min(float(lat.length), float(conn)))
+            _append_wing_rows(lat, pay.get("L1"), conn, -1.0)
+            _append_wing_rows(lat, pay.get("L2"), conn, 1.0)
+        return sample_pts
+
+    def _draw_emitter_flow_graph_canvas(self, *_args, target_canvas=None) -> None:
+        canvas = target_canvas
+        if canvas is None:
+            if (
+                not hasattr(self, "emit_flow_canvas")
+                or self.emit_flow_canvas is None
+                or not self.emit_flow_canvas.winfo_exists()
+            ):
+                return
+            canvas = self.emit_flow_canvas
+        elif not canvas.winfo_exists():
+            return
+        canvas.delete("all")
+        try:
+            h_lo_lim = float(self.var_emit_h_press_min.get().replace(",", "."))
+        except Exception:
+            h_lo_lim = 0.0
+        try:
+            h_hi_lim = float(self.var_emit_h_press_max.get().replace(",", "."))
+        except Exception:
+            h_hi_lim = 0.0
+        _h_band_tol = 0.02
+
+        def _classify_h(hm: float) -> str:
+            ok_lo = (True if h_lo_lim <= 1e-9 else hm >= h_lo_lim - _h_band_tol)
+            ok_hi = (True if h_hi_lim <= 1e-9 else hm <= h_hi_lim + _h_band_tol)
+            if ok_lo and ok_hi:
+                return "inband"
+            if not ok_hi:
+                return "overflow"
+            return "underflow"
+
+        def _lerp_rgb(c0: tuple[int, int, int], c1: tuple[int, int, int], t: float) -> str:
+            t = max(0.0, min(1.0, float(t)))
+            r = int(c0[0] + (c1[0] - c0[0]) * t)
+            g = int(c0[1] + (c1[1] - c0[1]) * t)
+            b = int(c0[2] + (c1[2] - c0[2]) * t)
+            return f"#{r:02x}{g:02x}{b:02x}"
+
+        def _palette_by_class(cls_name: str, t: float) -> str:
+            if cls_name == "inband":
+                # Норма: зелена гамма.
+                return _lerp_rgb((198, 245, 194), (41, 163, 74), t)
+            if cls_name == "overflow":
+                # Перелив: фуксія -> ало.
+                return _lerp_rgb((255, 66, 214), (255, 36, 0), t)
+            # Недолив: жовто-охряна гама.
+            return _lerp_rgb((241, 208, 110), (178, 132, 38), t)
+
+        mask_lines_ov = []
+        mask_lines_un = []
+        if bool(getattr(self, "var_show_press_zone_outlines_on_map", None) and self.var_show_press_zone_outlines_on_map.get()):
+            try:
+                bun = self._bad_pressure_emitter_details_active_block()
+                if bun["band_on"] and bun["has_calc"]:
+                    items = bun.get("items") or []
+                    ov_items = [it for it in items if it.get("overflow")]
+                    un_items = [it for it in items if it.get("underflow")]
+
+                    def _geom_to_lines(gm):
+                        if gm is None or gm.is_empty:
+                            return
+                        gt = gm.geom_type
+                        if gt == "Polygon":
+                            ex = list(gm.exterior.coords)
+                            if len(ex) >= 2:
+                                yield ex
+                        elif gt == "MultiPolygon":
+                            for pp in gm.geoms:
+                                ex = list(pp.exterior.coords)
+                                if len(ex) >= 2:
+                                    yield ex
+                        elif gt == "GeometryCollection":
+                            for sub in gm.geoms:
+                                for ln in _geom_to_lines(sub):
+                                    yield ln
+
+                    if ov_items:
+                        zone_ov = self._bad_emitter_pressure_zone_clipped({**bun, "items": ov_items})
+                        mask_lines_ov = list(_geom_to_lines(zone_ov))
+                    if un_items:
+                        zone_un = self._bad_emitter_pressure_zone_clipped({**bun, "items": un_items})
+                        mask_lines_un = list(_geom_to_lines(zone_un))
+            except Exception:
+                mask_lines_ov = []
+                mask_lines_un = []
+        cache = getattr(self, "_emit_isolines_cache", None) or {}
+        contours = list(cache.get("contours") or [])
+        if not bool(getattr(self, "var_show_emitter_flow", None) and self.var_show_emitter_flow.get()):
+            contours = []
+        h_points = self._collect_emitter_flow_points_for_window()
+        # Якщо ізолінії увімкнені, але кеш ще порожній (бо не малюємо на основному полотні),
+        # будуємо їх прямо для панелі діаграми.
+        if (
+            bool(getattr(self, "var_show_emitter_flow", None) and self.var_show_emitter_flow.get())
+            and not contours
+            and h_points
+        ):
+            pts_q = [(float(x), float(y), float(q)) for x, y, q, _h in h_points if float(q) > 1e-6]
+            if len(pts_q) >= 8:
+                try:
+                    lo_q = min(p[2] for p in pts_q)
+                    hi_q = max(p[2] for p in pts_q)
+                except Exception:
+                    lo_q = hi_q = 0.0
+                if hi_q > lo_q + 1e-9:
+                    boundary = self.field_union_polygon()
+                    if boundary is None or boundary.is_empty:
+                        abi = self._safe_active_block_idx()
+                        if abi is not None and 0 <= abi < len(self.field_blocks):
+                            boundary = self._block_poly(self.field_blocks[abi])
+                    if boundary is not None and not boundary.is_empty:
+                        try:
+                            tpe = TopoEngine()
+                            tpe.power = 2.0
+                            step_q = max((hi_q - lo_q) / 6.0, 1e-6)
+                            nq = len(pts_q)
+                            if nq < 900:
+                                grid_m = 11.0
+                            elif nq < 1600:
+                                grid_m = 14.0
+                            elif nq < 2400:
+                                grid_m = 17.0
+                            else:
+                                grid_m = 21.0
+                            contours = tpe.generate_contours(
+                                boundary=boundary,
+                                step_z=step_q,
+                                grid_size=grid_m,
+                                elevation_points=pts_q,
+                            ) or []
+                        except Exception:
+                            contours = []
+        if not contours:
+            pts = h_points
+            if not pts:
+                canvas.create_text(
+                    20,
+                    20,
+                    anchor=tk.NW,
+                    fill="#D0D0D0",
+                    font=("Arial", 10),
+                    text="Немає даних емітерів. Спочатку виконайте розрахунок.",
+                )
+                return
+            min_x = min(p[0] for p in pts)
+            min_y = min(p[1] for p in pts)
+            max_x = max(p[0] for p in pts)
+            max_y = max(p[1] for p in pts)
+            min_q = min(p[2] for p in pts)
+            max_q = max(p[2] for p in pts)
+            for ln in mask_lines_ov + mask_lines_un:
+                for x, y in ln:
+                    min_x = min(min_x, float(x))
+                    min_y = min(min_y, float(y))
+                    max_x = max(max_x, float(x))
+                    max_y = max(max_y, float(y))
+            cw = max(420, int(canvas.winfo_width() or 840))
+            ch = max(300, int(canvas.winfo_height() or 560))
+            pad_l, pad_t, pad_r, pad_b = 20, 20, 20, 34
+            avail_w = max(200, cw - pad_l - pad_r)
+            avail_h = max(160, ch - pad_t - pad_b)
+            span_x = max(1e-6, max_x - min_x)
+            span_y = max(1e-6, max_y - min_y)
+            scale = min(avail_w / span_x, avail_h / span_y)
+            off_x = pad_l + (avail_w - span_x * scale) * 0.5
+            off_y = pad_t + (avail_h - span_y * scale) * 0.5
+
+            def _to_screen(wx: float, wy: float) -> tuple[float, float]:
+                sx = off_x + (wx - min_x) * scale
+                sy = off_y + (max_y - wy) * scale
+                return sx, sy
+
+            def _q_t(q_val: float) -> float:
+                if max_q <= min_q + 1e-9:
+                    return 0.5
+                return max(0.0, min(1.0, (float(q_val) - min_q) / (max_q - min_q)))
+
+            canvas.create_rectangle(
+                pad_l - 1, pad_t - 1, cw - pad_r + 1, ch - pad_b + 1, outline="#3A3A3A"
+            )
+            for ln in mask_lines_ov:
+                scr = []
+                for wx, wy in ln:
+                    sx, sy = _to_screen(float(wx), float(wy))
+                    scr.extend((sx, sy))
+                if len(scr) >= 4:
+                    canvas.create_line(scr, fill="#FF5533", width=2)
+            for ln in mask_lines_un:
+                scr = []
+                for wx, wy in ln:
+                    sx, sy = _to_screen(float(wx), float(wy))
+                    scr.extend((sx, sy))
+                if len(scr) >= 4:
+                    canvas.create_line(scr, fill="#E8C547", width=2)
+            for wx, wy, qv, hv in pts:
+                sx, sy = _to_screen(wx, wy)
+                rr = 2
+                cls = _classify_h(float(hv))
+                canvas.create_oval(
+                    sx - rr,
+                    sy - rr,
+                    sx + rr,
+                    sy + rr,
+                    fill=_palette_by_class(cls, _q_t(qv)),
+                    outline="",
+                )
+            canvas.create_text(
+                10,
+                ch - 8,
+                anchor=tk.SW,
+                fill="#BDBDBD",
+                font=("Arial", 9),
+                text=f"Точки емітерів: {len(pts)} | Q min={min_q:.2f} л/г | Q max={max_q:.2f} л/г",
+            )
+            return
+
+        line_items = []
+        min_x = min_y = float("inf")
+        max_x = max_y = float("-inf")
+        min_z = float("inf")
+        max_z = float("-inf")
+        for c in contours:
+            z = float(c.get("z", 0.0))
+            g = c.get("geom")
+            if g is None or g.is_empty:
+                continue
+            geoms = getattr(g, "geoms", [g])
+            for gg in geoms:
+                if gg.geom_type != "LineString":
+                    continue
+                coords = list(gg.coords)
+                if len(coords) < 2:
+                    continue
+                for x, y in coords:
+                    min_x = min(min_x, float(x))
+                    min_y = min(min_y, float(y))
+                    max_x = max(max_x, float(x))
+                    max_y = max(max_y, float(y))
+                min_z = min(min_z, z)
+                max_z = max(max_z, z)
+                line_items.append((coords, z))
+        for ln in mask_lines_ov + mask_lines_un:
+            for x, y in ln:
+                min_x = min(min_x, float(x))
+                min_y = min(min_y, float(y))
+                max_x = max(max_x, float(x))
+                max_y = max(max_y, float(y))
+
+        if not line_items:
+            canvas.create_text(20, 20, anchor=tk.NW, fill="#D0D0D0", text="Ізолінії порожні.")
+            return
+
+        cw = max(420, int(canvas.winfo_width() or 840))
+        ch = max(300, int(canvas.winfo_height() or 560))
+        pad_l, pad_t, pad_r, pad_b = 20, 20, 20, 34
+        avail_w = max(200, cw - pad_l - pad_r)
+        avail_h = max(160, ch - pad_t - pad_b)
+        span_x = max(1e-6, max_x - min_x)
+        span_y = max(1e-6, max_y - min_y)
+        scale = min(avail_w / span_x, avail_h / span_y)
+        off_x = pad_l + (avail_w - span_x * scale) * 0.5
+        off_y = pad_t + (avail_h - span_y * scale) * 0.5
+
+        def _to_screen(wx: float, wy: float) -> tuple[float, float]:
+            sx = off_x + (wx - min_x) * scale
+            sy = off_y + (max_y - wy) * scale
+            return sx, sy
+
+        def _q_t(z_val: float) -> float:
+            if max_z <= min_z + 1e-9:
+                return 0.5
+            return max(0.0, min(1.0, (float(z_val) - min_z) / (max_z - min_z)))
+
+        h_samples = h_points
+        if len(h_samples) > 2400:
+            st = max(1, len(h_samples) // 2400)
+            h_samples = h_samples[::st]
+
+        def _nearest_h_cls(wx: float, wy: float) -> str:
+            if not h_samples:
+                return "inband"
+            best_h = float(h_samples[0][3])
+            best_d2 = float("inf")
+            for sx, sy, _q, sh in h_samples:
+                dx = float(wx) - float(sx)
+                dy = float(wy) - float(sy)
+                d2 = dx * dx + dy * dy
+                if d2 < best_d2:
+                    best_d2 = d2
+                    best_h = float(sh)
+            return _classify_h(best_h)
+
+        canvas.create_rectangle(
+            pad_l - 1, pad_t - 1, cw - pad_r + 1, ch - pad_b + 1, outline="#3A3A3A"
+        )
+        for ln in mask_lines_ov:
+            scr = []
+            for wx, wy in ln:
+                sx, sy = _to_screen(float(wx), float(wy))
+                scr.extend((sx, sy))
+            if len(scr) >= 4:
+                canvas.create_line(scr, fill="#FF5533", width=2)
+        for ln in mask_lines_un:
+            scr = []
+            for wx, wy in ln:
+                sx, sy = _to_screen(float(wx), float(wy))
+                scr.extend((sx, sy))
+            if len(scr) >= 4:
+                canvas.create_line(scr, fill="#E8C547", width=2)
+        for coords, z in line_items:
+            scr = []
+            for wx, wy in coords:
+                sx, sy = _to_screen(float(wx), float(wy))
+                scr.extend((sx, sy))
+            if len(scr) >= 4:
+                mid = coords[len(coords) // 2]
+                cls = _nearest_h_cls(float(mid[0]), float(mid[1]))
+                canvas.create_line(
+                    scr,
+                    fill=_palette_by_class(cls, _q_t(z)),
+                    width=1,
+                    dash=(3, 2),
+                )
+
+        canvas.create_text(
+            10,
+            ch - 8,
+            anchor=tk.SW,
+            fill="#BDBDBD",
+            font=("Arial", 9),
+            text=f"Q min={min_z:.2f} л/г | Q max={max_z:.2f} л/г | контурів: {len(line_items)}",
+        )
+
+    def show_emitter_flow_graph(self) -> None:
+        if not self.calc_results.get("emitters"):
+            silent_showinfo(self.root, "Інфо", "Спочатку виконайте розрахунок!")
+            return
+        if not hasattr(self, "emit_flow_window") or not self.emit_flow_window.winfo_exists():
+            self.emit_flow_window = tk.Toplevel(self.root)
+            self.emit_flow_window.geometry("900x620")
+            self.emit_flow_window.configure(bg="#1e1e1e")
+            self.emit_flow_window.title("Діаграма виливу (ізолінії)")
+            self.emit_flow_canvas = tk.Canvas(
+                self.emit_flow_window,
+                width=860,
+                height=560,
+                bg="#222",
+                highlightthickness=0,
+            )
+            self.emit_flow_canvas.pack(fill=tk.BOTH, expand=True, padx=16, pady=16)
+            self.emit_flow_canvas.bind(
+                "<Configure>", self._draw_emitter_flow_graph_canvas, add="+"
+            )
+            self.emit_flow_window.protocol(
+                "WM_DELETE_WINDOW", lambda: self.emit_flow_window.destroy()
+            )
+        self.emit_flow_window.lift(self.root)
+        try:
+            self.emit_flow_window.focus_force()
+        except tk.TclError:
+            pass
+        self._draw_emitter_flow_graph_canvas()
 
     def _open_lateral_tip_probe_dialog(self, lat_idx: int, lat: LineString):
         sm_lines = self._all_submain_lines()
@@ -13113,6 +14598,9 @@ class DripCAD:
             self.mode.set("VIEW")
             self.redraw()
             return
+        if self.mode.get() in ("VIEW", "PAN") and self._pan_start is not None:
+            self.end_pan(event)
+            return
         ct = getattr(self, "_canvas_special_tool", None)
         if ct != "select" or not getattr(self, "_select_marquee_active", False):
             return
@@ -13168,9 +14656,6 @@ class DripCAD:
         self.redraw()
 
     def _canvas_b1_motion(self, event):
-        if self.mode.get() == "PAN":
-            self.handle_pan(event)
-            return
         if self.mode.get() == "ZOOM_BOX" and self._zoom_box_start is not None:
             wx, wy = self.to_world(event.x, event.y)
             self._zoom_box_end = (float(wx), float(wy))
@@ -13210,6 +14695,9 @@ class DripCAD:
             if abs(event.x - sx0) > 3 or abs(event.y - sy0) > 3:
                 self._select_marquee_dragged = True
             self.redraw()
+            return
+        if self.mode.get() in ("VIEW", "PAN") and self._pan_start is not None:
+            self.handle_pan(event)
             return
 
     def _handle_left_click_world(
@@ -13282,6 +14770,8 @@ class DripCAD:
             return
 
         if m in ("PAN", "VIEW"):
+            if scr_x is not None and scr_y is not None:
+                self.start_pan(scr_x=scr_x, scr_y=scr_y)
             return
         if m == "SUB_LABEL":
             # Підписи секцій сабмейну та телескопа магістралі: 1-й ЛКМ — взяти, рух миші, 2-й ЛКМ — зафіксувати.
@@ -14400,6 +15890,78 @@ class DripCAD:
         self.offset_x = cw/2 - center_x * self.zoom
         self.offset_y = ch/2 - center_y * self.zoom
 
+    def zoom_to_visible(self):
+        self.canvas.update_idletasks()
+        cw = self.canvas.winfo_width()
+        ch = self.canvas.winfo_height()
+        if cw <= 1 or ch <= 1:
+            cw, ch = 800, 600  # fallback
+
+        points_to_check = []
+        for b in self.field_blocks:
+            points_to_check.extend(b["ring"])
+        if self.points:
+            points_to_check.extend(self.points)
+        for sm in self._all_submain_lines():
+            points_to_check.extend(sm)
+        for lat in self._flatten_all_lats():
+            points_to_check.extend(list(lat.coords))
+        for seg in getattr(self, "trunk_map_segments", []) or []:
+            pl = self._trunk_segment_world_path(seg)
+            for xy in pl:
+                if isinstance(xy, (list, tuple)) and len(xy) >= 2:
+                    try:
+                        points_to_check.append((float(xy[0]), float(xy[1])))
+                    except (TypeError, ValueError):
+                        pass
+        for node in getattr(self, "trunk_map_nodes", []) or []:
+            try:
+                points_to_check.append((float(node["x"]), float(node["y"])))
+            except (KeyError, TypeError, ValueError):
+                pass
+        if bool(getattr(self, "show_topo_computation_zone", None) and self.show_topo_computation_zone.get()):
+            pz_fit = self.project_zone_display_ring_local()
+            if pz_fit:
+                points_to_check.extend(pz_fit)
+        if bool(getattr(self, "show_topo_points", None) and self.show_topo_points.get()):
+            if self.topo.elevation_points:
+                points_to_check.extend([(p[0], p[1]) for p in self.topo.elevation_points])
+        if bool(getattr(self, "show_srtm_boundary_overlay", None) and self.show_srtm_boundary_overlay.get()):
+            if self.topo.srtm_boundary_pts_local:
+                points_to_check.extend(self.topo.srtm_boundary_pts_local)
+
+        if not points_to_check:
+            self.zoom_to_fit()
+            return
+
+        min_x = min(p[0] for p in points_to_check)
+        max_x = max(p[0] for p in points_to_check)
+        min_y = min(p[1] for p in points_to_check)
+        max_y = max(p[1] for p in points_to_check)
+
+        width = max_x - min_x
+        height = max_y - min_y
+
+        if width == 0 and height == 0:
+            self.zoom = 1.0
+            self.offset_x = cw / 2 - min_x
+            self.offset_y = ch / 2 - min_y
+            return
+
+        margin = 0.05
+        use_w = cw * (1 - 2 * margin)
+        use_h = ch * (1 - 2 * margin)
+
+        zoom_x = use_w / width if width > 0 else float("inf")
+        zoom_y = use_h / height if height > 0 else float("inf")
+        self.zoom = min(zoom_x, zoom_y)
+
+        center_x = (min_x + max_x) / 2
+        center_y = (min_y + max_y) / 2
+
+        self.offset_x = cw / 2 - center_x * self.zoom
+        self.offset_y = ch / 2 - center_y * self.zoom
+
     def _draw_workspace_background(self) -> None:
         """Фонова сітка 100×100 м у локальних координатах; підказка, коли ще немає блоків."""
         _GRID_STEP_M = 100.0
@@ -14573,6 +16135,28 @@ class DripCAD:
             self.zoom_to_fit()
             self.redraw()
 
+    def _top_bar_zoom_visible(self) -> None:
+        try:
+            tab_idx = int(self.view_notebook.index("current"))
+        except Exception:
+            tab_idx = 0
+        if tab_idx == 1:
+            if not self._ensure_embedded_map_panel():
+                silent_showerror(self.root,
+                    "Карта",
+                    "Не вдалося відкрити панель карти (перевірте tkintermapview).",
+                )
+                return
+            host = getattr(self, "_embedded_map_host", None)
+            fn = getattr(host, "_zoom_extents_project", None) if host is not None else None
+            if callable(fn):
+                fn()
+            else:
+                silent_showinfo(self.root, "Карта", "Функція зуму на карті недоступна.")
+            return
+        self.zoom_to_visible()
+        self.redraw()
+
     def redraw(self, skip_heavy_canvas_layers: bool = False):
         """
         Повне перемальовування робочого полотна. ``skip_heavy_canvas_layers`` — легший кадр
@@ -14612,14 +16196,35 @@ class DripCAD:
                 cy = sum(p[1] for p in ring) / len(ring)
                 sx, sy = self.to_screen(cx, cy)
                 self.canvas.create_text(sx, sy, text=str(bi + 1), fill="#00FFCC", font=("Arial", 9, "bold"))
+                _has_sec = bool(self.calc_results.get("sections"))
                 bavg = (self.calc_results.get("block_avg_emit_lph") or {}).get(str(bi))
-                if bavg is not None and bool(self.calc_results.get("sections")):
+                _y_lbl = sy + 14
+                if bavg is not None and _has_sec:
                     self.canvas.create_text(
                         sx,
-                        sy + 14,
+                        _y_lbl,
                         text=f"ØQ {float(bavg):.2f} л/г",
                         fill="#AAEEDD",
                         font=("Arial", 8, "bold"),
+                    )
+                    _y_lbl += 14
+                _lat_st = self.calc_results.get("lateral_solver_stats") or {}
+                _buni = (self.calc_results.get("block_emitter_uniformity") or {}).get(str(bi))
+                if (
+                    _lat_st.get("mode") == "trickle_nr"
+                    and _buni
+                    and int(_buni.get("n_emitters") or 0) >= 2
+                    and _has_sec
+                ):
+                    self.canvas.create_text(
+                        sx,
+                        _y_lbl,
+                        text=(
+                            f"DU {_buni['du_low_quarter_pct']:.0f}% "
+                            f"CU {_buni['christiansen_cu']:.2f}"
+                        ),
+                        fill="#88CCBB",
+                        font=("Arial", 7, "bold"),
                     )
         if self.points:
             scr = [self.to_screen(*p) for p in self.points]
@@ -14839,11 +16444,13 @@ class DripCAD:
                     _draw_lateral_with_audit(lat, b, li_use, 3, True, bi)
                 lat_draw_idx += 1
 
-        # Ізолінії виливу будуються з точок емітера — виглядають як «кожна крапельниця».
-        # Якщо на мапі потрібні лише контури зон переливу/недоливу — не накладаємо ізолінії.
+        self._draw_lateral_h_graph_markers_on_canvas()
+
+        # Ізолінії виливу на блоці/мапі вимкнені: показ тільки в окремому вікні.
         if (
             is_calculated
             and self.var_show_emitter_flow.get()
+            and bool(getattr(self, "_emit_flow_draw_on_canvas", False))
             and not bool(self.var_show_press_zone_outlines_on_map.get())
             and not skip_heavy_canvas_layers
         ):
@@ -15324,6 +16931,14 @@ class DripCAD:
                 for i in range(len(sm) - 1):
                     self.canvas.create_line(self.to_screen(*sm[i]), self.to_screen(*sm[i + 1]), fill="#FF3366", width=8)
 
+        area_ha = 0.0
+        try:
+            u_area = self.field_union_polygon()
+            if u_area is not None and not u_area.is_empty:
+                area_ha = float(u_area.area) / 10000.0
+        except Exception:
+            area_ha = 0.0
+
         for vx, vy in self.get_valves():
             sx, sy = self.to_screen(vx, vy)
             node_r = max(3, min(8, int(5 * self.zoom)))
@@ -15335,9 +16950,11 @@ class DripCAD:
                 spec = v_res.get("valve_h_max_m_spec")
                 if spec is not None:
                     try:
-                        txt += f"\nH макс (задано): {float(spec):.1f} м"
+                        txt += f"\nHвст.: {float(spec):.1f} м"
                     except (TypeError, ValueError):
                         pass
+                if area_ha > 1e-9:
+                    txt += f"\nS: {area_ha:.2f} га"
                 if v_res.get("exceeds_valve_h_max"):
                     txt += "\n⚠ понад норму"
                 fg = "#FF8888" if v_res.get("exceeds_valve_h_max") else "#FFD700"
@@ -15361,7 +16978,11 @@ class DripCAD:
                 self.canvas.create_polygon(scr + [scr[0]], fill="", outline="#888844", dash=(4,6), width=2)
                 self.canvas.create_text(scr[0][0], scr[0][1]-15, text="Межа SRTM", fill="#888844", font=("Arial", 9, "bold"), anchor=tk.W)
 
-        if bool(self.var_show_press_zone_outlines_on_map.get()) and not skip_heavy_canvas_layers:
+        if (
+            bool(self.var_show_press_zone_outlines_on_map.get())
+            and bool(getattr(self, "_emit_flow_draw_on_canvas", False))
+            and not skip_heavy_canvas_layers
+        ):
             try:
                 bun = self._bad_pressure_emitter_details_active_block()
                 if bun["band_on"] and bun["has_calc"]:
