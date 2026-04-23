@@ -90,7 +90,7 @@ _MODES_AUTO_EXIT_SELECT_TOOL = frozenset(
         "INFO",
     }
 )
-_TRUNK_NODE_SNAP_CANVAS_M = 16.0
+_TRUNK_NODE_SNAP_CANVAS_M = 3.67
 _TRUNK_CANVAS_PATH_COLOR = "#8E24AA"
 # Інфо: шлях до насоса / шлях до споживачів від розгалуження
 _TRUNK_INFO_COLOR_PUMP_PATH = "#FFEB3B"
@@ -99,7 +99,7 @@ _TRUNK_INFO_COLOR_TO_CONSUMERS = "#ADFF2F"
 _PICK_TRUNK_NODE_R_M = 26.0
 _PICK_TRUNK_LINE_R_M = 16.0
 _PICK_SUBMAIN_R_M = 14.0
-_PICK_FIELD_VALVE_R_M = 22.0
+_PICK_FIELD_VALVE_R_M = 16.5
 _PICK_LAT_SCENE_R_M = 12.0
 # Магістраль на полотні: кореневий тег + шари для BOM / косметики (підписи).
 _TRUNK_MAP_TAG_ROOT = "trunk_map_canvas"
@@ -862,53 +862,8 @@ class DripCAD:
             self.mode.set("VIEW")
 
     def _draw_trunk_drag_edge_length_hints(self) -> None:
-        """Під час перетягування вузла — довжина (м) над пов'язаними ребрами (екран: трохи вище середини полілінії)."""
-        di = getattr(self, "_trunk_node_drag_idx", None)
-        if di is None:
-            return
-        try:
-            di_i = int(di)
-        except (TypeError, ValueError):
-            return
-        for seg in getattr(self, "trunk_map_segments", []) or []:
-            if not isinstance(seg, dict):
-                continue
-            ni = seg.get("node_indices")
-            if not isinstance(ni, list):
-                continue
-            idxs: List[int] = []
-            for x in ni:
-                try:
-                    idxs.append(int(x))
-                except (TypeError, ValueError):
-                    idxs = []
-                    break
-            if di_i not in idxs:
-                continue
-            pl = self._trunk_segment_world_path(seg)
-            if len(pl) < 2:
-                continue
-            lm = self._polyline_length_m(pl)
-            if lm <= 1e-6:
-                continue
-            try:
-                mx, my = self._polyline_point_at_dist(pl, lm * 0.5)
-            except ValueError:
-                continue
-            try:
-                sx, sy = self.to_screen(float(mx), float(my))
-            except Exception:
-                continue
-            txt = f"{lm:.1f} м"
-            self.canvas.create_text(
-                sx,
-                sy - 18,
-                text=txt,
-                fill="#FFF59D",
-                font=("Segoe UI", 9, "bold"),
-                anchor=tk.S,
-                tags=_TRUNK_MAP_TAGS_COSMETIC,
-            )
+        """Службові підписи довжин під час drag вузла вимкнені (не показуємо проміжні числа в UI)."""
+        return
 
     def _trunk_node_drag_apply_world(self, node_index: int, wx: float, wy: float) -> None:
         """Перемістити вузол у світових XY (м) і оновити lat/lon; path_local сегментів — за node_indices."""
@@ -1202,6 +1157,38 @@ class DripCAD:
                 if isinstance(ids, list):
                     g["node_ids"] = [x for x in ids if str(x).strip() not in rid]
 
+    def _pipe_abbr_from_material(self, mat: str) -> str:
+        m = str(mat or "").strip()
+        db = getattr(self, "pipe_db", None) or {}
+        pns = db.get(m)
+        if isinstance(pns, dict):
+            for _pn, ods in pns.items():
+                if not isinstance(ods, dict):
+                    continue
+                for _od, row in ods.items():
+                    if isinstance(row, dict):
+                        abbr = str(row.get("ABBR", "")).strip()
+                        if abbr:
+                            return abbr
+        up = m.upper()
+        if up == "PVC":
+            return "ПВХ"
+        if up == "PE":
+            return "ПЕ"
+        if up == "LAYFLAT":
+            return "ЛФ"
+        return m
+
+    def _format_pipe_signature(self, mat: str, pn: str, od: str, length_m: Optional[float]) -> str:
+        abbr = self._pipe_abbr_from_material(mat)
+        pn_s = str(pn or "").strip() or "?"
+        od_s = str(od or "").strip() or "?"
+        try:
+            lm = float(length_m if length_m is not None else 0.0)
+        except (TypeError, ValueError):
+            lm = 0.0
+        return f"{abbr} Ø{od_s}/{pn_s} {lm:.1f}м"
+
     def _pipe_db_closest_catalog_label(self, d_tgt: float) -> Optional[Tuple[float, str]]:
         """(відхилення dᵥ, підпис) з повного каталогу pipe_db."""
         db = getattr(self, "pipe_db", None) or {}
@@ -1228,10 +1215,14 @@ class DripCAD:
                         dn = int(float(d_nom))
                     except (TypeError, ValueError):
                         dn = str(d_nom).strip()
+                    try:
+                        ln = float(pipe_data.get("length", 0.0)) if isinstance(pipe_data, dict) else 0.0
+                    except (TypeError, ValueError):
+                        ln = 0.0
                     diff = abs(inner - d_tgt)
                     if diff < best_d:
                         best_d = diff
-                        best_lab = f"{mat} PN{pn} Ø{dn}"
+                        best_lab = self._format_pipe_signature(str(mat), str(pn), str(dn), ln)
         if best_lab is None:
             return None
         return (best_d, best_lab)
@@ -1255,17 +1246,27 @@ class DripCAD:
             diff = abs(float(c["inner"]) - d_tgt)
             if diff < best_d:
                 best_d = diff
-                best_lab = f"{c['mat']} PN{c['pn']} Ø{c['d']}"
+                mat_s = str(c.get("mat", ""))
+                pn_s = str(c.get("pn", ""))
+                od_s = str(c.get("d", ""))
+                ln = 0.0
+                try:
+                    db_row = (((db.get(mat_s) or {}).get(pn_s) or {}).get(od_s))
+                    if isinstance(db_row, dict):
+                        ln = float(db_row.get("length", 0.0) or 0.0)
+                except (TypeError, ValueError):
+                    ln = 0.0
+                best_lab = self._format_pipe_signature(mat_s, pn_s, od_s, ln)
         if best_lab is not None and best_d <= 1.5:
             return best_lab
         full = self._pipe_db_closest_catalog_label(d_tgt)
         if full is not None and full[0] <= 2.5:
             return full[1]
         if best_lab is not None:
-            return f"{best_lab} · dᵥ≈{d_tgt:.0f} мм"
+            return best_lab
         if full is not None:
-            return f"{full[1]} · dᵥ≈{d_tgt:.0f} мм"
-        return f"dᵥ≈{d_tgt:.0f} мм (немає в каталозі)"
+            return full[1]
+        return "труба —"
 
     def trunk_pipe_label_for_segment(self, seg: dict) -> str:
         if not isinstance(seg, dict):
@@ -1290,14 +1291,23 @@ class DripCAD:
                         except (TypeError, ValueError):
                             pass
         if m and p and len(dns) >= 1:
-            return f"{m} PN{p} Ø{'→'.join(dns)}"
+            od_show = dns[0]
+            try:
+                length_m = float(seg.get("length_m", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                length_m = 0.0
+            return self._format_pipe_signature(m, p, od_show, length_m)
         o = str(seg.get("pipe_od", "")).strip()
         if m and p and o:
             try:
                 o_show = str(int(float(str(o).replace(",", "."))))
             except (TypeError, ValueError):
                 o_show = o
-            return f"{m} PN{p} Ø{o_show}"
+            try:
+                length_m = float(seg.get("length_m", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                length_m = 0.0
+            return self._format_pipe_signature(m, p, o_show, length_m)
         try:
             dmm = float(seg.get("d_inner_mm", 90.0) or 90.0)
         except (TypeError, ValueError):
@@ -1393,14 +1403,15 @@ class DripCAD:
                 continue
             oc = row.get("objective_cost", None)
             od_s = self._trunk_pipe_row_outer_d_mm_str(row, seg, float(sd))
-            od_show = od_s if (od_s and od_s != "—") else f"{sd:.0f}"
-            if oc is not None:
-                try:
-                    sec_parts.append(f"{sl:.1f}м/Ø{od_show}/C{float(oc):.1f}")
-                except (TypeError, ValueError):
-                    sec_parts.append(f"{sl:.1f}м/Ø{od_show}")
-            else:
-                sec_parts.append(f"{sl:.1f}м/Ø{od_show}")
+            od_show = od_s if (od_s and od_s != "—") else "?"
+            sec_parts.append(
+                self._format_pipe_signature(
+                    row.get("material", seg.get("pipe_material", "")),
+                    row.get("pn", seg.get("pipe_pn", "")),
+                    od_show,
+                    sl,
+                )
+            )
         if not sec_parts:
             return base
         return f"{base} · секції: " + ", ".join(sec_parts[:4])
@@ -1543,7 +1554,7 @@ class DripCAD:
             if sl <= 1e-9 or sd <= 1e-9:
                 continue
             od_s = self._trunk_pipe_row_outer_d_mm_str(row, seg, float(sd))
-            od_show = od_s if (od_s and od_s != "—") else f"{sd:.0f}"
+            od_show = od_s if (od_s and od_s != "—") else "?"
             parts.append(f"{sl:.0f}м×Ø{od_show}")
         if len(parts) < 2:
             return ""
@@ -1573,14 +1584,9 @@ class DripCAD:
             od_s = self._trunk_pipe_row_outer_d_mm_str(sec, {}, float(din))
             if od_s and od_s != "—":
                 d_txt = od_s
-            elif din > 1e-6:
-                if abs(din - round(din)) < 0.01:
-                    d_txt = str(int(round(din)))
-                else:
-                    d_txt = f"{din:.2f}".rstrip("0").rstrip(".")
             else:
-                return ""
-        return f"{mat} Ø{d_txt}/{pn} L={lm:.1f}m"
+                d_txt = "?"
+        return self._format_pipe_signature(mat, pn, d_txt, lm)
 
     @staticmethod
     def _trunk_telescope_label_pos_key(seg_idx: int, chunk_idx: int) -> str:
@@ -2439,7 +2445,7 @@ class DripCAD:
             return out
 
         if isinstance(ni, list) and len(ni) == 2:
-            path: list = []
+            chord: list = []
             for ii in ni:
                 try:
                     idx = int(ii)
@@ -2448,10 +2454,33 @@ class DripCAD:
                 if not (0 <= idx < len(nodes)):
                     return []
                 try:
-                    path.append((float(nodes[idx]["x"]), float(nodes[idx]["y"])))
+                    chord.append((float(nodes[idx]["x"]), float(nodes[idx]["y"])))
                 except (KeyError, TypeError, ValueError):
                     return []
-            return path if len(path) == 2 else []
+            if len(chord) != 2:
+                return []
+            pl2 = _parse_pl(seg.get("path_local") or [])
+            if len(pl2) < 2:
+                return chord
+            a, b = chord[0], chord[1]
+
+            def _dxy(p, q):
+                return math.hypot(float(p[0]) - float(q[0]), float(p[1]) - float(q[1]))
+
+            fwd_ep = _dxy(pl2[0], a) + _dxy(pl2[-1], b)
+            rev_ep = _dxy(pl2[0], b) + _dxy(pl2[-1], a)
+            if rev_ep + 1e-6 < fwd_ep:
+                pl2 = list(reversed(pl2))
+            ep_tol = 0.75
+            if _dxy(pl2[0], a) > ep_tol or _dxy(pl2[-1], b) > ep_tol:
+                return chord
+            chord_len = self._polyline_length_m(chord)
+            plen = self._polyline_length_m(pl2)
+            if len(pl2) >= 3:
+                return pl2
+            if plen > max(chord_len * 1.02, chord_len + 0.5):
+                return pl2
+            return chord
 
         path = []
         if isinstance(ni, list) and len(ni) > 2:
@@ -3056,10 +3085,15 @@ class DripCAD:
         return None
 
     def _open_trunk_graph_context_menu(
-        self, wx: float, wy: float, *, menu_anchor: Optional[Tuple[int, int]] = None
+        self,
+        wx: float,
+        wy: float,
+        *,
+        menu_anchor: Optional[Tuple[int, int]] = None,
+        target: Optional[Tuple[str, object, str]] = None,
     ) -> bool:
         """ПКМ по вузлу або ребру магістралі: дії + видалення (режими VIEW/PAN або «Вибір»)."""
-        target = self._trunk_context_target_from_selection_or_pick(wx, wy)
+        target = target or self._trunk_context_target_from_selection_or_pick(wx, wy)
         if target is None:
             return False
         cat, payload, label = target
@@ -3129,6 +3163,98 @@ class DripCAD:
                 px = int(self.root.winfo_pointerx())
                 py = int(self.root.winfo_pointery())
             m.tk_popup(px, py)
+        finally:
+            try:
+                m.grab_release()
+            except Exception:
+                pass
+        return True
+
+    def _open_context_menu_for_pick_target(
+        self,
+        wx: float,
+        wy: float,
+        *,
+        cat: str,
+        payload: object,
+        label: str,
+        menu_anchor: Optional[Tuple[int, int]] = None,
+    ) -> bool:
+        c = str(cat).strip().lower()
+        if c in ("trunk_node", "trunk_seg"):
+            return self._open_trunk_graph_context_menu(
+                float(wx),
+                float(wy),
+                menu_anchor=menu_anchor,
+                target=(c, payload, str(label)),
+            )
+        if c == "block":
+            try:
+                bi = int(payload)
+            except (TypeError, ValueError):
+                return False
+            return self._open_block_context_menu(float(wx), float(wy), menu_anchor=menu_anchor, block_idx=bi)
+        return False
+
+    def _open_context_menu_for_world_pick(
+        self, wx: float, wy: float, *, menu_anchor: Optional[Tuple[int, int]] = None
+    ) -> bool:
+        """ПКМ по об'єкту під курсором; при кількох попаданнях дає вибір конкретного об'єкта."""
+        hits = self._collect_world_pick_hits(float(wx), float(wy))
+        if not hits:
+            return False
+        candidates: List[Tuple[int, float, str, object, str]] = []
+        seen: set[Tuple[str, str]] = set()
+        for pri, dist, cat, payload, label in hits:
+            c = str(cat).strip().lower()
+            if c not in ("trunk_node", "trunk_seg", "block"):
+                continue
+            key = (c, str(payload))
+            if key in seen:
+                continue
+            seen.add(key)
+            candidates.append((int(pri), float(dist), c, payload, str(label)))
+        if not candidates:
+            return False
+        if len(candidates) == 1:
+            _pri, _dist, c, payload, label = candidates[0]
+            return self._open_context_menu_for_pick_target(
+                float(wx),
+                float(wy),
+                cat=c,
+                payload=payload,
+                label=label,
+                menu_anchor=menu_anchor,
+            )
+
+        mx = int(menu_anchor[0]) if menu_anchor else int(self.root.winfo_pointerx())
+        my = int(menu_anchor[1]) if menu_anchor else int(self.root.winfo_pointery())
+        m = tk.Menu(self.root, tearoff=0)
+        m.add_command(label="Оберіть об'єкт під курсором:", state=tk.DISABLED)
+        m.add_separator()
+        for _pri, dist, c, payload, label in candidates[:16]:
+            if c == "trunk_node":
+                prefix = "Вузол"
+            elif c == "trunk_seg":
+                prefix = "Ребро"
+            else:
+                prefix = "Блок"
+            m.add_command(
+                label=f"{prefix}: {label}  (d≈{dist:.1f} м)",
+                command=lambda cc=c, pp=payload, ll=label: self._open_context_menu_for_pick_target(
+                    float(wx),
+                    float(wy),
+                    cat=cc,
+                    payload=pp,
+                    label=ll,
+                    menu_anchor=menu_anchor,
+                ),
+            )
+        if len(candidates) > 16:
+            m.add_separator()
+            m.add_command(label=f"… ще {len(candidates) - 16} об'єкт(ів)", state=tk.DISABLED)
+        try:
+            m.tk_popup(mx, my)
         finally:
             try:
                 m.grab_release()
@@ -7392,6 +7518,102 @@ class DripCAD:
         txtw.config(state=tk.DISABLED)
         # Важливо: не тригерити перемальовку прев'ю з цього апдейту,
         # бо ця функція може викликатись у загальному циклі redraw().
+        try:
+            self.refresh_block_lateral_flow_audit_panel()
+        except Exception:
+            pass
+
+    def refresh_block_lateral_flow_audit_panel(self):
+        """Вкладка «Блок»: мін./макс. вилив по латералях активного блоку vs Q ном ±5 %."""
+        cp = getattr(self, "control_panel", None)
+        txtw = getattr(cp, "txt_block_flow_audit", None) if cp is not None else None
+
+        def _fit_txt_height():
+            if txtw is None:
+                return
+            try:
+                n_lines = int(float(txtw.index("end-1c").split(".")[0]))
+            except Exception:
+                n_lines = 8
+            target = max(7, min(18, n_lines + 1))
+            try:
+                txtw.config(height=target)
+            except tk.TclError:
+                pass
+
+        if txtw is None:
+            return
+        try:
+            txtw.config(state=tk.NORMAL)
+            txtw.delete("1.0", tk.END)
+        except tk.TclError:
+            return
+        if not self.field_blocks:
+            txtw.insert(tk.END, "Немає блоків поля.")
+            _fit_txt_height()
+            txtw.config(state=tk.DISABLED)
+            return
+        bi = self._safe_active_block_idx()
+        lo, hi = self._lat_index_range_for_block(bi)
+        has_calc = bool(self.calc_results.get("sections") or self.calc_results.get("emitters"))
+        if not has_calc:
+            txtw.insert(
+                tk.END,
+                "Ще немає гідравлічного розрахунку — аудит виливу з’явиться після «Розрахунок».",
+            )
+            _fit_txt_height()
+            txtw.config(state=tk.DISABLED)
+            return
+        lfa = self.calc_results.get("lateral_flow_audit") or {}
+        if not lfa:
+            txtw.insert(
+                tk.END,
+                "Немає поля lateral_flow_audit (перезапустіть «Розрахунок» після оновлення).",
+            )
+            _fit_txt_height()
+            txtw.config(state=tk.DISABLED)
+            return
+        hdr = f"Активний блок {bi + 1} · порівняння з Q ном ±5 %\n\n"
+        lines = [hdr]
+        st_ua = {
+            "ok_q": "OK",
+            "overflow_q": "Перелив виливу",
+            "underflow_q": "Недолив виливу",
+            "both_q": "Перелив і недолив",
+            "no_emitters": "Немає крапельниць",
+        }
+        any_row = False
+        for j in range(lo, hi):
+            rec = lfa.get(f"lat_{j}")
+            if not isinstance(rec, dict):
+                continue
+            any_row = True
+            st = str(rec.get("status") or "")
+            qn = rec.get("q_nom")
+            qmin = rec.get("q_min")
+            qmax = rec.get("q_max")
+            if qmin is None or qmax is None:
+                lines.append(f"Лат. {j + 1}: {st_ua.get(st, st)} (Q ном={qn})\n")
+                continue
+            lo_b = float(qn) * 0.95 if qn is not None else 0.0
+            hi_b = float(qn) * 1.05 if qn is not None else 0.0
+            mn = rec.get("min_emitter") or {}
+            mx = rec.get("max_emitter") or {}
+            lines.append(
+                f"Лат. {j + 1}: Q∈[{float(qmin):.3f} … {float(qmax):.3f}] л/г, "
+                f"номінал {float(qn):.3f} л/г (допуск [{lo_b:.3f} … {hi_b:.3f}]) — {st_ua.get(st, st)}\n"
+                f"  мін: {mn.get('wing', '?')} x={mn.get('x_m', '?')} м, Q={mn.get('q_lph', '?')} л/г\n"
+                f"  макс: {mx.get('wing', '?')} x={mx.get('x_m', '?')} м, Q={mx.get('q_lph', '?')} л/г\n"
+            )
+        if not any_row:
+            lines.append("У цьому блоці немає латералів у глобальному списку.")
+        txtw.insert(tk.END, "".join(lines))
+        try:
+            txtw.see("1.0")
+        except tk.TclError:
+            pass
+        _fit_txt_height()
+        txtw.config(state=tk.DISABLED)
 
     @staticmethod
     def _decimate_closed_ring_xy(
@@ -8500,6 +8722,113 @@ class DripCAD:
                 return i
         return None
 
+    def _pick_block_for_context_menu(self, wx: float, wy: float) -> Optional[int]:
+        """
+        Блок для ПКМ-меню: пріоритет попадання у площу полігона (без «влучання» у межу),
+        з невеликим buffer-допуском; при кількох кандидатах — найменший за площею.
+        """
+        if not self.field_blocks:
+            return None
+        p = Point(float(wx), float(wy))
+        tol = max(10.0 / max(float(self.zoom), 0.01), 0.35)
+        candidates: List[Tuple[float, int]] = []
+        for bi, b in enumerate(self.field_blocks):
+            poly = self._block_poly(b)
+            if poly.is_empty:
+                continue
+            try:
+                hit_inside = poly.contains(p)
+                hit_near_inside = (not hit_inside) and poly.buffer(tol).contains(p)
+                if hit_inside or hit_near_inside:
+                    area = float(abs(poly.area)) if not poly.is_empty else 1e18
+                    candidates.append((area if area > 1e-9 else 1e18, int(bi)))
+            except Exception:
+                continue
+        if candidates:
+            candidates.sort(key=lambda t: (t[0], t[1]))
+            return int(candidates[0][1])
+        return self._find_block_containing(wx, wy, boundary_tol=tol)
+
+    def _open_block_context_menu(
+        self,
+        wx: float,
+        wy: float,
+        *,
+        menu_anchor: Optional[Tuple[int, int]] = None,
+        block_idx: Optional[int] = None,
+    ) -> bool:
+        """ПКМ-меню блоку поля у VIEW/PAN: по площі блоку, не лише по межі."""
+        if block_idx is None:
+            bi = self._pick_block_for_context_menu(float(wx), float(wy))
+        else:
+            try:
+                bi = int(block_idx)
+            except (TypeError, ValueError):
+                bi = None
+        if bi is None or bi < 0 or bi >= len(self.field_blocks):
+            return False
+        mx = int(menu_anchor[0]) if menu_anchor else int(self.root.winfo_pointerx())
+        my = int(menu_anchor[1]) if menu_anchor else int(self.root.winfo_pointery())
+
+        def _set_active_block() -> None:
+            self.var_active_block_idx.set(int(bi))
+            self._refresh_active_block_combo()
+            try:
+                self.cb_active_block.set(f"Блок {int(bi) + 1}")
+            except Exception:
+                pass
+            self._on_active_block_combo()
+
+        def _regenerate_block() -> None:
+            _set_active_block()
+            ok = self._regenerate_block_grid(int(bi), redraw=False)
+            if not ok:
+                silent_showwarning(self.root, "Блок", "Не вдалося оновити сітку для цього блоку.")
+                return
+            self._strip_hydro_for_block_keep_others(int(bi))
+            self.redraw()
+
+        def _clear_block_hydro() -> None:
+            self._strip_hydro_for_block_keep_others(int(bi))
+            self.redraw()
+
+        def _delete_block() -> None:
+            ans = silent_askyesno(
+                self.root,
+                "Видалення блоку",
+                f"Видалити блок {int(bi) + 1} разом із його сабмейнами та латералями?",
+            )
+            if not ans:
+                return
+            nblk = len(self.field_blocks)
+            if nblk <= 1 or int(bi) == nblk - 1:
+                self._strip_hydro_for_block_keep_others(int(bi))
+            else:
+                self.reset_calc()
+            self.field_blocks.pop(int(bi))
+            self._refresh_active_block_combo()
+            self.redraw()
+
+        m = tk.Menu(self.root, tearoff=0)
+        m.add_command(
+            label=f"Властивості блоку {bi + 1}…",
+            command=lambda b=bi: self.open_block_irrigation_scheme_dialog(int(b)),
+        )
+        m.add_separator()
+        m.add_command(label=f"Зробити активним блок {bi + 1}", command=_set_active_block)
+        m.add_command(label="Оновити сітку блоку", command=_regenerate_block)
+        m.add_command(label="Очистити гідравліку блоку", command=_clear_block_hydro)
+        m.add_separator()
+        m.add_command(label=f"Видалити блок {bi + 1}…", command=_delete_block)
+        try:
+            m.tk_popup(mx, my)
+        finally:
+            try:
+                m.grab_release()
+            except Exception:
+                pass
+        return True
+
     def _erase_laterals_intersecting_line(self, cutter: LineString):
         """Видалити всі авто/ручні латералі, що перетинають відрізок."""
         self.reset_calc()
@@ -8819,16 +9148,25 @@ class DripCAD:
         for j in range(lo, hi):
             lpa.pop(f"lat_{j}", None)
         cr["lateral_pressure_audit"] = lpa
+        lfa = dict(cr.get("lateral_flow_audit") or {})
+        for j in range(lo, hi):
+            lfa.pop(f"lat_{j}", None)
+        cr["lateral_flow_audit"] = lfa
         bae = dict(cr.get("block_avg_emit_lph") or {})
         bae.pop(str(bi), None)
         cr["block_avg_emit_lph"] = bae
         bu = dict(cr.get("block_emitter_uniformity") or {})
         bu.pop(str(bi), None)
         cr["block_emitter_uniformity"] = bu
+        bee = dict(cr.get("block_equivalent_emitter") or {})
+        bee.pop(str(bi), None)
+        cr["block_equivalent_emitter"] = bee
         cr.pop("lateral_emitter_uniformity", None)
         cr["section_label_pos"] = {}
 
-    def _remap_partial_hydro_results(self, partial: dict, orig_sm_indices: list, lat_lo: int) -> dict:
+    def _remap_partial_hydro_results(
+        self, partial: dict, orig_sm_indices: list, lat_lo: int, orig_block_idx: int = -1
+    ) -> dict:
         out = copy.deepcopy(partial)
         sm_map = {j: orig_sm_indices[j] for j in range(len(orig_sm_indices))}
         for s in out.get("sections") or []:
@@ -8878,12 +9216,49 @@ class DripCAD:
             else:
                 la[k] = v
         out["lateral_pressure_audit"] = la
+        lf = {}
+        for k, v in (out.get("lateral_flow_audit") or {}).items():
+            if k.startswith("lat_"):
+                try:
+                    j = int(k.split("_", 1)[1])
+                except (IndexError, ValueError):
+                    lf[k] = v
+                    continue
+                nk = f"lat_{lat_lo + j}"
+                lf[nk] = copy.deepcopy(v) if isinstance(v, dict) else v
+            else:
+                lf[k] = v
+        out["lateral_flow_audit"] = lf
+        if int(orig_block_idx) >= 0:
+            for key in ("block_avg_emit_lph", "block_emitter_uniformity", "block_equivalent_emitter"):
+                src = dict(out.get(key) or {})
+                if not src:
+                    continue
+                rem = {}
+                for _k, _v in src.items():
+                    try:
+                        k_i = int(_k)
+                    except (TypeError, ValueError):
+                        rem[_k] = _v
+                        continue
+                    if k_i == 0:
+                        rem[str(int(orig_block_idx))] = _v
+                    else:
+                        rem[str(k_i)] = _v
+                out[key] = rem
         return out
 
     def _merge_hydro_slice_into_state(self, remapped: dict) -> None:
         cr = self.calc_results
         cr["sections"] = list(cr.get("sections") or []) + list(remapped.get("sections") or [])
-        for key in ("emitters", "valves", "submain_profiles", "submain_math_zones", "lateral_pressure_audit"):
+        for key in (
+            "emitters",
+            "valves",
+            "submain_profiles",
+            "submain_math_zones",
+            "lateral_pressure_audit",
+            "lateral_flow_audit",
+        ):
             base = dict(cr.get(key) or {})
             base.update(remapped.get(key) or {})
             cr[key] = base
@@ -8893,6 +9268,9 @@ class DripCAD:
         bu = dict(cr.get("block_emitter_uniformity") or {})
         bu.update(remapped.get("block_emitter_uniformity") or {})
         cr["block_emitter_uniformity"] = bu
+        bee = dict(cr.get("block_equivalent_emitter") or {})
+        bee.update(remapped.get("block_equivalent_emitter") or {})
+        cr["block_equivalent_emitter"] = bee
         if "lateral_emitter_uniformity" in remapped:
             cr["lateral_emitter_uniformity"] = remapped["lateral_emitter_uniformity"]
         for key in ("valve_h_max_m_spec", "valve_pressure_within_spec", "lateral_solver_stats"):
@@ -8930,9 +9308,19 @@ class DripCAD:
         self.calc_results["emitters"] = em
         self.calc_results["section_label_pos"] = {}
         self.calc_results["submain_profiles"] = {}
+        lpa = dict(self.calc_results.get("lateral_pressure_audit") or {})
+        lfa = dict(self.calc_results.get("lateral_flow_audit") or {})
+        for j in range(lo, hi):
+            lpa.pop(f"lat_{j}", None)
+            lfa.pop(f"lat_{j}", None)
+        self.calc_results["lateral_pressure_audit"] = lpa
+        self.calc_results["lateral_flow_audit"] = lfa
         bu = dict(self.calc_results.get("block_emitter_uniformity") or {})
         bu.pop(str(bi), None)
         self.calc_results["block_emitter_uniformity"] = bu
+        bee = dict(self.calc_results.get("block_equivalent_emitter") or {})
+        bee.pop(str(bi), None)
+        self.calc_results["block_equivalent_emitter"] = bee
         self.calc_results.pop("lateral_emitter_uniformity", None)
         self.redraw()
 
@@ -11157,8 +11545,8 @@ class DripCAD:
         )
 
     def _trunk_snap_radius_m(self) -> float:
-        """Радіус прив’язки до вузла магістралі: не менше фіксованого м і ~14 px на екрані (легше клацати ребро)."""
-        return max(_TRUNK_NODE_SNAP_CANVAS_M, self._world_m_from_screen_px(14.0))
+        """Жорсткий радіус прив’язки до вузла магістралі у world-метрах (без залежності від zoom)."""
+        return float(_TRUNK_NODE_SNAP_CANVAS_M)
 
     def _pick_tolerance_m(self, min_m: float, px: float = 22.0) -> float:
         """Поріг попадання в об’єкт при підборі: мінімум у метрах або ~px пікселів на полотні."""
@@ -14185,7 +14573,6 @@ class DripCAD:
                 continue
             seg_d = seg if isinstance(seg, dict) else {}
             chunks = self._trunk_segment_telescope_path_chunks(seg_d, pl)
-            n_chunk_labels = sum(1 for _pl, sec in chunks if isinstance(sec, dict))
             vw = self.trunk_display_velocity_warn_mps_effective()
             vm = self.trunk_segment_velocity_mps_from_hydro_cache(si)
             warn_vel = vw > 1e-9 and vm is not None and vm + 1e-9 >= vw
@@ -14227,31 +14614,10 @@ class DripCAD:
             except (TypeError, ValueError, IndexError):
                 pass
             else:
-                seg_d = seg if isinstance(seg, dict) else {}
-                cap = self.trunk_pipe_label_for_segment(seg_d)
-                if len(cap) > 28:
-                    cap = cap[:25] + "…"
-                self.canvas.create_text(
-                    sx + 8,
-                    sy - 12,
-                    text=cap,
-                    anchor=tk.W,
-                    fill="#E1BEE7",
-                    font=("Segoe UI", 8, "bold"),
-                    tags=_TRUNK_MAP_TAGS_COSMETIC,
-                )
-                tele = self._trunk_telescope_short_label(seg_d)
-                if tele and n_chunk_labels < 2:
-                    t2 = tele if len(tele) <= 42 else tele[:39] + "…"
-                    self.canvas.create_text(
-                        sx + 8,
-                        sy + 2,
-                        text=t2,
-                        anchor=tk.W,
-                        fill="#CE93D8",
-                        font=("Segoe UI", 7, "bold"),
-                        tags=_TRUNK_MAP_TAGS_COSMETIC,
-                    )
+                # Тут свідомо не малюємо дрібні службові підписи сегмента.
+                # Після оптимізації лишаємо лише фінальні телескоп-підписи
+                # секцій (малюються в _draw_trunk_telescope_chunk_label).
+                pass
         self._draw_trunk_drag_edge_length_hints()
         nodes = list(getattr(self, "trunk_map_nodes", []) or [])
         g = 11.0
@@ -14416,6 +14782,7 @@ class DripCAD:
                     tags=_TRUNK_MAP_TAGS_COSMETIC,
                 )
         self._draw_consumer_valve_snap_zones_on_canvas()
+        self._draw_trunk_node_snap_radius_hint_on_canvas()
         self._draw_trunk_irrigation_pump_label_canvas()
         try:
             if self.canvas.find_withtag(_TRUNK_MAP_TAG_BOM):
@@ -14458,6 +14825,50 @@ class DripCAD:
                 fill="",
                 tags=_TRUNK_MAP_TAGS_COSMETIC,
             )
+
+    def _draw_trunk_node_snap_radius_hint_on_canvas(self) -> None:
+        """Показати радіус snap вузла магістралі, коли курсор наближається до вузла."""
+        ptr = getattr(self, "_last_mouse_world", None)
+        if not isinstance(ptr, tuple) or len(ptr) < 2:
+            return
+        try:
+            wx, wy = float(ptr[0]), float(ptr[1])
+        except (TypeError, ValueError):
+            return
+        ni, _dist = self._nearest_trunk_node_index_world(wx, wy)
+        if ni is None:
+            return
+        nodes = list(getattr(self, "trunk_map_nodes", []) or [])
+        if not (0 <= int(ni) < len(nodes)):
+            return
+        node = nodes[int(ni)]
+        try:
+            nx, ny = float(node.get("x")), float(node.get("y"))
+        except (TypeError, ValueError):
+            return
+        try:
+            r_m = float(self._trunk_snap_radius_m())
+        except Exception:
+            return
+        if r_m <= 1e-9:
+            return
+        try:
+            zf = float(self.zoom)
+        except (TypeError, ValueError):
+            zf = 1.0
+        rad_px = max(4.0, r_m * max(zf, 0.01))
+        sx, sy = self.to_screen(nx, ny)
+        self.canvas.create_oval(
+            sx - rad_px,
+            sy - rad_px,
+            sx + rad_px,
+            sy + rad_px,
+            outline="#00E5FF",
+            dash=(4, 3),
+            width=2,
+            fill="",
+            tags=_TRUNK_MAP_TAGS_COSMETIC,
+        )
 
     def _draw_canvas_polyline_and_route_drafts(self) -> None:
         ct = getattr(self, "_canvas_special_tool", None)
@@ -15027,9 +15438,8 @@ class DripCAD:
                 return
         ct = getattr(self, "_canvas_special_tool", None)
         if ct == "select":
-            if self._trunk_interaction_priority_active():
-                if self._open_trunk_graph_context_menu(wx, wy, menu_anchor=menu_anchor):
-                    return
+            if self._open_context_menu_for_world_pick(wx, wy, menu_anchor=menu_anchor):
+                return
             keys = list(getattr(self, "_canvas_selection_keys", []) or [])
             if keys:
                 block_indices = sorted(
@@ -15143,8 +15553,8 @@ class DripCAD:
             return
 
         m = self.mode.get()
-        if m in ("VIEW", "PAN") and ct is None and self._trunk_interaction_priority_active():
-            if self._open_trunk_graph_context_menu(wx, wy, menu_anchor=menu_anchor):
+        if m in ("VIEW", "PAN") and ct is None:
+            if self._open_context_menu_for_world_pick(wx, wy, menu_anchor=menu_anchor):
                 return
 
         if m == "TOPO":
@@ -15735,7 +16145,7 @@ class DripCAD:
         """Якщо поруч кран (початок відрізка сабмейну) — координати крана; інакше (wx, wy) без змін."""
         best: Optional[Tuple[float, float]] = None
         best_d: Optional[float] = None
-        tol = self._pick_tolerance_m(_PICK_FIELD_VALVE_R_M, 22.0)
+        tol = self._consumer_valve_snap_radius_m()
         try:
             for vx, vy in self.get_valves():
                 d = math.hypot(float(wx) - float(vx), float(wy) - float(vy))
@@ -15752,7 +16162,7 @@ class DripCAD:
 
     def _consumer_valve_snap_radius_m(self) -> float:
         """Радіус снапу споживача до крана (м) — збігає з _snap_world_xy_to_nearest_field_valve."""
-        return self._pick_tolerance_m(_PICK_FIELD_VALVE_R_M, 22.0)
+        return float(_PICK_FIELD_VALVE_R_M)
 
     def _consumer_valve_snap_overlay_enabled(self) -> bool:
         """Чи показувати пунктирні зони снапу до кранів на полотні та карті."""
@@ -15768,7 +16178,7 @@ class DripCAD:
             if 0 <= ii < len(nodes):
                 if str(nodes[ii].get("kind", "")).lower() == "consumption":
                     return True
-        return bool(self._trunk_interaction_priority_active())
+        return False
 
     def clear_topo(self):
         self.topo.clear()
@@ -16345,6 +16755,17 @@ class DripCAD:
         def _lat_line_color(li: int, calculated: bool, base_ok: str, base_pre: str) -> str:
             if not calculated:
                 return base_pre
+            faud = (self.calc_results.get("lateral_flow_audit") or {}).get(f"lat_{li}")
+            if faud and faud.get("q_min") is not None:
+                stq = str(faud.get("status") or "")
+                if stq == "overflow_q":
+                    return "#FF4444"
+                if stq == "underflow_q":
+                    return "#CC7722"
+                if stq == "both_q":
+                    return "#FF6600"
+                if stq == "ok_q":
+                    return base_ok
             aud = (self.calc_results.get("lateral_pressure_audit") or {}).get(f"lat_{li}")
             if not aud:
                 return base_ok
@@ -16382,6 +16803,16 @@ class DripCAD:
                     self.canvas.create_line(
                         [self.to_screen(*c) for c in piece.coords],
                         fill=okc,
+                        width=line_width,
+                    )
+                return
+            faud = (self.calc_results.get("lateral_flow_audit") or {}).get(f"lat_{li_use}")
+            if faud and faud.get("q_min") is not None:
+                lc = _lat_line_color(li_use, True, okc, okc)
+                for piece in self._split_lateral_at_block_submains(lat, block):
+                    self.canvas.create_line(
+                        [self.to_screen(*c) for c in piece.coords],
+                        fill=lc,
                         width=line_width,
                     )
                 return
@@ -16882,7 +17313,26 @@ class DripCAD:
                 off_x = 10 * math.cos(angle_rad + math.pi/2)
                 off_y = -10 * math.sin(angle_rad + math.pi/2)
                 sx, sy = self.to_screen(midpt.x, midpt.y)
-                txt = f"{sec['mat']} d{sec['d']}/{sec['pn']} L={sec['L']:.1f}m"
+                try:
+                    L_sec = float(sec.get("L", 0.0) or 0.0)
+                except (TypeError, ValueError):
+                    L_sec = 0.0
+                _dr = sec.get("d")
+                try:
+                    d_f = float(_dr)
+                    od_show = (
+                        str(int(round(d_f)))
+                        if abs(d_f - round(d_f)) < 0.01
+                        else f"{d_f:.2f}".rstrip("0").rstrip(".")
+                    )
+                except (TypeError, ValueError):
+                    od_show = str(_dr).strip() if _dr is not None else "?"
+                txt = self._format_pipe_signature(
+                    str(sec.get("mat", "") or ""),
+                    str(sec.get("pn", "") or ""),
+                    od_show,
+                    L_sec,
+                )
                 is_selected = (
                     self._moving_section_label_key is not None
                     and lk == int(self._moving_section_label_key)
@@ -17373,6 +17823,38 @@ class DripCAD:
         v_lat_model = tk.StringVar(
             value=self._block_param_display_str(block, "lateral_model", self.var_lateral_model, "")
         )
+        eq_rec = (self.calc_results.get("block_equivalent_emitter") or {}).get(str(bi)) or {}
+        try:
+            v_eq_k = tk.StringVar(value=f"{float(eq_rec.get('k_eq_lph_mx')):.8f}")
+        except (TypeError, ValueError):
+            v_eq_k = tk.StringVar(value="—")
+        try:
+            v_eq_x = tk.StringVar(value=f"{float(eq_rec.get('x_exp')):.6f}")
+        except (TypeError, ValueError):
+            v_eq_x = tk.StringVar(value="—")
+        try:
+            v_eq_pref = tk.StringVar(value=f"{float(eq_rec.get('p_ref_m')):.3f}")
+        except (TypeError, ValueError):
+            v_eq_pref = tk.StringVar(value="—")
+        try:
+            _k_eq_num = float(eq_rec.get("k_eq_lph_mx"))
+            _x_eq_num = float(eq_rec.get("x_exp"))
+            _eq_ready = _k_eq_num > 0.0 and _x_eq_num > 1e-12
+        except (TypeError, ValueError):
+            _k_eq_num = 0.0
+            _x_eq_num = 0.0
+            _eq_ready = False
+        try:
+            _h_eval_default = f"{float(eq_rec.get('p_ref_m')):.3f}"
+        except (TypeError, ValueError):
+            _h_eval_default = "10.0"
+        v_eq_h_eval = tk.StringVar(value=_h_eval_default)
+        v_eq_q_eval = tk.StringVar(value="—")
+        v_eq_q_nom_pct = tk.StringVar(value="—")
+        try:
+            _n_emit_eq = int(eq_rec.get("n_emitters") or 0)
+        except (TypeError, ValueError):
+            _n_emit_eq = 0
 
         top = tk.Frame(dlg, bg="#1e1e1e")
         top.pack(fill=tk.BOTH, expand=True, padx=14, pady=12)
@@ -17413,6 +17895,27 @@ class DripCAD:
                 fg="#88DDFF",
                 font=("Segoe UI", 9, "bold"),
             ).pack(anchor=tk.W, pady=(10, 4))
+
+        def _row_readonly(parent, caption: str, value_var: tk.StringVar, hint: str = "") -> None:
+            fr = tk.Frame(parent, bg="#1e1e1e")
+            fr.pack(fill=tk.X, pady=4)
+            tk.Label(fr, text=caption, bg="#1e1e1e", fg="#E0E0E0", font=("Segoe UI", 9)).pack(
+                side=tk.LEFT, anchor=tk.W
+            )
+            lb = tk.Label(
+                fr,
+                textvariable=value_var,
+                bg="#252525",
+                fg="#E8E0D5",
+                width=16,
+                anchor="center",
+                relief="sunken",
+                bd=1,
+                font=("Consolas", 10),
+            )
+            lb.pack(side=tk.RIGHT)
+            if hint:
+                attach_tooltip(lb, hint)
 
         _section_title("Схема поливу (сітка)")
         _row(
@@ -17504,7 +18007,7 @@ class DripCAD:
         lat_fr = tk.Frame(top, bg="#1e1e1e")
         lat_fr.pack(fill=tk.X, pady=4)
         tk.Label(
-            lat_fr, text="Модель труби (довідник):", bg="#1e1e1e", fg="#E0E0E0", font=("Segoe UI", 9)
+            lat_fr, text="Модель латералі (довідник):", bg="#1e1e1e", fg="#E0E0E0", font=("Segoe UI", 9)
         ).pack(side=tk.LEFT)
         cb_lat_m = ttk.Combobox(
             lat_fr,
@@ -17517,6 +18020,91 @@ class DripCAD:
             cb_lat_m,
             "Необов’язково: вибір з бази латералів; можна лише задати Ø вручну вище.",
         )
+
+        _section_title("Еквівалентний емітер (після розрахунку)")
+        _row_readonly(
+            top,
+            "K_eq (для q = K·H^x):",
+            v_eq_k,
+            "Розраховується після гідравліки блоку при фіксованому x моделі емітера.",
+        )
+        _row_readonly(
+            top,
+            "x (ступінь):",
+            v_eq_x,
+            "Показник степеня у формулі q = K·H^x для еквівалентного емітера блоку.",
+        )
+        _row_readonly(
+            top,
+            "P_ref (м):",
+            v_eq_pref,
+            "Опорний напір, відносно якого обчислено K_eq.",
+        )
+        _row(
+            top,
+            "Тиск для оцінки Q_total (м):",
+            v_eq_h_eval,
+            "Змініть H, щоб переглянути прогноз Q_total за еквівалентною моделлю блоку.",
+        )
+        _row_readonly(
+            top,
+            "Q_total @ H (л/г):",
+            v_eq_q_eval,
+            "Оцінка за формулою q = K_eq · H^x для поточного блоку.",
+        )
+        _row_readonly(
+            top,
+            "% до Q_nom блоку:",
+            v_eq_q_nom_pct,
+            "Відхилення оціненого Q_total від номіналу блоку (n_emitters × Q номінал).",
+        )
+
+        def _refresh_eq_eval_fields(*_a):
+            if not _eq_ready:
+                v_eq_q_eval.set("—")
+                v_eq_q_nom_pct.set("—")
+                return
+            try:
+                h_eval = float(str(v_eq_h_eval.get()).replace(",", ".").strip())
+            except (TypeError, ValueError):
+                v_eq_q_eval.set("—")
+                v_eq_q_nom_pct.set("—")
+                return
+            h_eff = max(0.0, h_eval)
+            q_eval = _k_eq_num * (h_eff ** _x_eq_num)
+            v_eq_q_eval.set(f"{q_eval:.4f}")
+            try:
+                q_nom_emit = float(str(v_emit_nominal.get()).replace(",", ".").strip())
+            except (TypeError, ValueError):
+                v_eq_q_nom_pct.set("—")
+                return
+            if _n_emit_eq <= 0 or q_nom_emit <= 1e-12:
+                v_eq_q_nom_pct.set("—")
+                return
+            q_nom_block = float(_n_emit_eq) * q_nom_emit
+            pct = (q_eval / q_nom_block - 1.0) * 100.0
+            v_eq_q_nom_pct.set(f"{pct:+.2f}%")
+
+        v_eq_h_eval.trace_add("write", _refresh_eq_eval_fields)
+        v_emit_nominal.trace_add("write", _refresh_eq_eval_fields)
+        _refresh_eq_eval_fields()
+
+        if not eq_rec:
+            tk.Label(
+                top,
+                text="Дані з’являться після «Розрахунок».",
+                bg="#1e1e1e",
+                fg="#AAAAAA",
+                font=("Segoe UI", 8),
+            ).pack(anchor=tk.W, pady=(0, 2))
+        elif not _eq_ready:
+            tk.Label(
+                top,
+                text="Немає валідних K_eq/x для оцінки Q_total.",
+                bg="#1e1e1e",
+                fg="#AAAAAA",
+                font=("Segoe UI", 8),
+            ).pack(anchor=tk.W, pady=(0, 2))
 
         status = tk.Label(top, text="", bg="#1e1e1e", fg="#FFAB40", font=("Segoe UI", 9))
         status.pack(anchor=tk.W, pady=(10, 0))
@@ -17576,6 +18164,23 @@ class DripCAD:
                     self.var_lat_block_count.set(p["blocks"])
                     self.var_emit_model.set(p["emit_model"])
                     self.var_emit_nominal_flow.set(p["emit_nominal_flow"])
+                    rec_emit = self._dripper_record(p["emit_model"], p["emit_nominal_flow"])
+                    if isinstance(rec_emit, dict):
+                        try:
+                            self.var_emit_k_coeff.set(str(float(rec_emit.get("constant_k"))))
+                        except (TypeError, ValueError):
+                            self.var_emit_k_coeff.set("")
+                        try:
+                            self.var_emit_x_exp.set(str(float(rec_emit.get("exponent_x"))))
+                        except (TypeError, ValueError):
+                            self.var_emit_x_exp.set("")
+                        try:
+                            kd_loc = float(rec_emit.get("kd", 1.0))
+                            if kd_loc <= 1e-12:
+                                kd_loc = 1.0
+                            self.var_emit_kd_coeff.set(str(kd_loc))
+                        except (TypeError, ValueError):
+                            self.var_emit_kd_coeff.set("1.0")
                     self.var_emit_flow.set(p["flow"])
                     self.var_lat_inner_d_mm.set(str(d_mm))
                     self.var_lateral_model.set(lm)
@@ -17751,7 +18356,7 @@ class DripCAD:
         tree_frame = tk.Frame(dlg, bg="#1e1e1e")
         tree_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=10, pady=5)
 
-        columns = ("use", "mat", "pn", "od", "len")
+        columns = ("use", "mat", "abbr", "pn", "od", "len")
         tree = ttk.Treeview(
             tree_frame,
             columns=columns,
@@ -17765,31 +18370,47 @@ class DripCAD:
 
         tree.heading("use", text="Вик.")
         tree.heading("mat", text="Матеріал")
+        tree.heading("abbr", text="ABBR")
         tree.heading("pn", text="PN")
         tree.heading("od", text="Діаметр Ø")
         tree.heading("len", text="Довжина(м)")
 
         tree.column("use", width=46, anchor="center")
-        tree.column("mat", width=118, anchor="center")
-        tree.column("pn", width=58, anchor="center")
-        tree.column("od", width=96, anchor="center")
-        tree.column("len", width=96, anchor="center")
+        tree.column("mat", width=100, anchor="center")
+        tree.column("abbr", width=64, anchor="center")
+        tree.column("pn", width=52, anchor="center")
+        tree.column("od", width=88, anchor="center")
+        tree.column("len", width=88, anchor="center")
 
         scroll.pack(side=tk.RIGHT, fill=tk.Y)
         tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
         all_items = []
-        filters = {"mat": None, "pn": None, "od": None, "len": None}
-        col_to_key = {"#2": "mat", "#3": "pn", "#4": "od", "#5": "len"}
+        filters = {"mat": None, "abbr": None, "pn": None, "od": None, "len": None}
+        col_to_key = {"#2": "mat", "#3": "abbr", "#4": "pn", "#5": "od", "#6": "len"}
 
         def rebuild_catalog():
             all_items.clear()
             for mat, pns in self.pipe_db.items():
                 for pn, ods in pns.items():
                     for od, data in ods.items():
-                        l_val = data.get("length", "") if isinstance(data, dict) else ""
+                        if isinstance(data, dict):
+                            l_val = data.get("length", "")
+                            abbr_v = (
+                                str(data.get("ABBR", "")).strip()
+                                or self._pipe_abbr_from_material(mat)
+                            )
+                        else:
+                            l_val = ""
+                            abbr_v = self._pipe_abbr_from_material(mat)
                         all_items.append(
-                            {"mat": mat, "pn": str(pn), "od": str(od), "len": str(l_val)}
+                            {
+                                "mat": mat,
+                                "abbr": abbr_v,
+                                "pn": str(pn),
+                                "od": str(od),
+                                "len": str(l_val),
+                            }
                         )
 
         def row_passes_filters(it):
@@ -17812,7 +18433,14 @@ class DripCAD:
                 tree.insert(
                     "",
                     tk.END,
-                    values=("✅" if is_allowed else "❌", it["mat"], it["pn"], it["od"], it["len"]),
+                    values=(
+                        "✅" if is_allowed else "❌",
+                        it["mat"],
+                        it["abbr"],
+                        it["pn"],
+                        it["od"],
+                        it["len"],
+                    ),
                 )
 
         def _after_pipe_allow_change():
@@ -17874,9 +18502,9 @@ class DripCAD:
                 items_list = []
                 for iid in sel:
                     v = tree.item(iid, "values")
-                    if len(v) < 4:
+                    if len(v) < 6:
                         continue
-                    items_list.append({"mat": v[1], "pn": str(v[2]), "od": str(v[3])})
+                    items_list.append({"mat": v[1], "pn": str(v[3]), "od": str(v[4])})
             else:
                 items_list = list(visible_filtered_items())
             if not items_list:
@@ -17928,9 +18556,9 @@ class DripCAD:
             if not item_id:
                 return
             vals = tree.item(item_id, "values")
-            if len(vals) < 4:
+            if len(vals) < 6:
                 return
-            mat, pn, od = vals[1], vals[2], vals[3]
+            mat, pn, od = vals[1], vals[3], vals[4]
             invert_for_items([{"mat": mat, "pn": str(pn), "od": str(od)}])
 
         def on_double_left(event):
@@ -18006,17 +18634,28 @@ class DripCAD:
         tree_frame = tk.Frame(dlg, bg="#1e1e1e")
         tree_frame.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=10, pady=10)
 
-        columns = ("mat", "pn", "od", "id", "len", "price", "color")
+        _abbr_by_mat = {"PVC": "ПВХ", "PE": "ПЕ", "LAYFLAT": "ЛФ", "Layflat": "ЛФ"}
+
+        def _resolve_pipe_abbr(mat_name, payload):
+            if isinstance(payload, dict):
+                raw = str(payload.get("ABBR", "")).strip()
+                if raw:
+                    return raw
+            key = str(mat_name).strip()
+            return _abbr_by_mat.get(key, _abbr_by_mat.get(key.upper(), ""))
+
+        columns = ("mat", "abbr", "pn", "od", "id", "len", "price", "color")
         tree = ttk.Treeview(tree_frame, columns=columns, show="headings", height=10)
         
         scroll = ttk.Scrollbar(tree_frame, orient="vertical", command=tree.yview)
         tree.configure(yscrollcommand=scroll.set)
         
-        for c, t in zip(columns, ["Матеріал", "PN", "Зовн. Ø", "Внутр. Ø", "Довжина(м)", "Ціна", "Колір"]): tree.heading(c, text=t)
-        for c, w in zip(columns, [100, 60, 80, 80, 100, 90, 80]): tree.column(c, width=w, anchor="center")
+        for c, t in zip(columns, ["Матеріал", "ABBR", "PN", "Зовн. Ø", "Внутр. Ø", "Довжина(м)", "Ціна", "Колір"]): tree.heading(c, text=t)
+        for c, w in zip(columns, [100, 70, 60, 80, 80, 100, 90, 80]): tree.column(c, width=w, anchor="center")
         
         scroll.pack(side=tk.RIGHT, fill=tk.Y)
         tree.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        active_col_filters = {}
 
         def refresh_tree():
             for item in tree.get_children():
@@ -18033,20 +18672,96 @@ class DripCAD:
                             data.get("price", 0.0),
                             data.get("color", "#FFFFFF"),
                         ) if isinstance(data, dict) else (data, 6.0, 0.0, "#FFFFFF")
-                        vals = (mat, pn, od, id_v, len_v, price_v, col_v)
+                        vals = (mat, _resolve_pipe_abbr(mat, data), pn, od, id_v, len_v, price_v, col_v)
+                        if active_col_filters:
+                            row_map = dict(zip(columns, vals))
+                            passed = True
+                            for f_col, f_val in active_col_filters.items():
+                                if str(row_map.get(f_col, "")) != str(f_val):
+                                    passed = False
+                                    break
+                            if not passed:
+                                continue
                         if m:
                             blob = " | ".join(str(x) for x in vals).lower()
                             if not fnmatch.fnmatch(blob, m.lower()):
                                 continue
                         tree.insert("", tk.END, values=vals)
 
+        def _collect_col_values(col_name):
+            vals = set()
+            for mat, pns in self.pipe_db.items():
+                if not isinstance(pns, dict):
+                    continue
+                for pn, ods in pns.items():
+                    if not isinstance(ods, dict):
+                        continue
+                    for od, data in ods.items():
+                        id_v, len_v, price_v, col_v = (
+                            data.get("id", ""),
+                            data.get("length", ""),
+                            data.get("price", 0.0),
+                            data.get("color", "#FFFFFF"),
+                        ) if isinstance(data, dict) else (data, 6.0, 0.0, "#FFFFFF")
+                        row = (mat, _resolve_pipe_abbr(mat, data), pn, od, id_v, len_v, price_v, col_v)
+                        row_map = dict(zip(columns, row))
+                        vals.add(str(row_map.get(col_name, "")))
+            return sorted(vals, key=lambda x: x.lower())
+
+        def _set_column_filter(col_name, value):
+            active_col_filters[col_name] = str(value)
+            refresh_tree()
+
+        def _clear_column_filter(col_name):
+            if col_name in active_col_filters:
+                del active_col_filters[col_name]
+            refresh_tree()
+
+        def _clear_all_filters():
+            active_col_filters.clear()
+            refresh_tree()
+
+        def _show_header_filter_menu(event):
+            if tree.identify_region(event.x, event.y) != "heading":
+                return
+            col_id = tree.identify_column(event.x)
+            if not col_id or not col_id.startswith("#"):
+                return
+            try:
+                idx = int(col_id[1:]) - 1
+            except (TypeError, ValueError):
+                return
+            if idx < 0 or idx >= len(columns):
+                return
+            col_name = columns[idx]
+            menu = tk.Menu(dlg, tearoff=0, bg="#2a2a2a", fg="white", activebackground="#3a3a3a", activeforeground="white")
+            menu.add_command(label=f"Фільтр: {tree.heading(col_name, 'text')}", state="disabled")
+            menu.add_separator()
+            cur = active_col_filters.get(col_name)
+            selected_var = tk.StringVar(value=cur if cur is not None else "")
+            for v in _collect_col_values(col_name):
+                menu.add_radiobutton(
+                    label=v if v != "" else "<порожньо>",
+                    value=v,
+                    variable=selected_var,
+                    command=lambda vv=v, cc=col_name: _set_column_filter(cc, vv),
+                )
+            menu.add_separator()
+            menu.add_command(label="Скинути цю колонку", command=lambda cc=col_name: _clear_column_filter(cc))
+            menu.add_command(label="Скинути всі фільтри", command=_clear_all_filters)
+            try:
+                menu.tk_popup(event.x_root, event.y_root)
+            finally:
+                menu.grab_release()
+
         ent_pipe_mask.bind("<KeyRelease>", lambda _e: refresh_tree())
+        tree.bind("<Button-1>", _show_header_filter_menu, add="+")
         refresh_tree()
 
         vars_dict = {c: tk.StringVar() for c in columns}
         vars_dict['color'].set("#FFFFFF")
         
-        for i, (c, t) in enumerate(zip(columns, ["Матеріал:", "PN:", "Зовн. Ø:", "Внутр. Ø:", "Довжина:", "Ціна:", "Колір:"])):
+        for i, (c, t) in enumerate(zip(columns, ["Матеріал:", "ABBR:", "PN:", "Зовн. Ø:", "Внутр. Ø:", "Довжина:", "Ціна:", "Колір:"])):
             tk.Label(
                 form_frame,
                 text=t,
@@ -18127,6 +18842,7 @@ class DripCAD:
 
         def add_upd():
             mat, pn, od = vars_dict['mat'].get().strip(), str(vars_dict['pn'].get()).strip(), str(vars_dict['od'].get()).strip()
+            abbr = (vars_dict["abbr"].get() or "").strip() or _resolve_pipe_abbr(mat, {})
             try:
                 id_v = float(vars_dict["id"].get().replace(",", "."))
                 len_v = float(vars_dict["len"].get().replace(",", "."))
@@ -18138,7 +18854,7 @@ class DripCAD:
             col = (vars_dict["color"].get() or "").strip() or "#FFFFFF"
             if mat not in self.pipe_db: self.pipe_db[mat] = {}
             if pn not in self.pipe_db[mat]: self.pipe_db[mat][pn] = {}
-            self.pipe_db[mat][pn][od] = {"id": id_v, "length": len_v, "price": max(0.0, price_v), "color": col}
+            self.pipe_db[mat][pn][od] = {"id": id_v, "length": len_v, "price": max(0.0, price_v), "color": col, "ABBR": abbr}
             if mat not in self.allowed_pipes: self.allowed_pipes[mat] = {}
             if pn not in self.allowed_pipes[mat]: self.allowed_pipes[mat][pn] = []
             if od not in self.allowed_pipes[mat][pn]: self.allowed_pipes[mat][pn].append(od)
@@ -18157,6 +18873,7 @@ class DripCAD:
                 mat = vars_dict["mat"].get().strip()
                 pn = str(vars_dict["pn"].get()).strip()
                 od = str(vars_dict["od"].get()).strip()
+                abbr = (vars_dict["abbr"].get() or "").strip() or _resolve_pipe_abbr(mat, {})
                 if mat and pn and od:
                     try:
                         id_v = float(vars_dict["id"].get().replace(",", "."))
@@ -18175,6 +18892,7 @@ class DripCAD:
                             "length": len_v,
                             "price": max(0.0, price_v),
                             "color": col,
+                            "ABBR": abbr,
                         }
                         if mat not in self.allowed_pipes:
                             self.allowed_pipes[mat] = {}

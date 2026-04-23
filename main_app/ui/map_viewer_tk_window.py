@@ -621,108 +621,60 @@ def create_embedded_map_panel(parent: tk.Misc, app=None):
                     tags="trunk_map_glyph",
                 )
 
-        segs = list(getattr(app, "trunk_map_segments", []) or [])
-        for si, seg in enumerate(segs):
-            if not hasattr(app, "_trunk_segment_world_path"):
-                break
-            plw = app._trunk_segment_world_path(seg)
-            if len(plw) < 2:
-                continue
-            mi = len(plw) // 2
-            try:
-                x0, y0 = float(plw[mi][0]), float(plw[mi][1])
-            except (TypeError, ValueError, IndexError):
-                continue
-            ll = _project_local_to_latlon(x0, y0)
-            if not ll:
-                continue
-            plat, plon = float(ll[0]), float(ll[1])
-            pseg = _latlon_to_canvas_xy(plat, plon)
-            if pseg is None:
-                continue
-            tcx, tcy = float(pseg[0]), float(pseg[1])
-            if not (-80 < tcx < float(map_widget.width) + 80 and -80 < tcy < float(map_widget.height) + 80):
-                continue
-            if hasattr(app, "trunk_pipe_label_for_segment") and isinstance(seg, dict):
-                cap = str(app.trunk_pipe_label_for_segment(seg))
-            else:
-                try:
-                    dmm = float(seg.get("d_inner_mm", 90.0) or 90.0)
-                except (TypeError, ValueError):
-                    dmm = 90.0
-                if hasattr(app, "trunk_pipe_label_for_inner_mm"):
-                    cap = app.trunk_pipe_label_for_inner_mm(dmm)
-                else:
-                    cap = f"М{si + 1}"
-            if len(cap) > 26:
-                cap = cap[:23] + "…"
-            c.create_text(
-                tcx + 8,
-                tcy - 8,
-                text=cap,
-                fill="#E1BEE7",
-                font=("Segoe UI", 8, "bold"),
-                tags="trunk_map_glyph",
-            )
-
-        drag_idx = getattr(app, "_trunk_node_drag_idx", None) if app is not None else None
         if (
-            drag_idx is not None
-            and hasattr(app, "_trunk_segment_world_path")
-            and hasattr(app, "_polyline_length_m")
-            and hasattr(app, "_polyline_point_at_dist")
+            app is not None
+            and hasattr(app, "_last_map_pointer_world")
+            and hasattr(app, "_nearest_trunk_node_index_world")
+            and hasattr(app, "_trunk_snap_radius_m")
         ):
-            try:
-                di_i = int(drag_idx)
-            except (TypeError, ValueError):
-                di_i = None
-            if di_i is not None:
-                for seg in list(getattr(app, "trunk_map_segments", []) or []):
-                    if not isinstance(seg, dict):
-                        continue
-                    ni = seg.get("node_indices")
-                    if not isinstance(ni, list):
-                        continue
-                    idxs: list[int] = []
-                    for x in ni:
+            ptr = getattr(app, "_last_map_pointer_world", None)
+            if isinstance(ptr, tuple) and len(ptr) >= 2:
+                try:
+                    wxp, wyp = float(ptr[0]), float(ptr[1])
+                    ni, _dist = app._nearest_trunk_node_index_world(wxp, wyp)
+                except Exception:
+                    ni = None
+                if ni is not None:
+                    nodes = list(getattr(app, "trunk_map_nodes", []) or [])
+                    if 0 <= int(ni) < len(nodes):
                         try:
-                            idxs.append(int(x))
-                        except (TypeError, ValueError):
-                            idxs = []
-                            break
-                    if di_i not in idxs:
-                        continue
-                    plw = app._trunk_segment_world_path(seg)
-                    if len(plw) < 2:
-                        continue
-                    try:
-                        lm = float(app._polyline_length_m(plw))
-                    except Exception:
-                        continue
-                    if lm <= 1e-6:
-                        continue
-                    try:
-                        mx, my = app._polyline_point_at_dist(plw, lm * 0.5)
-                    except ValueError:
-                        continue
-                    llm = _project_local_to_latlon(float(mx), float(my))
-                    if not llm:
-                        continue
-                    pxy = _latlon_to_canvas_xy(float(llm[0]), float(llm[1]))
-                    if pxy is None:
-                        continue
-                    tcx, tcy = float(pxy[0]), float(pxy[1])
-                    if not (-80 < tcx < float(map_widget.width) + 80 and -80 < tcy < float(map_widget.height) + 80):
-                        continue
-                    c.create_text(
-                        tcx,
-                        tcy - 16,
-                        text=f"{lm:.1f} м",
-                        fill="#FFF59D",
-                        font=("Segoe UI", 9, "bold"),
-                        anchor=tk.S,
-                        tags="trunk_map_glyph",
-                    )
+                            nx = float(nodes[int(ni)].get("x"))
+                            ny = float(nodes[int(ni)].get("y"))
+                            r_m = float(app._trunk_snap_radius_m())
+                        except Exception:
+                            nx = ny = r_m = None  # type: ignore[assignment]
+                        if nx is not None and ny is not None and r_m is not None and r_m > 1e-9:
+                            ll0 = _project_local_to_latlon(float(nx), float(ny))
+                            ll1 = _project_local_to_latlon(float(nx) + float(r_m), float(ny))
+                            if ll0 and ll1:
+                                p0 = _latlon_to_canvas_xy(float(ll0[0]), float(ll0[1]))
+                                p1 = _latlon_to_canvas_xy(float(ll1[0]), float(ll1[1]))
+                                if p0 is not None and p1 is not None:
+                                    rad = max(
+                                        4.0,
+                                        math.hypot(float(p1[0]) - float(p0[0]), float(p1[1]) - float(p0[1])),
+                                    )
+                                    cxh, cyh = float(p0[0]), float(p0[1])
+                                    if (
+                                        -80 < cxh < float(map_widget.width) + 80
+                                        and -80 < cyh < float(map_widget.height) + 80
+                                    ):
+                                        c.create_oval(
+                                            cxh - rad,
+                                            cyh - rad,
+                                            cxh + rad,
+                                            cyh + rad,
+                                            outline="#00E5FF",
+                                            dash=(4, 3),
+                                            width=2,
+                                            fill="",
+                                            tags="trunk_map_glyph",
+                                        )
+
+        # Дрібні службові підписи сегментів на карті вимкнені:
+        # залишаємо лише фінальну інформацію оптимізації.
+
+        # Під час drag вузла не показуємо проміжні довжини ребер.
 
         probe = getattr(app, "_trunk_profile_probe_world", None) if app is not None else None
         if isinstance(probe, tuple) and len(probe) >= 2:
@@ -1010,6 +962,17 @@ def create_embedded_map_panel(parent: tk.Misc, app=None):
         if not is_calculated:
             return "#FFCC66" if manual else "#336699"
         base_ok = "#90EE90"
+        faud = (app.calc_results.get("lateral_flow_audit") or {}).get(f"lat_{li_use}")
+        if faud and faud.get("q_min") is not None:
+            stq = str(faud.get("status") or "")
+            if stq == "overflow_q":
+                return "#FF4444"
+            if stq == "underflow_q":
+                return "#CC7722"
+            if stq == "both_q":
+                return "#FF6600"
+            if stq == "ok_q":
+                return base_ok
         aud = (app.calc_results.get("lateral_pressure_audit") or {}).get(f"lat_{li_use}")
         if not aud:
             return base_ok
@@ -2391,9 +2354,7 @@ def create_embedded_map_panel(parent: tk.Misc, app=None):
                 app is not None
                 and getattr(app, "geo_ref", None)
                 and app.mode.get() in ("VIEW", "PAN")
-                and hasattr(app, "_trunk_interaction_priority_active")
-                and app._trunk_interaction_priority_active()
-                and hasattr(app, "_open_trunk_graph_context_menu")
+                and hasattr(app, "_handle_right_click_world")
             ):
                 try:
                     lat, lon = map_widget.convert_canvas_coords_to_decimal_coords(int(event.x), int(event.y))
@@ -2402,8 +2363,8 @@ def create_embedded_map_panel(parent: tk.Misc, app=None):
                         float(lat), float(lon), float(ref_lon), float(ref_lat)
                     )
                     anchor = (int(getattr(event, "x_root", 0)), int(getattr(event, "y_root", 0)))
-                    if app._open_trunk_graph_context_menu(float(wx), float(wy), menu_anchor=anchor):
-                        return "break"
+                    app._handle_right_click_world(float(wx), float(wy), menu_anchor=anchor)
+                    return "break"
                 except Exception:
                     pass
             _set_tool(None)
@@ -2432,9 +2393,7 @@ def create_embedded_map_panel(parent: tk.Misc, app=None):
                         pass
                     return "break"
                 if (
-                    hasattr(app, "_trunk_interaction_priority_active")
-                    and app._trunk_interaction_priority_active()
-                    and hasattr(app, "_open_trunk_graph_context_menu")
+                    hasattr(app, "_handle_right_click_world")
                 ):
                     try:
                         lat, lon = map_widget.convert_canvas_coords_to_decimal_coords(int(event.x), int(event.y))
@@ -2443,11 +2402,11 @@ def create_embedded_map_panel(parent: tk.Misc, app=None):
                             float(lat), float(lon), float(ref_lon), float(ref_lat)
                         )
                         anchor = (int(getattr(event, "x_root", 0)), int(getattr(event, "y_root", 0)))
-                        if app._open_trunk_graph_context_menu(float(wx), float(wy), menu_anchor=anchor):
-                            if hasattr(app, "_schedule_embedded_map_overlay_refresh"):
-                                app._schedule_embedded_map_overlay_refresh()
-                            _paint_map_live_preview()
-                            return "break"
+                        app._handle_right_click_world(float(wx), float(wy), menu_anchor=anchor)
+                        if hasattr(app, "_schedule_embedded_map_overlay_refresh"):
+                            app._schedule_embedded_map_overlay_refresh()
+                        _paint_map_live_preview()
+                        return "break"
                     except Exception:
                         pass
             if m in ("DRAW", "SUBMAIN", "DRAW_LAT", "RULER", "CUT_LATS", "TOPO"):
