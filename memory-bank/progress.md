@@ -1,0 +1,28 @@
+# Progress
+
+## Working (high level)
+
+- Multi-block field CAD with submains, auto/manual laterals, hydraulic solve, results tab, BOM module.
+- Map tab with zone, tiles, drawing/trunk panels, geo ref, scale overlay, tooltips.
+- Trunk as validated tree: drawing, selection, info/highlight, irrigation slots, telescope optimization (incl. bend-chain logical edge), pressure/profile dialogs, velocity indication, `ensure_trunk_node_ids`.
+- Relief: SRTM tiles (Skadi / custom URL / `earthaccess`), elevation provider dropdown + fallbacks, contours IDW/kriging, Z grid smoothing before contours, **Zoom visible**, relief layer toggles persisted in project JSON.
+- Off-map canvas: LMB-drag pan in VIEW/PAN without stealing select/trunk/zoom-box gestures.
+- Block tab: emitter flow / masks / isoline UI decoupled from main canvas redraw for performance.
+- Block hydraulics metadata: `lateral_flow_audit` and `block_equivalent_emitter` stored in `calc_results` with block-local strip/remap merge paths.
+- Block properties dialog: shows `K_eq`, `P_ref`, live `Q_total @ H`, and `% to Q_nom` preview for quick pressure sensitivity checks.
+- Canvas right-click over block area (not only boundary) opens block context menu with property/edit/clear/delete actions.
+- Canvas/map right-click now supports overlap disambiguation: when multiple objects are under cursor, user chooses exact target (`node/edge/block`) before actions menu opens.
+- Trunk snap uses fixed world-meter radii (no zoom-based growth), and near-node snap radius is visually highlighted on canvas and embedded map.
+- Lateral graphs: adaptive layout, debounced resize, hover annotations, aligned L1/L2 tap pressure.
+- Exports: KML/DXF/PDF; silent dialogs on Windows.
+
+## Known documentation anchors
+
+- Active issues and wishlist items are not duplicated here; see **“Що логічно доробити далі”** and session notes in [PROJECT_STATE.md](../PROJECT_STATE.md).
+- Open design plans live under `docs/plans/` and root `*_plan.md` files where present.
+
+## Memory bank maintenance
+
+- On **Update** / **update memory bank**: review **every** file in `memory-bank/`, then adjust `activeContext.md` and `progress.md` at minimum; keep others in sync if project facts changed.
+- After significant code or doc changes in the repo, refresh this folder or extend `PROJECT_STATE.md` first, then mirror here.
+- Keep this layer **short**; defer depth to `PROJECT_CONTEXT.md` / `PROJECT_STATE.md` to avoid drift.
