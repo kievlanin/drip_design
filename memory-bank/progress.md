@@ -10,6 +10,8 @@
 - Block tab: emitter flow / masks / isoline UI decoupled from main canvas redraw for performance.
 - Block hydraulics metadata: `lateral_flow_audit` and `block_equivalent_emitter` stored in `calc_results` with block-local strip/remap merge paths.
 - Block properties dialog: shows `K_eq`, `P_ref`, editable `Hвст.`, live `Q_total @ H`, `% to Q_nom`, inverse `H for Q_nom`, and now preserves existing hydro on no-op `OK` / `Apply`.
+- Canvas layer system: grouped layer dialog + empty-canvas RMB access, persisted `canvas_layers`, dynamic `trunk.pipes.od:*` and `block.submain.od:*`, with `visible/selectable` enforcement.
+- Block canvas UX: valve labels are multiline and draggable in `SUB_LABEL`, per-branch emitter Q extrema can be rendered for each visible submain branch, and render/pick paths respect current layer visibility/selectability.
 - Canvas right-click over block area (not only boundary) opens block context menu with property/edit/clear/delete actions.
 - Canvas/map right-click now supports overlap disambiguation: when multiple objects are under cursor, user chooses exact target (`node/edge/block`) before actions menu opens.
 - Trunk consumer/valve context menu exposes `Властивості…` for the existing per-node Q/H schedule dialog.

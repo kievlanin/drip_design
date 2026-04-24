@@ -21,6 +21,9 @@
 
 - Block properties dialog (`open_block_irrigation_scheme_dialog`) mixes editable block params with read-only computed fields from `calc_results` (`K_eq`, `P_ref`, `Hвст.`, pressure-driven `Q_total`, `% to nominal`, inverse `H for Q_nom`).
 - The block-properties dialog must not invalidate existing hydraulic results on no-op `OK` / `Apply`; sync back into traced global `var_*` only when parameters actually changed and recalculation is needed.
+- Canvas visibility/selection is modeled as a small hierarchy: group nodes plus leaf layers, with dynamic diameter-based leaves for trunk and submain pipes; the invariant is `selectable => visible`, and disabling visibility also disables selectability.
+- Rendering and picking must go through layer helpers (`is_canvas_layer_visible`, `is_canvas_layer_selectable`, dynamic layer-id resolvers) so new canvas objects inherit layer behavior consistently.
+- Valve label movement follows the same two-click `SUB_LABEL` interaction used for section/telescope labels, but persists separately in `consumer_schedule.field_valve_label_pos`.
 - Context menus are mode-aware and world-pick driven: one hit opens target menu directly; multiple overlapping hits show a choose-target menu before opening specific actions.
 - Block context menu supports explicit target index (used by overlap disambiguation), while trunk context menu supports explicit `(cat, payload, label)` target forwarding; consumption/valve nodes expose a `Властивості…` action that opens the consumer schedule/properties dialog.
 - Snap radii for trunk node/valve interactions are fixed in world meters; near-node snap radius is rendered as a dashed hint ring on both canvas and embedded map.

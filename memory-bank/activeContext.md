@@ -2,15 +2,16 @@
 
 **Last aligned with repo docs:** 2026-04-24 — see [PROJECT_STATE.md](../PROJECT_STATE.md) session notes.
 
-**Last memory-bank review:** full pass over all six files on user doc/context refresh; compared to [PROJECT_CONTEXT.md](../PROJECT_CONTEXT.md) / `PROJECT_STATE.md` including 2026-04-24 session notes.
+**Last memory-bank review:** full pass over all memory-bank files on user doc/context refresh; compared to [PROJECT_CONTEXT.md](../PROJECT_CONTEXT.md) / `PROJECT_STATE.md` including the 2026-04-24 canvas-layer and block-dialog session notes.
 
 ## Current focus
 
-- **Emitter block equivalent (`K_eq`)**: `modules/hydraulic_module/emitter_block_equivalent.py` + integration in `hydraulics_core` (`calc_results["block_equivalent_emitter"]`), where `x` is taken from selected dripper model only (no `x` fitting fallback).
-- **Block flow audit/UI:** `calc_results["lateral_flow_audit"]` with min/max/Qnom statuses; Block dialog now shows `K_eq`, `P_ref`, editable `Hвст.`, live `Q_total @ H`, `% to Q_nom`, and inverse `H for Q_nom`.
-- **Block dialog no-op apply fix:** `OK` / `Apply` in `open_block_irrigation_scheme_dialog` no longer wipe existing hydro just by touching traced global `StringVar`; sync into `self.var_*` happens only when parameters actually require recalculation.
-- **Canvas/map ПКМ routing:** right-click now uses a shared world-pick router (`trunk_node` / `trunk_seg` / `block`); consumer/valve nodes expose `Властивості…` to open `_open_trunk_consumer_schedule_dialog`.
-- **Trunk + geo baseline remains:** bend-chain logical edges, dz-aware budget loop, SRTM providers/fallbacks, contour smoothing, off-map LMB pan.
+- **Canvas layer manager:** `dripcad_legacy.py` now owns grouped canvas layers with `visible/selectable` state, a dedicated `Шари...` dialog, empty-canvas RMB entry point, and the enforced rule `selectable => visible`.
+- **Granular block layers:** block rendering/picking is split into `block.boundaries`, `block.laterals`, `block.submain.base`, `block.valves`, and dynamic `block.submain.od:*`; trunk keeps graph/node layers plus dynamic `trunk.pipes.od:*`; labels stay under `cosmetic.labels`.
+- **Valve label UX:** field-valve labels are multiline, left-aligned, and draggable with the two-click `SUB_LABEL` flow; positions persist in `consumer_schedule.field_valve_label_pos`.
+- **Emitter block equivalent (`K_eq`) and audits:** `emitter_block_equivalent.py` + integration in `hydraulics_core` remain active, with `block_equivalent_emitter`, `lateral_flow_audit`, and per-submain-branch emitter Q extrema overlay.
+- **Block dialog UX baseline:** `open_block_irrigation_scheme_dialog` shows `K_eq`, `P_ref`, editable `Hвст.`, live `Q_total @ H`, `% to Q_nom`, inverse `H for Q_nom`, and no longer wipes hydro on no-op `OK` / `Apply`.
+- **Canvas/map ПКМ routing:** right-click still uses the shared world-pick router (`trunk_node` / `trunk_seg` / `block`); consumer/valve nodes expose `Властивості…` to open `_open_trunk_consumer_schedule_dialog`.
 
 ## When starting a task
 
@@ -24,10 +25,9 @@
 
 ## Latest completed in this session
 
-- Added `Hвст.` and inverse `H for Q_nom` to block properties, plus an in-dialog `▶ РОЗРАХУНОК` action.
-- Fixed block-properties `OK` / `Apply` so they do not reset hydraulic results unless a real hydro-affecting parameter changed.
-- Added consumer-node context-menu entry `Властивості…` to open the existing Q/H dialog.
-- Synced docs (`PROJECT_CONTEXT.md`, `PROJECT_STATE.md`) and memory bank with the 2026-04-24 UI/UX fixes.
+- Synced `PROJECT_CONTEXT.md`, `PROJECT_STATE.md`, `memory-bank/activeContext.md`, `memory-bank/progress.md`, and `memory-bank/systemPatterns.md` with the latest 2026-04-24 repo state.
+- Captured the new canvas-layer hierarchy, dynamic submain `Ø` layers, valve-label drag persistence, and per-branch Qmin/Qmax overlay behavior.
+- Preserved the earlier 2026-04-24 block-dialog notes (`Hвст.`, inverse `H for Q_nom`, no-op `OK` / `Apply`, consumer-node `Властивості…`) as still-current baseline.
 
 ## Decisions / constraints to remember
 
