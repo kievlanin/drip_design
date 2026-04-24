@@ -11,6 +11,7 @@ from main_app.paths import PIPES_DB_PATH
 from . import lateral_solver as lat_sol
 from . import trickle_line_nr_solver as trickle_nr
 from .dripperline_catalog import load_dripperlines_catalog
+from .emitter_block_equivalent import equivalent_k_from_total_flow, mean_positive
 from .hydraulics_constants import DEFAULT_HAZEN_WILLIAMS_C, hazen_c_from_pipe_entry
 
 
@@ -457,6 +458,15 @@ class HydraulicEngine:
                     }
             return db
 
+        _mat_abbr = {"PVC": "ПВХ", "PE": "ПЕ", "LAYFLAT": "ЛФ", "Layflat": "ЛФ"}
+
+        def _resolve_abbr(mat_name: str, payload: dict) -> str:
+            if isinstance(payload, dict):
+                abbr_raw = str(payload.get("ABBR", "")).strip()
+                if abbr_raw:
+                    return abbr_raw
+            return _mat_abbr.get(str(mat_name).strip(), _mat_abbr.get(str(mat_name).strip().upper(), ""))
+
         def _normalize_pipe_catalog(db: dict) -> dict:
             if not isinstance(db, dict):
                 return {"PVC": {}, "PE": {}, "Layflat": {}}
@@ -488,6 +498,7 @@ class HydraulicEngine:
                                 "length": _ln,
                                 "color": _cl,
                                 "price": max(0.0, _pr),
+                                "ABBR": _resolve_abbr(_mat, _pay),
                             }
                         else:
                             try:
@@ -499,6 +510,7 @@ class HydraulicEngine:
                                 "length": 6.0,
                                 "color": "#FFFFFF",
                                 "price": 0.0,
+                                "ABBR": _resolve_abbr(_mat, {}),
                             }
             for _mk in ("PVC", "PE", "Layflat"):
                 if _mk not in db or not isinstance(db[_mk], dict):
@@ -518,36 +530,36 @@ class HydraulicEngine:
         pns_pe_pvc = ["4", "6", "8", "10", "12.5", "16"]
         for pn in pns_pe_pvc:
             default_db["PVC"][pn] = {
-                "50": {"id": 46.4, "length": 6.0, "color": "#0066FF"},
-                "63": {"id": 59.0, "length": 6.0, "color": "#33CC33"},
-                "75": {"id": 70.6, "length": 6.0, "color": "#660099"},
-                "90": {"id": 84.6, "length": 6.0, "color": "#556B2F"},
-                "110": {"id": 103.6, "length": 6.0, "color": "#FF3366"},
-                "160": {"id": 150.6, "length": 6.0, "color": "#4682B4"},
-                "200": {"id": 188.6, "length": 6.0, "color": "#8A2BE2"},
-                "225": {"id": 212.0, "length": 6.0, "color": "#FF8C00"}
+                "50": {"id": 46.4, "length": 6.0, "color": "#0066FF", "ABBR": "ПВХ"},
+                "63": {"id": 59.0, "length": 6.0, "color": "#33CC33", "ABBR": "ПВХ"},
+                "75": {"id": 70.6, "length": 6.0, "color": "#660099", "ABBR": "ПВХ"},
+                "90": {"id": 84.6, "length": 6.0, "color": "#556B2F", "ABBR": "ПВХ"},
+                "110": {"id": 103.6, "length": 6.0, "color": "#FF3366", "ABBR": "ПВХ"},
+                "160": {"id": 150.6, "length": 6.0, "color": "#4682B4", "ABBR": "ПВХ"},
+                "200": {"id": 188.6, "length": 6.0, "color": "#8A2BE2", "ABBR": "ПВХ"},
+                "225": {"id": 212.0, "length": 6.0, "color": "#FF8C00", "ABBR": "ПВХ"}
             }
             default_db["PE"][pn] = {
-                "32": {"id": 29.6, "length": 100.0, "color": "#AAAAAA"},
-                "40": {"id": 37.0, "length": 100.0, "color": "#CC7722"},
-                "50": {"id": 46.2, "length": 100.0, "color": "#0066FF"},
-                "63": {"id": 58.2, "length": 100.0, "color": "#33CC33"},
-                "75": {"id": 69.2, "length": 100.0, "color": "#660099"},
-                "90": {"id": 83.0, "length": 100.0, "color": "#556B2F"},
-                "110": {"id": 101.4, "length": 100.0, "color": "#FF3366"},
-                "160": {"id": 147.6, "length": 12.0, "color": "#4682B4"},
-                "200": {"id": 184.6, "length": 12.0, "color": "#8A2BE2"},
-                "225": {"id": 207.0, "length": 12.0, "color": "#FF8C00"}
+                "32": {"id": 29.6, "length": 100.0, "color": "#AAAAAA", "ABBR": "ПЕ"},
+                "40": {"id": 37.0, "length": 100.0, "color": "#CC7722", "ABBR": "ПЕ"},
+                "50": {"id": 46.2, "length": 100.0, "color": "#0066FF", "ABBR": "ПЕ"},
+                "63": {"id": 58.2, "length": 100.0, "color": "#33CC33", "ABBR": "ПЕ"},
+                "75": {"id": 69.2, "length": 100.0, "color": "#660099", "ABBR": "ПЕ"},
+                "90": {"id": 83.0, "length": 100.0, "color": "#556B2F", "ABBR": "ПЕ"},
+                "110": {"id": 101.4, "length": 100.0, "color": "#FF3366", "ABBR": "ПЕ"},
+                "160": {"id": 147.6, "length": 12.0, "color": "#4682B4", "ABBR": "ПЕ"},
+                "200": {"id": 184.6, "length": 12.0, "color": "#8A2BE2", "ABBR": "ПЕ"},
+                "225": {"id": 207.0, "length": 12.0, "color": "#FF8C00", "ABBR": "ПЕ"}
             }
             
         for pn in ["3", "4", "6"]:
             default_db["Layflat"][pn] = {
-                "50": {"id": 51.5, "length": 100.0, "color": "#0066FF"},
-                "65": {"id": 66.0, "length": 100.0, "color": "#33CC33"},
-                "75": {"id": 77.0, "length": 100.0, "color": "#660099"},
-                "100": {"id": 103.0, "length": 100.0, "color": "#556B2F"},
-                "150": {"id": 154.0, "length": 100.0, "color": "#4682B4"},
-                "200": {"id": 205.0, "length": 100.0, "color": "#D2691E"}
+                "50": {"id": 51.5, "length": 100.0, "color": "#0066FF", "ABBR": "ЛФ"},
+                "65": {"id": 66.0, "length": 100.0, "color": "#33CC33", "ABBR": "ЛФ"},
+                "75": {"id": 77.0, "length": 100.0, "color": "#660099", "ABBR": "ЛФ"},
+                "100": {"id": 103.0, "length": 100.0, "color": "#556B2F", "ABBR": "ЛФ"},
+                "150": {"id": 154.0, "length": 100.0, "color": "#4682B4", "ABBR": "ЛФ"},
+                "200": {"id": 205.0, "length": 100.0, "color": "#D2691E", "ABBR": "ЛФ"}
             }
         
         try:
@@ -1989,6 +2001,8 @@ class HydraulicEngine:
         lateral_pressure_audit: dict = {}
         block_emit_sum: dict = {}
         block_emit_count: dict = {}
+        block_emit_heads: dict = {}
+        block_emit_h_sub: dict = {}
 
         def _topo_xy(px: float, py: float) -> float:
             if not topo:
@@ -2045,8 +2059,11 @@ class HydraulicEngine:
             if n_em:
                 block_emit_sum[bi] = block_emit_sum.get(bi, 0.0) + q_emit_sum
                 block_emit_count[bi] = block_emit_count.get(bi, 0) + n_em
+                block_emit_heads.setdefault(bi, []).extend(hs_emit)
 
             h_actual_sub = float(pay.get("H_submain_conn_m", 0.0))
+            if h_actual_sub > 1e-9:
+                block_emit_h_sub.setdefault(bi, []).append(h_actual_sub)
 
             def _heads_from_wing(rows):
                 out = []
@@ -2183,10 +2200,122 @@ class HydraulicEngine:
             }
 
         calc_results["lateral_pressure_audit"] = lateral_pressure_audit
+
+        try:
+            e_flow_nom_fallback = float(str(e_flow).replace(",", "."))
+        except (TypeError, ValueError):
+            e_flow_nom_fallback = 1.05
+        lateral_flow_audit: dict = {}
+        for idx in range(len(lat_geom)):
+            lk = f"lat_{idx}"
+            pay = project_emitters.get(lk) or {}
+            L1 = pay.get("L1") or []
+            L2 = pay.get("L2") or []
+            if per_e_flows is not None and idx < len(per_e_flows):
+                try:
+                    q_nom = float(per_e_flows[idx])
+                except (TypeError, ValueError):
+                    q_nom = e_flow_nom_fallback
+            else:
+                q_nom = e_flow_nom_fallback
+            q_nom = max(1e-9, float(q_nom))
+            bi_lat = int(lateral_block_idx[idx]) if idx < len(lateral_block_idx) else 0
+            entries: list = []
+            for wing_key, wing_rows in (("L1", L1), ("L2", L2)):
+                for row in wing_rows or []:
+                    if not isinstance(row, dict):
+                        continue
+                    try:
+                        qe = float(row.get("q_emit", 0))
+                    except (TypeError, ValueError):
+                        continue
+                    if qe <= 1e-4:
+                        continue
+                    try:
+                        xv = float(row.get("x", 0.0))
+                    except (TypeError, ValueError):
+                        xv = 0.0
+                    entries.append({"wing": wing_key, "x": round(xv, 4), "q": round(qe, 4)})
+            if not entries:
+                lateral_flow_audit[lk] = {
+                    "block_idx": bi_lat,
+                    "q_min": None,
+                    "q_max": None,
+                    "q_nom": round(q_nom, 4),
+                    "status": "no_emitters",
+                }
+                continue
+            q_vals = [float(e["q"]) for e in entries]
+            q_min_v, q_max_v = min(q_vals), max(q_vals)
+            hi_b = q_nom * 1.05
+            lo_b = q_nom * 0.95
+            min_e = min(entries, key=lambda e: float(e["q"]))
+            max_e = max(entries, key=lambda e: float(e["q"]))
+            over = q_max_v > hi_b
+            under = q_min_v < lo_b
+            if over and under:
+                st_q = "both_q"
+            elif over:
+                st_q = "overflow_q"
+            elif under:
+                st_q = "underflow_q"
+            else:
+                st_q = "ok_q"
+            lateral_flow_audit[lk] = {
+                "block_idx": bi_lat,
+                "q_min": round(q_min_v, 4),
+                "q_max": round(q_max_v, 4),
+                "q_nom": round(q_nom, 4),
+                "status": st_q,
+                "min_emitter": {
+                    "wing": min_e.get("wing"),
+                    "x_m": min_e.get("x"),
+                    "q_lph": min_e.get("q"),
+                },
+                "max_emitter": {
+                    "wing": max_e.get("wing"),
+                    "x_m": max_e.get("x"),
+                    "q_lph": max_e.get("q"),
+                },
+            }
+        calc_results["lateral_flow_audit"] = lateral_flow_audit
+
         calc_results["block_avg_emit_lph"] = {
             str(bi): round(block_emit_sum[bi] / max(1, block_emit_count[bi]), 4)
             for bi in block_emit_sum
         }
+        block_equivalent_emitter: dict = {}
+        if not bool(emitter_opts.get("compensated", False)):
+            try:
+                x_eff = float(emitter_opts.get("x_exp"))
+            except (TypeError, ValueError):
+                x_eff = None
+            # x має приходити з обраної моделі крапельниці; тут підбираємо лише K_eq.
+            if x_eff is not None and x_eff > 1e-12:
+                for bi, q_total_lph in block_emit_sum.items():
+                    p_ref = mean_positive(block_emit_h_sub.get(bi, []))
+                    if p_ref is None:
+                        p_ref = mean_positive(block_emit_heads.get(bi, []))
+                    if p_ref is None:
+                        continue
+                    k_eq_lph = equivalent_k_from_total_flow(
+                        q_total=float(q_total_lph),
+                        x=x_eff,
+                        p_ref=float(p_ref),
+                    )
+                    block_equivalent_emitter[str(bi)] = {
+                        "k_eq_lph_mx": round(float(k_eq_lph), 8),
+                        "x_exp": round(float(x_eff), 6),
+                        "x_source": "selected_dripper_model",
+                        "p_ref_m": round(float(p_ref), 6),
+                        "q_total_lph": round(float(q_total_lph), 4),
+                        "n_emitters": int(block_emit_count.get(bi, 0)),
+                        "derived_from": "q_total_at_p_ref",
+                        "p_ref_source": "mean_h_submain_conn"
+                        if block_emit_h_sub.get(bi)
+                        else "mean_emitter_head",
+                    }
+        calc_results["block_equivalent_emitter"] = block_equivalent_emitter
 
         if band_active and lateral_pressure_audit:
             report_lines.append("")

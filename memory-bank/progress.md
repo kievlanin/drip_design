@@ -9,9 +9,10 @@
 - Off-map canvas: LMB-drag pan in VIEW/PAN without stealing select/trunk/zoom-box gestures.
 - Block tab: emitter flow / masks / isoline UI decoupled from main canvas redraw for performance.
 - Block hydraulics metadata: `lateral_flow_audit` and `block_equivalent_emitter` stored in `calc_results` with block-local strip/remap merge paths.
-- Block properties dialog: shows `K_eq`, `P_ref`, live `Q_total @ H`, and `% to Q_nom` preview for quick pressure sensitivity checks.
+- Block properties dialog: shows `K_eq`, `P_ref`, editable `Hвст.`, live `Q_total @ H`, `% to Q_nom`, inverse `H for Q_nom`, and now preserves existing hydro on no-op `OK` / `Apply`.
 - Canvas right-click over block area (not only boundary) opens block context menu with property/edit/clear/delete actions.
 - Canvas/map right-click now supports overlap disambiguation: when multiple objects are under cursor, user chooses exact target (`node/edge/block`) before actions menu opens.
+- Trunk consumer/valve context menu exposes `Властивості…` for the existing per-node Q/H schedule dialog.
 - Trunk snap uses fixed world-meter radii (no zoom-based growth), and near-node snap radius is visually highlighted on canvas and embedded map.
 - Lateral graphs: adaptive layout, debounced resize, hover annotations, aligned L1/L2 tap pressure.
 - Exports: KML/DXF/PDF; silent dialogs on Windows.

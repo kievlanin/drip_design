@@ -19,9 +19,10 @@
 
 ## UI interaction patterns
 
-- Block properties dialog (`open_block_irrigation_scheme_dialog`) mixes editable block params with read-only computed fields from `calc_results` (`K_eq`, `P_ref`, pressure-driven `Q_total`, `% to nominal`).
+- Block properties dialog (`open_block_irrigation_scheme_dialog`) mixes editable block params with read-only computed fields from `calc_results` (`K_eq`, `P_ref`, `Hвст.`, pressure-driven `Q_total`, `% to nominal`, inverse `H for Q_nom`).
+- The block-properties dialog must not invalidate existing hydraulic results on no-op `OK` / `Apply`; sync back into traced global `var_*` only when parameters actually changed and recalculation is needed.
 - Context menus are mode-aware and world-pick driven: one hit opens target menu directly; multiple overlapping hits show a choose-target menu before opening specific actions.
-- Block context menu supports explicit target index (used by overlap disambiguation), while trunk context menu supports explicit `(cat, payload, label)` target forwarding.
+- Block context menu supports explicit target index (used by overlap disambiguation), while trunk context menu supports explicit `(cat, payload, label)` target forwarding; consumption/valve nodes expose a `Властивості…` action that opens the consumer schedule/properties dialog.
 - Snap radii for trunk node/valve interactions are fixed in world meters; near-node snap radius is rendered as a dashed hint ring on both canvas and embedded map.
 
 ## Geo / relief

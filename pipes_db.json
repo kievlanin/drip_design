@@ -4,252 +4,300 @@
             "50": {
                 "id": 46.4,
                 "length": 6.0,
-                "color": "#0066FF"
+                "color": "#0066FF",
+                "ABBR": "ПВХ"
             },
             "63": {
                 "id": 59.0,
                 "length": 6.0,
-                "color": "#33CC33"
+                "color": "#33CC33",
+                "ABBR": "ПВХ"
             },
             "75": {
                 "id": 70.6,
                 "length": 6.0,
-                "color": "#660099"
+                "color": "#660099",
+                "ABBR": "ПВХ"
             },
             "90": {
                 "id": 84.6,
                 "length": 6.0,
-                "color": "#556B2F"
+                "color": "#556B2F",
+                "ABBR": "ПВХ"
             },
             "110": {
                 "id": 103.6,
                 "length": 6.0,
-                "color": "#FF3366"
+                "color": "#FF3366",
+                "ABBR": "ПВХ"
             },
             "160": {
                 "id": 150.6,
                 "length": 6.0,
-                "color": "#4682B4"
+                "color": "#4682B4",
+                "ABBR": "ПВХ"
             },
             "200": {
                 "id": 188.6,
                 "length": 6.0,
-                "color": "#8A2BE2"
+                "color": "#8A2BE2",
+                "ABBR": "ПВХ"
             },
             "225": {
                 "id": 212.0,
                 "length": 6.0,
-                "color": "#FF8C00"
+                "color": "#FF8C00",
+                "ABBR": "ПВХ"
             }
         },
         "6": {
             "50": {
                 "id": 46.4,
                 "length": 6.0,
-                "color": "#0066FF"
+                "color": "#0066FF",
+                "ABBR": "ПВХ"
             },
             "63": {
                 "id": 59.0,
                 "length": 6.0,
-                "color": "#33CC33"
+                "color": "#33CC33",
+                "ABBR": "ПВХ"
             },
             "75": {
                 "id": 70.6,
                 "length": 6.0,
-                "color": "#660099"
+                "color": "#660099",
+                "ABBR": "ПВХ"
             },
             "90": {
                 "id": 84.6,
                 "length": 6.0,
-                "color": "#556B2F"
+                "color": "#556B2F",
+                "ABBR": "ПВХ"
             },
             "110": {
                 "id": 103.6,
                 "length": 6.0,
-                "color": "#FF3366"
+                "color": "#FF3366",
+                "ABBR": "ПВХ"
             },
             "160": {
                 "id": 150.6,
                 "length": 6.0,
-                "color": "#4682B4"
+                "color": "#4682B4",
+                "ABBR": "ПВХ"
             },
             "200": {
                 "id": 188.6,
                 "length": 6.0,
-                "color": "#8A2BE2"
+                "color": "#8A2BE2",
+                "ABBR": "ПВХ"
             },
             "225": {
                 "id": 212.0,
                 "length": 6.0,
-                "color": "#FF8C00"
+                "color": "#FF8C00",
+                "ABBR": "ПВХ"
             }
         },
         "8": {
             "50": {
                 "id": 46.4,
                 "length": 6.0,
-                "color": "#0066FF"
+                "color": "#0066FF",
+                "ABBR": "ПВХ"
             },
             "63": {
                 "id": 59.0,
                 "length": 6.0,
-                "color": "#33CC33"
+                "color": "#33CC33",
+                "ABBR": "ПВХ"
             },
             "75": {
                 "id": 70.6,
                 "length": 6.0,
-                "color": "#660099"
+                "color": "#660099",
+                "ABBR": "ПВХ"
             },
             "90": {
                 "id": 84.6,
                 "length": 6.0,
-                "color": "#556B2F"
+                "color": "#556B2F",
+                "ABBR": "ПВХ"
             },
             "110": {
                 "id": 103.6,
                 "length": 6.0,
-                "color": "#FF3366"
+                "color": "#FF3366",
+                "ABBR": "ПВХ"
             },
             "160": {
                 "id": 150.6,
                 "length": 6.0,
-                "color": "#4682B4"
+                "color": "#4682B4",
+                "ABBR": "ПВХ"
             },
             "200": {
                 "id": 188.6,
                 "length": 6.0,
-                "color": "#8A2BE2"
+                "color": "#8A2BE2",
+                "ABBR": "ПВХ"
             },
             "225": {
                 "id": 212.0,
                 "length": 6.0,
-                "color": "#FF8C00"
+                "color": "#FF8C00",
+                "ABBR": "ПВХ"
             }
         },
         "10": {
             "50": {
                 "id": 46.4,
                 "length": 6.0,
-                "color": "#0066FF"
+                "color": "#0066FF",
+                "ABBR": "ПВХ"
             },
             "63": {
                 "id": 59.0,
                 "length": 6.0,
-                "color": "#33CC33"
+                "color": "#33CC33",
+                "ABBR": "ПВХ"
             },
             "75": {
                 "id": 70.6,
                 "length": 6.0,
-                "color": "#660099"
+                "color": "#660099",
+                "ABBR": "ПВХ"
             },
             "90": {
                 "id": 84.6,
                 "length": 6.0,
-                "color": "#556B2F"
+                "color": "#556B2F",
+                "ABBR": "ПВХ"
             },
             "110": {
                 "id": 103.6,
                 "length": 6.0,
-                "color": "#FF3366"
+                "color": "#FF3366",
+                "ABBR": "ПВХ"
             },
             "160": {
                 "id": 150.6,
                 "length": 6.0,
-                "color": "#4682B4"
+                "color": "#4682B4",
+                "ABBR": "ПВХ"
             },
             "200": {
                 "id": 188.6,
                 "length": 6.0,
-                "color": "#8A2BE2"
+                "color": "#8A2BE2",
+                "ABBR": "ПВХ"
             },
             "225": {
                 "id": 212.0,
                 "length": 6.0,
-                "color": "#FF8C00"
+                "color": "#FF8C00",
+                "ABBR": "ПВХ"
             }
         },
         "12.5": {
             "50": {
                 "id": 46.4,
                 "length": 6.0,
-                "color": "#0066FF"
+                "color": "#0066FF",
+                "ABBR": "ПВХ"
             },
             "63": {
                 "id": 59.0,
                 "length": 6.0,
-                "color": "#33CC33"
+                "color": "#33CC33",
+                "ABBR": "ПВХ"
             },
             "75": {
                 "id": 70.6,
                 "length": 6.0,
-                "color": "#660099"
+                "color": "#660099",
+                "ABBR": "ПВХ"
             },
             "90": {
                 "id": 84.6,
                 "length": 6.0,
-                "color": "#556B2F"
+                "color": "#556B2F",
+                "ABBR": "ПВХ"
             },
             "110": {
                 "id": 103.6,
                 "length": 6.0,
-                "color": "#FF3366"
+                "color": "#FF3366",
+                "ABBR": "ПВХ"
             },
             "160": {
                 "id": 150.6,
                 "length": 6.0,
-                "color": "#4682B4"
+                "color": "#4682B4",
+                "ABBR": "ПВХ"
             },
             "200": {
                 "id": 188.6,
                 "length": 6.0,
-                "color": "#8A2BE2"
+                "color": "#8A2BE2",
+                "ABBR": "ПВХ"
             },
             "225": {
                 "id": 212.0,
                 "length": 6.0,
-                "color": "#FF8C00"
+                "color": "#FF8C00",
+                "ABBR": "ПВХ"
             }
         },
         "16": {
             "50": {
                 "id": 46.4,
                 "length": 6.0,
-                "color": "#0066FF"
+                "color": "#0066FF",
+                "ABBR": "ПВХ"
             },
             "63": {
                 "id": 59.0,
                 "length": 6.0,
-                "color": "#33CC33"
+                "color": "#33CC33",
+                "ABBR": "ПВХ"
             },
             "75": {
                 "id": 70.6,
                 "length": 6.0,
-                "color": "#660099"
+                "color": "#660099",
+                "ABBR": "ПВХ"
             },
             "90": {
                 "id": 84.6,
                 "length": 6.0,
-                "color": "#556B2F"
+                "color": "#556B2F",
+                "ABBR": "ПВХ"
             },
             "110": {
                 "id": 103.6,
                 "length": 6.0,
-                "color": "#FF3366"
+                "color": "#FF3366",
+                "ABBR": "ПВХ"
             },
             "160": {
                 "id": 150.6,
                 "length": 6.0,
-                "color": "#4682B4"
+                "color": "#4682B4",
+                "ABBR": "ПВХ"
             },
             "200": {
                 "id": 188.6,
                 "length": 6.0,
-                "color": "#8A2BE2"
+                "color": "#8A2BE2",
+                "ABBR": "ПВХ"
             },
             "225": {
                 "id": 212.0,
                 "length": 6.0,
-                "color": "#FF8C00"
+                "color": "#FF8C00",
+                "ABBR": "ПВХ"
             }
         }
     },
@@ -258,312 +306,372 @@
             "32": {
                 "id": 29.6,
                 "length": 100.0,
-                "color": "#AAAAAA"
+                "color": "#AAAAAA",
+                "ABBR": "ПЕ"
             },
             "40": {
                 "id": 37.0,
                 "length": 100.0,
-                "color": "#CC7722"
+                "color": "#CC7722",
+                "ABBR": "ПЕ"
             },
             "50": {
                 "id": 46.2,
                 "length": 100.0,
-                "color": "#0066FF"
+                "color": "#0066FF",
+                "ABBR": "ПЕ"
             },
             "63": {
                 "id": 58.2,
                 "length": 100.0,
-                "color": "#33CC33"
+                "color": "#33CC33",
+                "ABBR": "ПЕ"
             },
             "75": {
                 "id": 69.2,
                 "length": 100.0,
-                "color": "#660099"
+                "color": "#660099",
+                "ABBR": "ПЕ"
             },
             "90": {
                 "id": 83.0,
                 "length": 100.0,
-                "color": "#556B2F"
+                "color": "#556B2F",
+                "ABBR": "ПЕ"
             },
             "110": {
                 "id": 101.4,
                 "length": 100.0,
-                "color": "#FF3366"
+                "color": "#FF3366",
+                "ABBR": "ПЕ"
             },
             "160": {
                 "id": 147.6,
                 "length": 12.0,
-                "color": "#4682B4"
+                "color": "#4682B4",
+                "ABBR": "ПЕ"
             },
             "200": {
                 "id": 184.6,
                 "length": 12.0,
-                "color": "#8A2BE2"
+                "color": "#8A2BE2",
+                "ABBR": "ПЕ"
             },
             "225": {
                 "id": 207.0,
                 "length": 12.0,
-                "color": "#FF8C00"
+                "color": "#FF8C00",
+                "ABBR": "ПЕ"
             }
         },
         "6": {
             "32": {
                 "id": 29.6,
                 "length": 100.0,
-                "color": "#AAAAAA"
+                "color": "#AAAAAA",
+                "ABBR": "ПЕ"
             },
             "40": {
                 "id": 37.0,
                 "length": 100.0,
-                "color": "#CC7722"
+                "color": "#CC7722",
+                "ABBR": "ПЕ"
             },
             "50": {
                 "id": 46.2,
                 "length": 100.0,
-                "color": "#0066FF"
+                "color": "#0066FF",
+                "ABBR": "ПЕ"
             },
             "63": {
                 "id": 58.2,
                 "length": 100.0,
-                "color": "#33CC33"
+                "color": "#33CC33",
+                "ABBR": "ПЕ"
             },
             "75": {
                 "id": 69.2,
                 "length": 100.0,
-                "color": "#660099"
+                "color": "#660099",
+                "ABBR": "ПЕ"
             },
             "90": {
                 "id": 83.0,
                 "length": 100.0,
-                "color": "#556B2F"
+                "color": "#556B2F",
+                "ABBR": "ПЕ"
             },
             "110": {
                 "id": 101.4,
                 "length": 100.0,
-                "color": "#FF3366"
+                "color": "#FF3366",
+                "ABBR": "ПЕ"
             },
             "160": {
                 "id": 147.6,
                 "length": 12.0,
-                "color": "#4682B4"
+                "color": "#4682B4",
+                "ABBR": "ПЕ"
             },
             "200": {
                 "id": 184.6,
                 "length": 12.0,
-                "color": "#8A2BE2"
+                "color": "#8A2BE2",
+                "ABBR": "ПЕ"
             },
             "225": {
                 "id": 207.0,
                 "length": 12.0,
-                "color": "#FF8C00"
+                "color": "#FF8C00",
+                "ABBR": "ПЕ"
             }
         },
         "8": {
             "32": {
                 "id": 29.6,
                 "length": 100.0,
-                "color": "#AAAAAA"
+                "color": "#AAAAAA",
+                "ABBR": "ПЕ"
             },
             "40": {
                 "id": 37.0,
                 "length": 100.0,
-                "color": "#CC7722"
+                "color": "#CC7722",
+                "ABBR": "ПЕ"
             },
             "50": {
                 "id": 46.2,
                 "length": 100.0,
-                "color": "#0066FF"
+                "color": "#0066FF",
+                "ABBR": "ПЕ"
             },
             "63": {
                 "id": 58.2,
                 "length": 100.0,
-                "color": "#33CC33"
+                "color": "#33CC33",
+                "ABBR": "ПЕ"
             },
             "75": {
                 "id": 69.2,
                 "length": 100.0,
-                "color": "#660099"
+                "color": "#660099",
+                "ABBR": "ПЕ"
             },
             "90": {
                 "id": 83.0,
                 "length": 100.0,
-                "color": "#556B2F"
+                "color": "#556B2F",
+                "ABBR": "ПЕ"
             },
             "110": {
                 "id": 101.4,
                 "length": 100.0,
-                "color": "#FF3366"
+                "color": "#FF3366",
+                "ABBR": "ПЕ"
             },
             "160": {
                 "id": 147.6,
                 "length": 12.0,
-                "color": "#4682B4"
+                "color": "#4682B4",
+                "ABBR": "ПЕ"
             },
             "200": {
                 "id": 184.6,
                 "length": 12.0,
-                "color": "#8A2BE2"
+                "color": "#8A2BE2",
+                "ABBR": "ПЕ"
             },
             "225": {
                 "id": 207.0,
                 "length": 12.0,
-                "color": "#FF8C00"
+                "color": "#FF8C00",
+                "ABBR": "ПЕ"
             }
         },
         "10": {
             "32": {
                 "id": 29.6,
                 "length": 100.0,
-                "color": "#AAAAAA"
+                "color": "#AAAAAA",
+                "ABBR": "ПЕ"
             },
             "40": {
                 "id": 37.0,
                 "length": 100.0,
-                "color": "#CC7722"
+                "color": "#CC7722",
+                "ABBR": "ПЕ"
             },
             "50": {
                 "id": 46.2,
                 "length": 100.0,
-                "color": "#0066FF"
+                "color": "#0066FF",
+                "ABBR": "ПЕ"
             },
             "63": {
                 "id": 58.2,
                 "length": 100.0,
-                "color": "#33CC33"
+                "color": "#33CC33",
+                "ABBR": "ПЕ"
             },
             "75": {
                 "id": 69.2,
                 "length": 100.0,
-                "color": "#660099"
+                "color": "#660099",
+                "ABBR": "ПЕ"
             },
             "90": {
                 "id": 83.0,
                 "length": 100.0,
-                "color": "#556B2F"
+                "color": "#556B2F",
+                "ABBR": "ПЕ"
             },
             "110": {
                 "id": 101.4,
                 "length": 100.0,
-                "color": "#FF3366"
+                "color": "#FF3366",
+                "ABBR": "ПЕ"
             },
             "160": {
                 "id": 147.6,
                 "length": 12.0,
-                "color": "#4682B4"
+                "color": "#4682B4",
+                "ABBR": "ПЕ"
             },
             "200": {
                 "id": 184.6,
                 "length": 12.0,
-                "color": "#8A2BE2"
+                "color": "#8A2BE2",
+                "ABBR": "ПЕ"
             },
             "225": {
                 "id": 207.0,
                 "length": 12.0,
-                "color": "#FF8C00"
+                "color": "#FF8C00",
+                "ABBR": "ПЕ"
             }
         },
         "12.5": {
             "32": {
                 "id": 29.6,
                 "length": 100.0,
-                "color": "#AAAAAA"
+                "color": "#AAAAAA",
+                "ABBR": "ПЕ"
             },
             "40": {
                 "id": 37.0,
                 "length": 100.0,
-                "color": "#CC7722"
+                "color": "#CC7722",
+                "ABBR": "ПЕ"
             },
             "50": {
                 "id": 46.2,
                 "length": 100.0,
-                "color": "#0066FF"
+                "color": "#0066FF",
+                "ABBR": "ПЕ"
             },
             "63": {
                 "id": 58.2,
                 "length": 100.0,
-                "color": "#33CC33"
+                "color": "#33CC33",
+                "ABBR": "ПЕ"
             },
             "75": {
                 "id": 69.2,
                 "length": 100.0,
-                "color": "#660099"
+                "color": "#660099",
+                "ABBR": "ПЕ"
             },
             "90": {
                 "id": 83.0,
                 "length": 100.0,
-                "color": "#556B2F"
+                "color": "#556B2F",
+                "ABBR": "ПЕ"
             },
             "110": {
                 "id": 101.4,
                 "length": 100.0,
-                "color": "#FF3366"
+                "color": "#FF3366",
+                "ABBR": "ПЕ"
             },
             "160": {
                 "id": 147.6,
                 "length": 12.0,
-                "color": "#4682B4"
+                "color": "#4682B4",
+                "ABBR": "ПЕ"
             },
             "200": {
                 "id": 184.6,
                 "length": 12.0,
-                "color": "#8A2BE2"
+                "color": "#8A2BE2",
+                "ABBR": "ПЕ"
             },
             "225": {
                 "id": 207.0,
                 "length": 12.0,
-                "color": "#FF8C00"
+                "color": "#FF8C00",
+                "ABBR": "ПЕ"
             }
         },
         "16": {
             "32": {
                 "id": 29.6,
                 "length": 100.0,
-                "color": "#AAAAAA"
+                "color": "#AAAAAA",
+                "ABBR": "ПЕ"
             },
             "40": {
                 "id": 37.0,
                 "length": 100.0,
-                "color": "#CC7722"
+                "color": "#CC7722",
+                "ABBR": "ПЕ"
             },
             "50": {
                 "id": 46.2,
                 "length": 100.0,
-                "color": "#0066FF"
+                "color": "#0066FF",
+                "ABBR": "ПЕ"
             },
             "63": {
                 "id": 58.2,
                 "length": 100.0,
-                "color": "#33CC33"
+                "color": "#33CC33",
+                "ABBR": "ПЕ"
             },
             "75": {
                 "id": 69.2,
                 "length": 100.0,
-                "color": "#660099"
+                "color": "#660099",
+                "ABBR": "ПЕ"
             },
             "90": {
                 "id": 83.0,
                 "length": 100.0,
-                "color": "#556B2F"
+                "color": "#556B2F",
+                "ABBR": "ПЕ"
             },
             "110": {
                 "id": 101.4,
                 "length": 100.0,
-                "color": "#FF3366"
+                "color": "#FF3366",
+                "ABBR": "ПЕ"
             },
             "160": {
                 "id": 147.6,
                 "length": 12.0,
-                "color": "#4682B4"
+                "color": "#4682B4",
+                "ABBR": "ПЕ"
             },
             "200": {
                 "id": 184.6,
                 "length": 12.0,
-                "color": "#8A2BE2"
+                "color": "#8A2BE2",
+                "ABBR": "ПЕ"
             },
             "225": {
                 "id": 207.0,
                 "length": 12.0,
-                "color": "#FF8C00"
+                "color": "#FF8C00",
+                "ABBR": "ПЕ"
             }
         }
     },
@@ -572,96 +680,114 @@
             "50": {
                 "id": 51.5,
                 "length": 100.0,
-                "color": "#0066FF"
+                "color": "#0066FF",
+                "ABBR": "ЛФ"
             },
             "65": {
                 "id": 66.0,
                 "length": 100.0,
-                "color": "#33CC33"
+                "color": "#33CC33",
+                "ABBR": "ЛФ"
             },
             "75": {
                 "id": 77.0,
                 "length": 100.0,
-                "color": "#660099"
+                "color": "#660099",
+                "ABBR": "ЛФ"
             },
             "100": {
                 "id": 103.0,
                 "length": 100.0,
-                "color": "#556B2F"
+                "color": "#556B2F",
+                "ABBR": "ЛФ"
             },
             "150": {
                 "id": 154.0,
                 "length": 100.0,
-                "color": "#4682B4"
+                "color": "#4682B4",
+                "ABBR": "ЛФ"
             },
             "200": {
                 "id": 205.0,
                 "length": 100.0,
-                "color": "#D2691E"
+                "color": "#D2691E",
+                "ABBR": "ЛФ"
             }
         },
         "4": {
             "50": {
                 "id": 51.5,
                 "length": 100.0,
-                "color": "#0066FF"
+                "color": "#0066FF",
+                "ABBR": "ЛФ"
             },
             "65": {
                 "id": 66.0,
                 "length": 100.0,
-                "color": "#33CC33"
+                "color": "#33CC33",
+                "ABBR": "ЛФ"
             },
             "75": {
                 "id": 77.0,
                 "length": 100.0,
-                "color": "#660099"
+                "color": "#660099",
+                "ABBR": "ЛФ"
             },
             "100": {
                 "id": 103.0,
                 "length": 100.0,
-                "color": "#8b0534"
+                "color": "#8b0534",
+                "ABBR": "ЛФ"
             },
             "150": {
                 "id": 154.0,
                 "length": 100.0,
-                "color": "#4682B4"
+                "color": "#4682B4",
+                "ABBR": "ЛФ"
             },
             "200": {
                 "id": 205.0,
                 "length": 100.0,
-                "color": "#D2691E"
+                "color": "#D2691E",
+                "ABBR": "ЛФ"
             }
         },
         "6": {
             "50": {
                 "id": 51.5,
                 "length": 100.0,
-                "color": "#0066FF"
+                "color": "#0066FF",
+                "ABBR": "ЛФ"
             },
             "65": {
                 "id": 66.0,
                 "length": 100.0,
-                "color": "#33CC33"
+                "color": "#33CC33",
+                "ABBR": "ЛФ"
             },
             "75": {
                 "id": 77.0,
                 "length": 100.0,
-                "color": "#660099"
+                "color": "#660099",
+                "ABBR": "ЛФ"
             },
             "100": {
                 "id": 103.0,
                 "length": 100.0,
-                "color": "#556B2F"
+                "color": "#556B2F",
+                "ABBR": "ЛФ"
             },
             "150": {
                 "id": 154.0,
                 "length": 100.0,
-                "color": "#4682B4"
+                "color": "#4682B4",
+                "ABBR": "ЛФ"
             },
             "200": {
                 "id": 205.0,
                 "length": 100.0,
-                "color": "#D2691E"
+                "color": "#D2691E",
+                "ABBR": "ЛФ"
             }
         }
     }

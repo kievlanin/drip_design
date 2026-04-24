@@ -549,6 +549,7 @@ class DripCADUI(DripCAD):
             lateral_block_idx = [abi] * len(all_lats)
             merge_meta["_orig_sm_indices"] = orig_sm_indices
             merge_meta["_merge_lat_lo"] = lat_lo
+            merge_meta["_orig_block_idx"] = int(abi)
             plan_all = self._all_submain_section_lengths_by_sm()
             section_lengths_by_sm = [
                 plan_all[i] if i < len(plan_all) else [] for i in orig_sm_indices
@@ -563,6 +564,51 @@ class DripCADUI(DripCAD):
         ref_bi = int(submain_block_idx[0]) if submain_block_idx else 0
         eff_ref = self._allowed_pipes_for_block_index(ref_bi)
         mat_str, pn_str = self._derive_hydro_mat_pn_from_allowed(eff_ref)
+        emit_model_name = (self.var_emit_model.get() or "").strip()
+        emit_nominal_str = (self.var_emit_nominal_flow.get() or "").strip()
+        if active_block_only and (not emit_model_name or not emit_nominal_str):
+            try:
+                abi2 = int(merge_meta.get("_orig_block_idx", -1))
+            except (TypeError, ValueError):
+                abi2 = -1
+            if 0 <= abi2 < len(self.field_blocks):
+                p_blk = self.field_blocks[abi2].get("params") or {}
+                if not emit_model_name:
+                    emit_model_name = str(p_blk.get("emit_model", "") or "").strip()
+                if not emit_nominal_str:
+                    emit_nominal_str = str(
+                        p_blk.get("emit_nominal_flow", p_blk.get("flow", "")) or ""
+                    ).strip()
+        try:
+            emitter_k_coeff = float((self.var_emit_k_coeff.get().strip() or "0").replace(",", "."))
+        except (TypeError, ValueError):
+            emitter_k_coeff = 0.0
+        try:
+            emitter_x_exp = float((self.var_emit_x_exp.get().strip() or "0").replace(",", "."))
+        except (TypeError, ValueError):
+            emitter_x_exp = 0.0
+        try:
+            emitter_kd_coeff = float((self.var_emit_kd_coeff.get().strip() or "1").replace(",", "."))
+        except (TypeError, ValueError):
+            emitter_kd_coeff = 1.0
+        if emitter_x_exp <= 1e-12:
+            try:
+                rec = self._dripper_record(emit_model_name, emit_nominal_str)
+            except Exception:
+                rec = None
+            if isinstance(rec, dict):
+                try:
+                    emitter_k_coeff = float(rec.get("constant_k", emitter_k_coeff))
+                except (TypeError, ValueError):
+                    pass
+                try:
+                    emitter_x_exp = float(rec.get("exponent_x", emitter_x_exp))
+                except (TypeError, ValueError):
+                    pass
+                try:
+                    emitter_kd_coeff = float(rec.get("kd", emitter_kd_coeff))
+                except (TypeError, ValueError):
+                    pass
         dto = {
             "e_step": float(self.var_emit_step.get().replace(",", ".")),
             "e_flow": float(self.var_emit_flow.get().replace(",", ".")),
@@ -600,15 +646,11 @@ class DripCADUI(DripCAD):
             "emitter_h_press_max_m": float(
                 self.var_emit_h_press_max.get().replace(",", ".")
             ),
-            "emitter_k_coeff": float(
-                (self.var_emit_k_coeff.get().strip() or "0").replace(",", ".")
-            ),
-            "emitter_x_exp": float(
-                (self.var_emit_x_exp.get().strip() or "0").replace(",", ".")
-            ),
-            "emitter_kd_coeff": float(
-                (self.var_emit_kd_coeff.get().strip() or "1").replace(",", ".")
-            ),
+            "emitter_k_coeff": float(emitter_k_coeff),
+            "emitter_x_exp": float(emitter_x_exp),
+            "emitter_kd_coeff": float(emitter_kd_coeff),
+            "emitter_model_name": emit_model_name,
+            "emitter_nominal_flow_lph": emit_nominal_str,
             "lateral_block_idx": lateral_block_idx,
             "submain_topo_in_headloss": bool(getattr(self, "_submain_topo_in_headloss", True)),
             "submain_lateral_snap_m": self._submain_lateral_snap_m(),
@@ -727,10 +769,13 @@ class DripCADUI(DripCAD):
                     partial,
                     data["_orig_sm_indices"],
                     int(data["_merge_lat_lo"]),
+                    int(data.get("_orig_block_idx", -1)),
                 )
                 self._merge_hydro_slice_into_state(remapped)
+                self._refresh_emitter_q_extrema_overlay_state([int(data.get("_orig_block_idx", -1))])
             else:
                 self.calc_results = partial
+                self._refresh_emitter_q_extrema_overlay_state()
             self._restore_section_label_positions(old_label_pts)
             self.last_report = hydro_result["report"]
             self.orchestrator.last_hydraulic = {

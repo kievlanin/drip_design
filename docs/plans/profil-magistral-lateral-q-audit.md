@@ -1,6 +1,6 @@
 # План: профіль магістралі, кольори латералів за Q, панель «Блок»
 
-**Статус:** чернетка плану до реалізації (оновлюйте цей файл після виконання пунктів).
+**Статус:** основні пункти 1–4 реалізовано в коді (2026-04-23); тести — п.5 частково (`tests/test_trunk_segment_world_path.py`).
 
 ## 1. Профіль прокладки (обрізається до «насос — перший пікет»)
 
@@ -46,8 +46,8 @@
 
 ## Трека робіт (коротко)
 
-1. `_trunk_segment_world_path`: при 2 `node_indices` підставляти `path_local`, якщо він довший/детальніший.
-2. `hydraulics_core`: `lateral_flow_audit` (q_min/q_max/q_nom + ідентифікація емітерів).
-3. `dripcad_legacy`: кольори латералів за `lateral_flow_audit` (+ fallback на тиск).
-4. `control_panel_impl` + refresh: блок тексту з min/max Q по латералях активного блоку.
-5. Тести на path та/або flow audit.
+1. ~~`_trunk_segment_world_path`: при 2 `node_indices` підставляти `path_local`, якщо він довший/детальніший.~~
+2. ~~`hydraulics_core`: `lateral_flow_audit` (q_min/q_max/q_nom + ідентифікація емітерів).~~
+3. ~~`dripcad_legacy`: кольори латералів за `lateral_flow_audit` (+ fallback на тиск); карта — `map_viewer_tk_window._lat_line_color_map`.~~
+4. ~~`control_panel_impl` + `refresh_block_lateral_flow_audit_panel` (виклик з `refresh_block_out_of_range_emitters_panel`).~~
+5. ~~Тести на path~~; тест на `lateral_flow_audit` — за бажанням (потребує мок гідравліки / інтеграції).

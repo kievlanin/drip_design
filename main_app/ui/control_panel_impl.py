@@ -220,11 +220,28 @@ class ControlPanel:
             txt.insert(tk.END, "--- Сабмейн: секції ---\n")
             for s in sections:
                 smi = int(s.get("sm_idx", -1))
-                txt.insert(
-                    tk.END,
-                    f"SM {smi + 1}: {s.get('mat','?')} d{s.get('d','?')}/{s.get('pn','?')}  "
-                    f"L={float(s.get('L', 0.0)):.1f} м\n",
-                )
+                _dr = s.get("d")
+                try:
+                    d_f = float(_dr)
+                    od_show = (
+                        str(int(round(d_f)))
+                        if abs(d_f - round(d_f)) < 0.01
+                        else f"{d_f:.2f}".rstrip("0").rstrip(".")
+                    )
+                except (TypeError, ValueError):
+                    od_show = str(_dr).strip() if _dr is not None else "?"
+                sig_fn = getattr(self.app, "_format_pipe_signature", None)
+                if callable(sig_fn):
+                    sm_line = (
+                        f"SM {smi + 1}: "
+                        f"{sig_fn(str(s.get('mat', '') or ''), str(s.get('pn', '') or ''), od_show, float(s.get('L', 0.0) or 0.0))}\n"
+                    )
+                else:
+                    sm_line = (
+                        f"SM {smi + 1}: {s.get('mat', '?')} d{s.get('d', '?')}/{s.get('pn', '?')}  "
+                        f"L={float(s.get('L', 0.0)):.1f} м\n"
+                    )
+                txt.insert(tk.END, sm_line)
 
         valves = dict(self.app.calc_results.get("valves") or {})
         block_valves = []
@@ -601,32 +618,6 @@ class ControlPanel:
             activeforeground="#88DDFF",
             font=("Arial", 9),
         ).pack(side=tk.LEFT, anchor=tk.W)
-        tk.Checkbutton(
-            emit_ctrl,
-            text="Ізолінії виливу",
-            variable=self.app.var_show_emitter_flow,
-            command=lambda: self.app._schedule_emit_preview_redraw(60),
-            bg="#1e1e1e",
-            fg="#88DDFF",
-            selectcolor="#333",
-            activebackground="#1e1e1e",
-            activeforeground="#88DDFF",
-            font=("Arial", 8),
-        ).pack(anchor=tk.W, pady=(0, 2))
-        tk.Checkbutton(
-            emit_ctrl,
-            text="Маски переливу / недоливу на мапі блоку (контури)",
-            variable=self.app.var_show_press_zone_outlines_on_map,
-            command=lambda: self.app._schedule_emit_preview_redraw(60),
-            bg="#1e1e1e",
-            fg="#CCCCCC",
-            selectcolor="#333333",
-            activebackground="#1e1e1e",
-            activeforeground="#CCCCCC",
-            font=("Arial", 8),
-            justify=tk.LEFT,
-            wraplength=420,
-        ).pack(anchor=tk.W, pady=(0, 2))
         self.block_emit_preview_canvas = tk.Canvas(
             sec_emit_preview,
             bg="#222",
@@ -634,6 +625,14 @@ class ControlPanel:
             height=260,
         )
         self.block_emit_preview_canvas.pack(fill=tk.BOTH, expand=True, padx=8, pady=(2, 6))
+        tk.Label(
+            sec_emit_preview,
+            text="Крапельниці поза діапазоном тиску (H мін./макс.):",
+            bg="#1e1e1e",
+            fg="#AAAAAA",
+            font=("Arial", 8),
+            anchor=tk.W,
+        ).pack(fill=tk.X, padx=8, pady=(4, 0))
         self.txt_block_bad_emitters = scrolledtext.ScrolledText(
             sec_emit_preview,
             height=6,
@@ -644,7 +643,26 @@ class ControlPanel:
             insertbackground="white",
             state=tk.DISABLED,
         )
-        self.txt_block_bad_emitters.pack(fill=tk.X, padx=8, pady=(0, 8))
+        self.txt_block_bad_emitters.pack(fill=tk.X, padx=8, pady=(0, 4))
+        tk.Label(
+            sec_emit_preview,
+            text="Вилив vs Q ном (±5 %):",
+            bg="#1e1e1e",
+            fg="#AAAAAA",
+            font=("Arial", 8),
+            anchor=tk.W,
+        ).pack(fill=tk.X, padx=8, pady=(6, 0))
+        self.txt_block_flow_audit = scrolledtext.ScrolledText(
+            sec_emit_preview,
+            height=7,
+            wrap=tk.WORD,
+            bg="#252525",
+            fg="#E8E0D5",
+            font=("Consolas", 8),
+            insertbackground="white",
+            state=tk.DISABLED,
+        )
+        self.txt_block_flow_audit.pack(fill=tk.X, padx=8, pady=(0, 8))
         self.block_emit_preview_canvas.bind(
             "<Configure>",
             lambda _e: self.app._schedule_emit_preview_redraw(220),

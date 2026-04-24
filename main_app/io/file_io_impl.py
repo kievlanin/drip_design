@@ -243,6 +243,19 @@ def _normalize_consumer_schedule_payload(raw) -> dict:
             goal = "money"
         out["trunk_schedule_opt_goal"] = goal
         out["trunk_pipes_selected"] = bool(raw.get("trunk_pipes_selected", False))
+        fv_pos = raw.get("field_valve_label_pos")
+        clean_fv_pos = {}
+        if isinstance(fv_pos, dict):
+            for ks, vv in fv_pos.items():
+                k = str(ks).strip()
+                if not k:
+                    continue
+                if isinstance(vv, (list, tuple)) and len(vv) >= 2:
+                    try:
+                        clean_fv_pos[k] = [float(vv[0]), float(vv[1])]
+                    except (TypeError, ValueError):
+                        pass
+        out["field_valve_label_pos"] = clean_fv_pos
         src_mode = str(raw.get("srtm_source_mode", "auto")).strip().lower()
         if src_mode not in ("auto", "skadi_local", "open_elevation", "earthdata"):
             src_mode = "auto"
@@ -482,6 +495,11 @@ def _collect_project_data(app, force_georeferenced=False):
             ),
             "show_srtm_boundary_overlay": bool(
                 getattr(app, "show_srtm_boundary_overlay", None) and app.show_srtm_boundary_overlay.get()
+            ),
+            "canvas_layers": (
+                app._export_canvas_layer_state()
+                if hasattr(app, "_export_canvas_layer_state")
+                else {}
             ),
             "mat": app.pipe_material.get(),
             "pn": app.pipe_pn.get(),
@@ -1113,6 +1131,8 @@ def load_project(app):
             app.show_topo_computation_zone.set(bool(p.get("show_topo_computation_zone", False)))
         if hasattr(app, "show_srtm_boundary_overlay"):
             app.show_srtm_boundary_overlay.set(bool(p.get("show_srtm_boundary_overlay", False)))
+        if hasattr(app, "_load_canvas_layer_state"):
+            app._load_canvas_layer_state(p.get("canvas_layers", {}))
         
         # ОНОВЛЮЄМО МЕНЮШКИ ПІСЛЯ ЗАВАНТАЖЕННЯ БАЗИ ТРУБ
         avail = list(app.pipe_db.keys())
