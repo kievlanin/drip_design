@@ -13,7 +13,6 @@ import subprocess
 import sys
 import threading
 import time
-from collections import OrderedDict
 from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 from shapely.geometry import (
     MultiLineString,
@@ -28,12 +27,12 @@ from shapely.ops import nearest_points, substring, unary_union
 
 # Імпорт модулів нової структури
 from modules.hydraulic_module.hydraulics_constants import hazen_c_from_pipe_entry
-from modules.hydraulic_module.hydraulics_core import (
+from modules.hydraulic_module.api import (
     HydraulicEngine,
-    _pn_sort_tuple,
     allowed_pipe_candidates_sorted,
     normalize_allowed_pipes_map,
     pick_smallest_allowed_pipe_for_inner_req,
+    pn_sort_tuple as _pn_sort_tuple,
 )
 from modules.hydraulic_module.trunk_tree_compute import (
     TrunkTreeEdge,
@@ -45,21 +44,17 @@ from modules.hydraulic_module import lateral_solver as lat_sol
 from modules.hydraulic_module.lateral_drip_core import hazen_williams_hloss_m
 from modules.hydraulic_module.emitter_block_equivalent import block_flow_at_ref
 from main_app.ui.silent_messagebox import (
+    silent_askyesno,
     silent_showerror,
     silent_showinfo,
     silent_showwarning,
 )
+from main_app.io.project_blocks import translate_field_block
 from main_app.paths import PIPES_DB_PATH, PROJECT_ROOT, DRIPPERS_DB_PATH, LATERALS_DB_PATH
 from main_app.io import file_io_impl as file_io
 from main_app.ui.control_panel_impl import ControlPanel
 from main_app.ui.tooltips import attach_tooltip
-from modules.geo_module.topography_core import (
-    TopoEngine,
-    _idw_z,
-    _BUCKET_CELL_M,
-    _build_point_buckets,
-    _z_at_grid_node,
-)
+from modules.geo_module.topography_core import TopoEngine
 from modules.hydraulic_module.trunk_map_graph import (
     build_oriented_edges,
     ensure_trunk_node_ids,
@@ -195,6 +190,10 @@ class DripCAD:
         self._submain_topo_in_headloss = True
         self._submain_preview_world = None
         self._submain_end_snapped = False
+        # SUBMAIN: throttling recalc (Shapely) і останній кадр після кліку
+        self._submain_motion_t_last: float = 0.0
+        self._SUBMAIN_MOTION_RECALC_INTERVAL_S: float = 1.0 / 35.0
+        self._submain_recalc_urgent: bool = False
         self._moving_section_label_key = None
         self._moving_section_label_sub_idx = None
         self._moving_section_label_sm_idx = None
@@ -204,8 +203,6 @@ class DripCAD:
         self._moving_trunk_tel_preview: Optional[Tuple[float, float]] = None
         self._moving_field_valve_label_key: Optional[str] = None
         self._moving_field_valve_label_preview: Optional[Tuple[float, float]] = None
-        self._emit_isolines_cache = {"sig": None, "contours": [], "contours_by_cls": {}}
-        self._pressure_zone_geom_cache = OrderedDict()
         self._zoom_box_start = None
         self._zoom_box_end = None
         self.ruler_start = None
@@ -260,6 +257,9 @@ class DripCAD:
         self._trunk_node_drag_moved: bool = False
         # Вибір (стрілка): збережені об'єкти (category, payload, label); рамка ЛКМ.
         self._canvas_selection_keys: List[Tuple[str, object, str]] = []
+        # Копіювання блоку (меню «Шари»): 1) блок, 2) точка прив’язки, 3+) точки вставки.
+        self._block_copy_source_idx: Optional[int] = None
+        self._block_copy_anchor_world: Optional[Tuple[float, float]] = None
         self._select_marquee_active = False
         self._select_marquee_dragged = False
         self._select_marquee_start_screen: Optional[Tuple[int, int]] = None
@@ -314,16 +314,11 @@ class DripCAD:
         self.var_trunk_display_velocity_warn_mps = tk.StringVar(value="0")
         # Підказка на магістралі (карта / полотно): False — топологія (граф), True — розрахунок/труби.
         self.var_trunk_map_hover_pipes_mode = tk.BooleanVar(value=False)
-        self.var_submain_lateral_snap_m = tk.StringVar(value="2.0")
+        self.var_submain_lateral_snap_m = tk.StringVar(value="4.0")
         self.var_valve_h_max_m = tk.StringVar(value="0")
         self.var_valve_h_max_optimize = tk.BooleanVar(value=True)
-        # Увімкніть за потреби: IDW + ізолінії навантажують CPU; типово вимкнено для плавнішого UI.
+        # Прев'ю діаграми виливу на вкладці «Блок» (без ізоліній/масок — лише точки).
         self.var_show_emit_diagram_panel = tk.BooleanVar(value=False)
-        self.var_show_emitter_flow = tk.BooleanVar(value=False)
-        # Діаграма виливу рендериться лише в окремому вікні, не на полотні блоку.
-        self._emit_flow_draw_on_canvas = False
-        self.var_show_press_zone_outlines_on_map = tk.BooleanVar(value=False)
-        self.var_emit_iso_method = tk.StringVar(value="idw")
         # Латералі: compare | bisection | newton | trickle_nr (див. lateral_solver_stats у звіті)
         self.var_lateral_solver_mode = tk.StringVar(value="bisection")
         
@@ -378,19 +373,6 @@ class DripCAD:
         )
         self.var_valve_h_max_optimize.trace_add(
             "write", lambda *a: self._invalidate_hydro_ui_active_block_or_all()
-        )
-        self.var_show_emitter_flow.trace_add("write", self._on_heavy_canvas_toggle_changed)
-        self.var_show_press_zone_outlines_on_map.trace_add("write", self._on_heavy_canvas_toggle_changed)
-        self.var_emit_iso_method.trace_add(
-            "write",
-                lambda *a: (
-                setattr(
-                    self,
-                    "_emit_isolines_cache",
-                    {"sig": None, "contours": [], "contours_by_cls": {}},
-                ),
-                self.redraw(),
-            ),
         )
         # Режим бісекція/Ньютон застосовується лише під час «Розрахунок»; перемикання не чіпає calc_results.
         self.pipe_material.trace_add("write", lambda *a: self.update_pn_dropdown(skip_reset=True))
@@ -981,6 +963,7 @@ class DripCAD:
         my = int(menu_anchor[1]) if menu_anchor else int(self.root.winfo_pointery())
         m = tk.Menu(self.root, tearoff=0)
         m.add_command(label="Налаштування шарів...", command=self.open_canvas_layers_dialog)
+        m.add_command(label="Копіювати блок…", command=self._enter_block_copy_mode)
         m.add_separator()
         m.add_command(
             label="Показати всі шари",
@@ -993,6 +976,106 @@ class DripCAD:
                 m.grab_release()
             except Exception:
                 pass
+
+    def _enter_block_copy_mode(self) -> None:
+        """ПКМ на порожньому полотні: копіювання — блок, прив'язка, багато вставок; ДБЛ ПКМ / Esc вихід."""
+        self._destroy_select_hover_pick_ui()
+        self._select_marquee_active = False
+        self._select_marquee_dragged = False
+        self._select_marquee_start_screen = None
+        self._select_marquee_curr_screen = None
+        self._select_marquee_start_world = None
+        self._select_marquee_curr_world = None
+        self._canvas_selection_keys = []
+        self._block_copy_source_idx = None
+        self._block_copy_anchor_world = None
+        self._canvas_special_tool = "block_copy"
+        self._refresh_canvas_cursor_for_special_tool()
+        self._flash_top_mode_hint(
+            "Копіювання блоку: 1) ЛКМ — вибір блоку, 2) ЛКМ — точка прив’язки, далі ЛКМ — точки вставки. ДБЛ ПКМ / Esc — кінець.",
+            duration_ms=8000,
+        )
+        self.redraw()
+
+    def _exit_block_copy_mode(self) -> None:
+        self._block_copy_source_idx = None
+        self._block_copy_anchor_world = None
+        self._canvas_special_tool = "select"
+        self._refresh_canvas_cursor_for_special_tool()
+
+    def _on_block_copy_left_click(self, wx: float, wy: float) -> None:
+        m = self.mode.get()
+        if m not in ("VIEW", "PAN"):
+            silent_showwarning(
+                self.root,
+                "Копіювання блоку",
+                "Перемкніть режим на «Перегляд» або «Панорама».",
+            )
+            return
+        if not self.is_canvas_layer_selectable("block.boundaries"):
+            silent_showwarning(
+                self.root,
+                "Копіювання блоку",
+                "Шар «Контур блоку» не вибирається. Увімкніть видимість/вибір у «Налаштування шарів…».",
+            )
+            return
+        if not self.field_blocks:
+            silent_showwarning(self.root, "Копіювання блоку", "Немає блоків поля.")
+            self._exit_block_copy_mode()
+            self._restore_top_mode_hint()
+            return
+        src = getattr(self, "_block_copy_source_idx", None)
+        anchor = getattr(self, "_block_copy_anchor_world", None)
+        if src is None:
+            bi = self._pick_block_for_context_menu(float(wx), float(wy))
+            if bi is None:
+                silent_showwarning(
+                    self.root,
+                    "Копіювання блоку",
+                    "Перший ЛКМ має бути всередині або біля контуру блоку-джерела.",
+                )
+                return
+            self._block_copy_source_idx = int(bi)
+            self._flash_top_mode_hint(
+                f"Блок {int(bi) + 1} вибрано. Другий ЛКМ — точка прив’язки.",
+                duration_ms=8000,
+            )
+            return
+        if src < 0 or src >= len(self.field_blocks):
+            silent_showwarning(self.root, "Копіювання блоку", "Блок-джерело недоступний.")
+            self._exit_block_copy_mode()
+            self._restore_top_mode_hint()
+            self.redraw()
+            return
+        sp = self.get_snap(float(wx), float(wy))
+        if sp is not None:
+            wx, wy = float(sp[0]), float(sp[1])
+        if anchor is None:
+            self._block_copy_anchor_world = (float(wx), float(wy))
+            self._flash_top_mode_hint(
+                "Точку прив’язки збережено. Наступні ЛКМ — точки вставки. ДБЛ ПКМ / Esc — кінець.",
+                duration_ms=8000,
+            )
+            return
+        ax, ay = float(anchor[0]), float(anchor[1])
+        ins_x, ins_y = float(wx), float(wy)
+        dx, dy = ins_x - ax, ins_y - ay
+        if len(self.field_blocks) >= self.MAX_FIELD_BLOCKS:
+            silent_showwarning(self.root, "Увага", f"Максимум {self.MAX_FIELD_BLOCKS} блоків поля.")
+            self._exit_block_copy_mode()
+            self._restore_top_mode_hint()
+            return
+        new_b = translate_field_block(self.field_blocks[int(src)], dx, dy)
+        self.field_blocks.append(new_b)
+        n = len(self.field_blocks) - 1
+        self.var_active_block_idx.set(n)
+        self._refresh_active_block_combo()
+        self._flash_top_mode_hint(
+            "Блок скопійовано. Наступний ЛКМ — ще одна точка вставки; ДБЛ ПКМ / Esc — кінець.",
+            duration_ms=5000,
+        )
+        self.redraw(skip_heavy_canvas_layers=True)
+        self._schedule_debounced_full_redraw(220)
 
     def _show_all_canvas_layers(self) -> None:
         self._ensure_canvas_layer_dynamic_defaults()
@@ -2643,13 +2726,24 @@ class DripCAD:
 
         def _fmt_valve_head() -> str:
             raw = node.get("trunk_schedule_valve_head_m")
-            if raw is None:
+            if raw is not None:
                 try:
-                    raw = float(node.get("trunk_schedule_h_m"))
+                    return f"{float(raw):.1f}"
                 except (TypeError, ValueError):
-                    raw = self.trunk_schedule_test_h_m_effective()
+                    pass
+            # Fallback: якщо valve_head_m не задано — виводимо h_m мінус valve_loss,
+            # щоб не показувати TARGET (h_m = valve + loss) у полі «Напір на крані».
+            h_raw = node.get("trunk_schedule_h_m")
+            if h_raw is not None:
+                try:
+                    h_val = float(h_raw)
+                    loss_raw = node.get("trunk_schedule_valve_loss_m")
+                    loss_val = float(loss_raw) if loss_raw is not None else 5.0
+                    return f"{max(0.0, h_val - loss_val):.1f}"
+                except (TypeError, ValueError):
+                    pass
             try:
-                return f"{float(raw):.1f}"
+                return f"{max(0.0, float(self.trunk_schedule_test_h_m_effective())):.1f}"
             except (TypeError, ValueError):
                 return "40.0"
 
@@ -6097,6 +6191,8 @@ class DripCAD:
                 self.canvas.config(cursor="hand2")
             elif ct == "select":
                 self.canvas.config(cursor="arrow")
+            elif ct == "block_copy":
+                self.canvas.config(cursor="cross")
             else:
                 self.canvas.config(cursor="")
         except tk.TclError:
@@ -6106,6 +6202,8 @@ class DripCAD:
         idx = int(self.view_notebook.index("current"))
         is_map = idx == 1
         if is_map:
+            self._block_copy_source_idx = None
+            self._block_copy_anchor_world = None
             self._destroy_select_hover_pick_ui()
             self._canvas_special_tool = None
             self._canvas_trunk_draft_world = None
@@ -6180,14 +6278,14 @@ class DripCAD:
                 pass
 
     def _schedule_embedded_map_overlay_refresh(self):
-        """Оновити overlay карти без зуму (дебаунс), лише на вкладці «Карта»."""
+        """Оновити overlay карти без зуму (дебаунс).
+
+        Раніше оновлення було лише на активній вкладці «Карта» — тоді після оптимізації
+        магістралі на «Без карти» лінії/телескоп на карті лишалися старими до ручного
+        перемикання вкладки. Якщо панель карти вже створена — перемальовуємо у фоні,
+        щоб при переході на «Карту» одразу були актуальні діаметри/кольори.
+        """
         if not getattr(self, "_embedded_map_ready", False):
-            return
-        try:
-            idx = int(self.view_notebook.index("current"))
-        except Exception:
-            return
-        if idx != 1:
             return
         host = getattr(self, "_embedded_map_host", None)
         cb = getattr(host, "_refresh_project_overlay", None) if host is not None else None
@@ -6749,6 +6847,11 @@ class DripCAD:
         return True
 
     def _on_double_right_cancel_draft(self, event=None):
+        if getattr(self, "_canvas_special_tool", None) == "block_copy":
+            self._exit_block_copy_mode()
+            self._restore_top_mode_hint()
+            self.redraw()
+            return "break"
         self.cancel_active_draft()
         return "break"
 
@@ -6758,6 +6861,11 @@ class DripCAD:
             wc = foc.winfo_class()
             if wc in ("Entry", "TEntry", "Text"):
                 return
+        if getattr(self, "_canvas_special_tool", None) == "block_copy":
+            self._exit_block_copy_mode()
+            self._restore_top_mode_hint()
+            self.redraw()
+            return "break"
         if getattr(self, "_select_hover_menu_popup", None) is not None:
             self._destroy_select_hover_pick_ui()
             return "break"
@@ -7593,14 +7701,6 @@ class DripCAD:
                 continue
         return None
 
-    @staticmethod
-    def _emit_iso_color(t: float) -> str:
-        t = max(0.0, min(1.0, float(t)))
-        r = int(30 + (240 - 30) * t)
-        g = int(180 + (60 - 180) * t)
-        b = int(255 + (40 - 255) * t)
-        return f"#{r:02x}{g:02x}{b:02x}"
-
     def _merge_sorted_distances(self, dists, eps_m=0.02):
         dists = sorted({float(d) for d in dists if d == d})
         if len(dists) < 2:
@@ -7756,7 +7856,6 @@ class DripCAD:
         lpa = self.calc_results.get("lateral_pressure_audit") or {}
         lat_list = self._flatten_all_lats()
         lateral_bi = self._lateral_block_indices()
-        sm_for_conn = self._hydraulic_submain_lines()
 
         def _lat_sort_key(kv):
             k = str(kv[0])
@@ -7766,6 +7865,49 @@ class DripCAD:
                 return int(k.split("_", 1)[1])
             except (ValueError, IndexError):
                 return 10**9
+
+        if lpa:
+            for key, aud in sorted(lpa.items(), key=_lat_sort_key):
+                if not str(key).startswith("lat_") or not isinstance(aud, dict):
+                    continue
+                try:
+                    li = int(str(key).split("_", 1)[1])
+                except (ValueError, IndexError):
+                    continue
+                if li < len(lateral_bi):
+                    row_bi = int(lateral_bi[li])
+                else:
+                    row_bi = int(aud.get("block_idx", -1))
+                if row_bi != int(bi):
+                    continue
+                out["had_block_emits"] = True
+                st = str(aud.get("status") or "")
+                if st not in ("overflow", "underflow", "both"):
+                    continue
+                ov = st in ("overflow", "both")
+                un = st in ("underflow", "both")
+                if ov and un:
+                    color = "#FF6600"
+                    issue = "перелив і недолив"
+                elif ov:
+                    color = "#FF4444"
+                    issue = f"перелив (H макс. {h_hi:.2f} м)"
+                else:
+                    color = "#E8C547"
+                    issue = f"недолив (H мін. {h_lo:.2f} м)"
+                out["items"].append(
+                    {
+                        "wx": 0.0,
+                        "wy": 0.0,
+                        "color": color,
+                        "line": f"Лат. {li + 1} · {issue}",
+                        "overflow": bool(ov),
+                        "underflow": bool(un),
+                    }
+                )
+            return out
+
+        sm_for_conn = self._hydraulic_submain_lines()
 
         for key, pay in sorted(em_db.items(), key=_lat_sort_key):
             if not str(key).startswith("lat_"):
@@ -7843,71 +7985,9 @@ class DripCAD:
 
         return out
 
-    def _emitter_q_samples_for_block_index(self, bi: int) -> list:
-        """Точки (x, y, q_emit л/г) для IDW поля виливу в межах блоку — ізолінія Q ном."""
-        em_db = self.calc_results.get("emitters") or {}
-        lpa = self.calc_results.get("lateral_pressure_audit") or {}
-        lat_list = self._flatten_all_lats()
-        lateral_bi = self._lateral_block_indices()
-        sm_for_conn = self._hydraulic_submain_lines()
-        out = []
-
-        def _lat_sort_key(kv):
-            k = str(kv[0])
-            if not k.startswith("lat_"):
-                return 10**9
-            try:
-                return int(k.split("_", 1)[1])
-            except (ValueError, IndexError):
-                return 10**9
-
-        for key, pay in sorted(em_db.items(), key=_lat_sort_key):
-            if not str(key).startswith("lat_"):
-                continue
-            try:
-                li = int(str(key).split("_", 1)[1])
-            except (ValueError, IndexError):
-                continue
-            if li < 0 or li >= len(lat_list):
-                continue
-            if li < len(lateral_bi):
-                row_bi = int(lateral_bi[li])
-            else:
-                row_bi = int((lpa.get(f"lat_{li}") or {}).get("block_idx", -1))
-            if row_bi != int(bi):
-                continue
-            lat = lat_list[li]
-            if lat.is_empty or lat.length < 1e-6:
-                continue
-            try:
-                conn = lat_sol.connection_distance_along_lateral(
-                    lat, sm_for_conn, snap_m=self._submain_lateral_snap_m()
-                )
-            except Exception:
-                conn = 0.0
-            conn = max(0.0, min(float(lat.length), float(conn)))
-            for rows, sign_xa in ((pay.get("L1"), -1.0), (pay.get("L2"), 1.0)):
-                for row in rows or []:
-                    qe = float(row.get("q_emit", 0))
-                    if qe <= 1e-4:
-                        continue
-                    xa = float(row.get("x", 0))
-                    along = conn + sign_xa * xa
-                    along = max(0.0, min(float(lat.length), float(along)))
-                    try:
-                        pt = lat.interpolate(along)
-                        out.append((float(pt.x), float(pt.y), float(qe)))
-                    except Exception:
-                        pass
-        if len(out) > 2800:
-            step = max(1, len(out) // 2800)
-            out = out[::step]
-        return out
-
     def _emitter_q_extrema_for_block_index(self, bi: int) -> dict:
         """Мін/макс вилив крапельниці активного блоку з координатами на полі."""
-        em_db = self.calc_results.get("emitters") or {}
-        lpa = self.calc_results.get("lateral_pressure_audit") or {}
+        lfa = self.calc_results.get("lateral_flow_audit") or {}
         lat_list = self._flatten_all_lats()
         lateral_bi = self._lateral_block_indices()
         sm_for_conn = self._hydraulic_submain_lines()
@@ -7940,7 +8020,7 @@ class DripCAD:
                 if q_new > q_cur:
                     bucket[kind] = rec
 
-        for key, pay in sorted(em_db.items(), key=_lat_sort_key):
+        for key, pay in sorted(lfa.items(), key=_lat_sort_key):
             if not str(key).startswith("lat_"):
                 continue
             try:
@@ -7952,14 +8032,26 @@ class DripCAD:
             if li < len(lateral_bi):
                 row_bi = int(lateral_bi[li])
             else:
-                row_bi = int((lpa.get(f"lat_{li}") or {}).get("block_idx", -1))
+                row_bi = int(pay.get("block_idx", -1))
             if row_bi != int(bi):
                 continue
             lat = lat_list[li]
             if lat.is_empty or lat.length < 1e-6:
                 continue
             try:
-                conn_sm, _s_along = self._lateral_connection_sm_index_and_chainage(lat)
+                conn = lat_sol.connection_distance_along_lateral(
+                    lat, sm_for_conn, snap_m=self._submain_lateral_snap_m()
+                )
+            except Exception:
+                conn = 0.0
+            conn = max(0.0, min(float(lat.length), float(conn)))
+
+            conn_sm = None
+            try:
+                p_conn = lat.interpolate(conn)
+                conn_sm, _s_along = lat_sol.nearest_submain_chainage_any(
+                    float(p_conn.x), float(p_conn.y), sm_for_conn
+                )
             except Exception:
                 conn_sm = None
             if (
@@ -7971,49 +8063,40 @@ class DripCAD:
                 )
             ):
                 conn_sm = None
-            try:
-                conn = lat_sol.connection_distance_along_lateral(
-                    lat, sm_for_conn, snap_m=self._submain_lateral_snap_m()
-                )
-            except Exception:
-                conn = 0.0
-            conn = max(0.0, min(float(lat.length), float(conn)))
-            for wing_label, rows, sign_xa in (
-                ("L1", pay.get("L1"), -1.0),
-                ("L2", pay.get("L2"), 1.0),
-            ):
-                for row in rows or []:
-                    try:
-                        qe = float(row.get("q_emit", 0))
-                    except (TypeError, ValueError):
-                        continue
-                    if qe <= 1e-4:
-                        continue
-                    try:
-                        xa = float(row.get("x", 0))
-                    except (TypeError, ValueError):
-                        xa = 0.0
-                    along = conn + sign_xa * xa
-                    along = max(0.0, min(float(lat.length), float(along)))
-                    try:
-                        pt = lat.interpolate(along)
-                    except Exception:
-                        continue
-                    rec = {
-                        "wx": float(pt.x),
-                        "wy": float(pt.y),
-                        "q": float(qe),
-                        "lat_idx": int(li),
-                        "wing": wing_label,
-                    }
-                    if conn_sm is not None:
-                        rec["sm_idx"] = int(conn_sm)
-                    _upd(out, "min", rec)
-                    _upd(out, "max", rec)
-                    if conn_sm is not None:
-                        br = out["branches"].setdefault(int(conn_sm), {"min": None, "max": None})
-                        _upd(br, "min", rec)
-                        _upd(br, "max", rec)
+
+            def _audit_extreme(kind: str, row: dict) -> None:
+                if not isinstance(row, dict):
+                    return
+                wing_label = str(row.get("wing") or "")
+                sign_xa = -1.0 if wing_label == "L1" else 1.0
+                try:
+                    qe = float(row.get("q_lph", 0.0))
+                    xa = float(row.get("x_m", 0.0))
+                except (TypeError, ValueError):
+                    return
+                if qe <= 1e-4:
+                    return
+                along = max(0.0, min(float(lat.length), float(conn) + sign_xa * xa))
+                try:
+                    pt = lat.interpolate(along)
+                except Exception:
+                    return
+                rec = {
+                    "wx": float(pt.x),
+                    "wy": float(pt.y),
+                    "q": float(qe),
+                    "lat_idx": int(li),
+                    "wing": wing_label,
+                }
+                if conn_sm is not None:
+                    rec["sm_idx"] = int(conn_sm)
+                _upd(out, kind, rec)
+                if conn_sm is not None:
+                    br = out["branches"].setdefault(int(conn_sm), {"min": None, "max": None})
+                    _upd(br, kind, rec)
+
+            _audit_extreme("min", pay.get("min_emitter") or {})
+            _audit_extreme("max", pay.get("max_emitter") or {})
         return out
 
     def _refresh_emitter_q_extrema_overlay_state(self, block_indices: Optional[Sequence[int]] = None) -> None:
@@ -8035,85 +8118,6 @@ class DripCAD:
             else:
                 state.pop(bi, None)
         self._emitter_q_extrema_overlay = state
-
-    def _union_overflow_with_q_nom_contour(
-        self, clipped, bi: int, block_poly, es: float
-    ):
-        """
-        Зона переливу з’єднується з смугою вздовж ізолінії Q = Q ном (номінальний вилив),
-        щоб внутрішня межа маски виходила з контуру номінального виливу.
-        """
-        if clipped is None or clipped.is_empty:
-            return clipped
-        try:
-            q_nom = float(self.var_emit_flow.get().replace(",", "."))
-        except Exception:
-            return clipped
-        if q_nom <= 1e-6:
-            return clipped
-        pts_q = self._emitter_q_samples_for_block_index(bi)
-        if len(pts_q) < 8:
-            return clipped
-        lo_q = min(p[2] for p in pts_q)
-        hi_q = max(p[2] for p in pts_q)
-        if not (lo_q - 1e-4 <= q_nom <= hi_q + 1e-4):
-            return clipped
-        nq = len(pts_q)
-        if nq < 900:
-            grid_m = 8.0
-        elif nq < 1600:
-            grid_m = 10.0
-        elif nq < 2400:
-            grid_m = 13.0
-        else:
-            grid_m = 16.0
-        ck = (
-            int(bi),
-            id(self.calc_results),
-            round(float(q_nom), 4),
-            round(float(grid_m), 2),
-            round(lo_q, 4),
-            round(hi_q, 4),
-            int(nq),
-        )
-        cache_lines = getattr(self, "_q_nom_contour_line_cache", None)
-        if not isinstance(cache_lines, dict):
-            cache_lines = {}
-        gn = cache_lines.get(ck)
-        if gn is None or gn.is_empty:
-            tpe = TopoEngine()
-            tpe.power = 2.0
-            try:
-                contours = tpe.generate_contours(
-                    boundary=block_poly,
-                    step_z=1.0,
-                    grid_size=grid_m,
-                    elevation_points=pts_q,
-                    fixed_z_levels=[q_nom],
-                ) or []
-            except Exception:
-                return clipped
-            if not contours:
-                return clipped
-            gn = contours[0].get("geom")
-            if gn is not None and not gn.is_empty:
-                cache_lines[ck] = gn
-                if len(cache_lines) > 14:
-                    cache_lines.clear()
-                self._q_nom_contour_line_cache = cache_lines
-        if gn is None or gn.is_empty:
-            return clipped
-        band = max(0.1, min(0.5, 0.26 * es))
-        try:
-            strip = gn.buffer(band, quad_segs=4)
-            merged = unary_union([clipped, strip])
-            if block_poly is not None and not block_poly.is_empty:
-                merged = merged.intersection(block_poly)
-            if merged.is_empty:
-                return clipped
-            return merged
-        except Exception:
-            return clipped
 
     def refresh_block_out_of_range_emitters_panel(self):
         """Вкладка «Блок»: коротке зведення крапельниць активного блоку поза діапазоном."""
@@ -8184,7 +8188,7 @@ class DripCAD:
             msg = (
                 hdr
                 + "\nПоза діапазоном: "
-                + f"{len(items)} крап.\n"
+                + f"{len(items)} латералей/крил.\n"
                 + f"Перелив: {n_ov} | Недолив: {n_un} | Обидва: {n_both}\n"
                 + "Детальний список приховано."
             )
@@ -8332,319 +8336,6 @@ class DripCAD:
             pass
         _fit_txt_height()
         txtw.config(state=tk.DISABLED)
-
-    @staticmethod
-    def _decimate_closed_ring_xy(
-        ring_coords: list,
-        min_step: float,
-        max_vertices: int = 280,
-    ) -> list:
-        """Менше вершин на контурі маски — швидший Tk Canvas при pan/zoom."""
-        if len(ring_coords) < 4:
-            return ring_coords
-        closed = ring_coords[0] == ring_coords[-1]
-        pts = list(ring_coords[:-1] if closed else ring_coords)
-        if len(pts) < 3:
-            return ring_coords
-        step = float(max(min_step, 1e-6))
-        out = None
-        for _ in range(14):
-            out = [pts[0]]
-            for i in range(1, len(pts)):
-                x, y = pts[i]
-                px, py = out[-1]
-                if math.hypot(x - px, y - py) >= step:
-                    out.append((x, y))
-            nv = len(out) + (1 if closed else 0)
-            if nv <= max_vertices and len(out) >= 3:
-                break
-            step *= 1.38
-        if out is None or len(out) < 3:
-            return ring_coords
-        if closed:
-            if out[0] != out[-1]:
-                out = out + [out[0]]
-        return out
-
-    def _pressure_zone_geom_cache_key(self, bun: dict) -> Optional[tuple]:
-        items = bun.get("items") or []
-        if not items or not self.field_blocks:
-            return None
-        bi = int(bun.get("bi", 0))
-        if bi < 0 or bi >= len(self.field_blocks):
-            return None
-        h = hashlib.sha256()
-        for it in sorted(
-            items,
-            key=lambda x: (float(x["wx"]), float(x["wy"])),
-        ):
-            h.update(
-                f"{float(it['wx']):.5f},{float(it['wy']):.5f}|".encode("utf-8")
-            )
-        try:
-            es = float(self.var_emit_step.get().replace(",", "."))
-        except Exception:
-            es = 0.3
-        es = round(max(0.12, min(2.0, es)), 4)
-        ring = self.field_blocks[bi].get("ring") or []
-        hr = hashlib.sha256(
-            "".join(f"{float(p[0]):.4f}:{float(p[1]):.4f};" for p in ring).encode(
-                "utf-8"
-            )
-        ).hexdigest()[:24]
-        try:
-            qn = float(self.var_emit_flow.get().replace(",", "."))
-        except Exception:
-            qn = 0.0
-        qn = round(max(0.0, qn), 4)
-        return (id(self.calc_results), bi, h.hexdigest()[:40], es, hr, qn)
-
-    def _lighten_pressure_zone_geometry(self, clipped, es: float):
-        """Спрощення + прорідження вершин для швидкого малювання."""
-        if clipped is None or clipped.is_empty:
-            return clipped
-        tol = max(0.28, min(2.2, 0.95 * es))
-        try:
-            g = clipped.simplify(tol, preserve_topology=True)
-            if g.is_empty:
-                g = clipped
-        except Exception:
-            g = clipped
-        min_decimate = max(0.12, min(0.85, 0.35 * es))
-
-        def polys_of(gm):
-            t = gm.geom_type
-            if t == "Polygon":
-                return [gm]
-            if t == "MultiPolygon":
-                return list(gm.geoms)
-            if t == "GeometryCollection":
-                acc = []
-                for sub in gm.geoms:
-                    acc.extend(polys_of(sub))
-                return acc
-            return []
-
-        rebuilt = []
-        for pl in polys_of(g):
-            if pl.geom_type != "Polygon" or pl.is_empty:
-                continue
-            dec = self._decimate_closed_ring_xy(
-                list(pl.exterior.coords),
-                min_decimate,
-                max_vertices=260,
-            )
-            if len(dec) < 4:
-                continue
-            try:
-                rebuilt.append(Polygon(dec))
-            except Exception:
-                continue
-        if not rebuilt:
-            return g
-        if len(rebuilt) == 1:
-            out = rebuilt[0]
-        else:
-            out = MultiPolygon(rebuilt)
-        try:
-            out = out.buffer(0)
-        except Exception:
-            pass
-        return out if not out.is_empty else g
-
-    def _bad_emitter_pressure_zone_clipped(self, bun: dict):
-        """
-        Силует «хмари» поганих крапельниць: одна зовнішня межа без дірок усередині.
-        Диски навколо точок зливаються; додатковий buffer з’єднує сусідні ряди в один контур,
-        без внутрішніх обручів (які виглядали б як окремі емітери). Обрізка — полігоном блоку.
-        Геометрія кешується між redraw (pan/zoom); контур спрощується для Canvas.
-        """
-        items = bun.get("items") or []
-        if not items or not self.field_blocks:
-            return None
-        bi = int(bun.get("bi", 0))
-        if bi < 0 or bi >= len(self.field_blocks):
-            return None
-        ckey = self._pressure_zone_geom_cache_key(bun)
-        if ckey is not None:
-            cache = getattr(self, "_pressure_zone_geom_cache", None)
-            if not isinstance(cache, OrderedDict):
-                cache = OrderedDict()
-                self._pressure_zone_geom_cache = cache
-            hit = cache.get(ckey)
-            if hit is not None and not hit.is_empty:
-                try:
-                    cache.move_to_end(ckey)
-                except Exception:
-                    pass
-                return hit
-        pts = [(float(it["wx"]), float(it["wy"])) for it in items]
-        block_poly = self._block_poly(self.field_blocks[bi])
-        if block_poly.is_empty:
-            return None
-        if not block_poly.is_valid:
-            try:
-                block_poly = block_poly.buffer(0)
-            except Exception:
-                return None
-        try:
-            es = float(self.var_emit_step.get().replace(",", "."))
-        except Exception:
-            es = 0.3
-        es = max(0.12, min(2.0, es))
-        r = max(0.22, min(0.7, 0.62 * es))
-        merge_m = max(0.42, min(2.8, 2.05 * es))
-        # Менше сегментів на дузі — менше вершин після union/buffer.
-        qseg = 4
-        try:
-            if len(pts) == 1:
-                base = Point(pts[0]).buffer(r, quad_segs=qseg)
-            else:
-                base = MultiPoint(pts).buffer(r, quad_segs=qseg)
-            if base.is_empty:
-                return None
-            if base.geom_type == "GeometryCollection":
-                polys = [
-                    g
-                    for g in base.geoms
-                    if getattr(g, "geom_type", "") == "Polygon"
-                ]
-                if not polys:
-                    return None
-                base = unary_union(polys)
-            try:
-                base = base.buffer(0)
-            except Exception:
-                pass
-            base = base.buffer(merge_m, quad_segs=qseg)
-            if base.is_empty:
-                return None
-            clipped = base.intersection(block_poly)
-        except Exception:
-            return None
-        if clipped is None or clipped.is_empty:
-            return None
-        overflow_only = bool(
-            items and all(bool(it.get("overflow")) for it in items)
-        )
-        if overflow_only:
-            clipped = self._union_overflow_with_q_nom_contour(
-                clipped, bi, block_poly, es
-            )
-        if clipped is None or clipped.is_empty:
-            return None
-        clipped = self._lighten_pressure_zone_geometry(clipped, es)
-        if clipped is None or clipped.is_empty:
-            return None
-        if ckey is not None:
-            cache = getattr(self, "_pressure_zone_geom_cache", None)
-            if not isinstance(cache, OrderedDict):
-                cache = OrderedDict()
-            cache[ckey] = clipped
-            cache.move_to_end(ckey)
-            while len(cache) > 16:
-                cache.popitem(last=False)
-            self._pressure_zone_geom_cache = cache
-        return clipped
-
-    def _draw_emitter_pressure_zone_on_canvas(
-        self,
-        geom,
-        outline: str = "#FFBB66",
-        width: int = 2,
-        canvas_tag: str = "bad_emit_pressure_zone",
-        dash_pattern: Optional[Tuple[int, ...]] = None,
-        outline_exterior_only: bool = True,
-    ):
-        """Контур Polygon / MultiPolygon / LineString після обрізки блоком.
-        outline_exterior_only: не малювати внутрішні кільця (дірки) — лише зовнішній силует «хмари».
-        dash_pattern: None — суцільна лінія контуру."""
-
-        def collect_polygons(g):
-            if g is None or g.is_empty:
-                return []
-            t = g.geom_type
-            if t == "Polygon":
-                return [g]
-            if t == "MultiPolygon":
-                return list(g.geoms)
-            if t == "GeometryCollection":
-                acc = []
-                for sub in g.geoms:
-                    acc.extend(collect_polygons(sub))
-                return acc
-            return []
-
-        def collect_lines(g):
-            if g is None or g.is_empty:
-                return []
-            t = g.geom_type
-            if t == "LineString":
-                return [g]
-            if t == "MultiLineString":
-                return list(g.geoms)
-            if t == "GeometryCollection":
-                acc = []
-                for sub in g.geoms:
-                    acc.extend(collect_lines(sub))
-                return acc
-            return []
-
-        poly_kw = {"tags": canvas_tag}
-        if dash_pattern is not None:
-            poly_kw["dash"] = dash_pattern
-        line_kw = {"fill": outline, "width": width, "tags": canvas_tag}
-        if dash_pattern is not None:
-            line_kw["dash"] = dash_pattern
-        canvas_bg = "#121212"
-        try:
-            canvas_bg = self.canvas.cget("bg") or canvas_bg
-        except tk.TclError:
-            pass
-
-        for pl in collect_polygons(geom):
-            ext = list(pl.exterior.coords)
-            flat = []
-            for xy in ext:
-                flat.extend(self.to_screen(float(xy[0]), float(xy[1])))
-            if len(flat) >= 6:
-                try:
-                    self.canvas.create_polygon(
-                        flat,
-                        fill="",
-                        outline=outline,
-                        width=width,
-                        **poly_kw,
-                    )
-                except tk.TclError:
-                    self.canvas.create_polygon(
-                        flat,
-                        fill=canvas_bg,
-                        outline=outline,
-                        width=width,
-                        **poly_kw,
-                    )
-            if not outline_exterior_only:
-                for intr in pl.interiors:
-                    ic = list(intr.coords)
-                    f2 = []
-                    for xy in ic:
-                        f2.extend(self.to_screen(float(xy[0]), float(xy[1])))
-                    if len(f2) >= 4:
-                        self.canvas.create_line(
-                            *f2,
-                            fill=outline,
-                            width=max(1, width - 1),
-                            dash=(3, 4),
-                            tags=canvas_tag,
-                        )
-
-        for ln in collect_lines(geom):
-            f3 = []
-            for xy in ln.coords:
-                f3.extend(self.to_screen(float(xy[0]), float(xy[1])))
-            if len(f3) >= 4:
-                self.canvas.create_line(*f3, **line_kw)
 
     def _refresh_active_block_combo(self):
         n = len(self.field_blocks)
@@ -9529,10 +9220,21 @@ class DripCAD:
             self._refresh_active_block_combo()
             self.redraw()
 
+        def _open_block_props() -> None:
+            selected_scope = self._selected_block_indices()
+            if len(selected_scope) > 1 and int(bi) in set(selected_scope):
+                self.open_block_irrigation_scheme_dialog(
+                    int(bi),
+                    selected_block_indices=selected_scope,
+                    clear_selected_blocks_on_close=True,
+                )
+                return
+            self.open_block_irrigation_scheme_dialog(int(bi))
+
         m = tk.Menu(self.root, tearoff=0)
         m.add_command(
             label=f"Властивості блоку {bi + 1}…",
-            command=lambda b=bi: self.open_block_irrigation_scheme_dialog(int(b)),
+            command=_open_block_props,
         )
         m.add_separator()
         m.add_command(label=f"Зробити активним блок {bi + 1}", command=_set_active_block)
@@ -9796,7 +9498,6 @@ class DripCAD:
 
     def reset_calc(self):
         self._graph_lateral_h_markers = None
-        self._pressure_zone_geom_cache = OrderedDict()
         self._emitter_q_extrema_overlay = {}
         cr = self.calc_results
         if (cr.get("sections") or cr.get("valves") or cr.get("emitters")):
@@ -9804,14 +9505,8 @@ class DripCAD:
             self.redraw()
 
     def release_geo_hydro_workspace_caches(self, *, clear_cached_contours: bool = False) -> None:
-        """Скинути важкі кеші UI (гідро магістралі, ізолінії виливу, зони тиску)."""
+        """Скинути важкі кеші UI (гідро магістралі тощо)."""
         self.trunk_irrigation_hydro_cache = None
-        self._emit_isolines_cache = {"sig": None, "contours": [], "contours_by_cls": {}}
-        self._pressure_zone_geom_cache = OrderedDict()
-        ql = getattr(self, "_q_nom_contour_line_cache", None)
-        if isinstance(ql, dict):
-            ql.clear()
-            self._q_nom_contour_line_cache = ql
         if clear_cached_contours:
             self.cached_contours = []
 
@@ -10346,7 +10041,7 @@ class DripCAD:
             self.offset_x += event.x - self._pan_start[0]
             self.offset_y += event.y - self._pan_start[1]
             self._pan_start = (event.x, event.y)
-            # Без важких шарів (ізолінії рельєфу / діаграма виливу / маски) — плавна панорама.
+            # Без важких шарів (ізолінії рельєфу) — плавна панорама.
             self.redraw(skip_heavy_canvas_layers=True)
 
     def end_pan(self, event=None):
@@ -10423,14 +10118,6 @@ class DripCAD:
         Показуємо легкий кадр одразу, а повний — відкладено (debounce).
         """
         self.reset_calc()
-        self.redraw(skip_heavy_canvas_layers=True)
-        self._schedule_debounced_full_redraw(140)
-
-    def _on_heavy_canvas_toggle_changed(self, *_args) -> None:
-        """
-        Перемикачі важких шарів (ізолінії/маски): спочатку легка перемальовка,
-        потім повна, щоб UI не «липнув» при зміні параметрів.
-        """
         self.redraw(skip_heavy_canvas_layers=True)
         self._schedule_debounced_full_redraw(140)
 
@@ -11450,17 +11137,123 @@ class DripCAD:
                     em_samples.append((sx, y_qemit(qe), qe))
             hover_series.append(("Вилив крап.", "#FFAA44", "л/г", em_samples))
 
+        def _nearest_x_row(rows: list, x_t: float):
+            best = None
+            best_d = 1e18
+            for d in rows:
+                if not isinstance(d, dict):
+                    continue
+                try:
+                    xv = float(d.get("x", 0.0))
+                except (TypeError, ValueError):
+                    continue
+                dd = abs(xv - x_t)
+                if dd < best_d:
+                    best_d = dd
+                    best = d
+            return best
+
         def _graph_hover_motion(ev):
             try:
                 canvas.delete("graph_hover_tip")
             except Exception:
                 pass
+            ex, ey = float(ev.x), float(ev.y)
+            axis_bot = float(pad_top + plot_h)
+            in_plot = (float(pad_left) <= ex <= float(pad_left + plot_w)) and (
+                float(pad_top) <= ey <= axis_bot
+            )
+            if in_plot and total_width > 1e-9:
+                row_x = None
+                wing_lbl = None
+                if ex < float(zero_x) and l1_data:
+                    x_m = (float(zero_x) - ex) / float(plot_w) * float(total_width)
+                    row_x = _nearest_x_row(l1_data, x_m)
+                    wing_lbl = "L1"
+                elif ex > float(zero_x) and l2_data:
+                    x_m = (ex - float(zero_x)) / float(plot_w) * float(total_width)
+                    row_x = _nearest_x_row(l2_data, x_m)
+                    wing_lbl = "L2"
+                else:
+                    if l1_data:
+                        row_x = _nearest_x_row(l1_data, 0.0)
+                        wing_lbl = "L1"
+                    elif l2_data:
+                        row_x = _nearest_x_row(l2_data, 0.0)
+                        wing_lbl = "L2"
+                if row_x is not None and isinstance(row_x, dict) and wing_lbl is not None:
+                    try:
+                        x_row = float(row_x.get("x", 0.0))
+                    except (TypeError, ValueError):
+                        x_row = 0.0
+                    try:
+                        qe = float(row_x.get("q_emit", 0.0) or 0.0)
+                    except (TypeError, ValueError):
+                        qe = 0.0
+                    try:
+                        hm = float(row_x.get("h", 0.0) or 0.0)
+                    except (TypeError, ValueError):
+                        hm = 0.0
+                    try:
+                        qt = float(row_x.get("q", 0.0) or 0.0)
+                    except (TypeError, ValueError):
+                        qt = 0.0
+                    try:
+                        elv = float(row_x.get("elev", 0.0) or 0.0)
+                    except (TypeError, ValueError):
+                        elv = 0.0
+                    if wing_lbl == "L1":
+                        sx_m = float(zero_x) - (x_row / float(total_width)) * float(plot_w)
+                        sy_m = y_qemit(qe) if qe > 1e-4 else y_screen_h(hm)
+                    else:
+                        sx_m = float(zero_x) + (x_row / float(total_width)) * float(plot_w)
+                        sy_m = y_qemit(qe) if qe > 1e-4 else y_screen_h(hm)
+                    lines_txt = [
+                        f"Вилив крап.: {qe:.2f} л/г",
+                        f"H: {hm:.2f} м  ·  {wing_lbl}  x={x_row:.1f} м",
+                        f"Q у трубі: {qt:.1f} л/г",
+                    ]
+                    if any(abs(float(d.get("elev", 0.0) or 0.0)) > 1e-9 for d in l1_data + l2_data):
+                        lines_txt.append(f"ΔZ: {elv:.2f} м")
+                    nl = len(lines_txt)
+                    lh, tw = 15.0, 228.0
+                    tx = min(float(pad_left + plot_w) - 8.0, ex + 14.0) - tw
+                    tx = max(float(pad_left) + 6.0, tx)
+                    ty = max(float(pad_top) + 4.0, min(axis_bot - nl * lh - 4.0, ey - 0.5 * nl * lh))
+                    canvas.create_line(
+                        ex, float(pad_top), ex, axis_bot, fill="#FFEB3B", width=1, dash=(3, 2), tags="graph_hover_tip"
+                    )
+                    canvas.create_rectangle(
+                        tx - 4,
+                        ty - 2,
+                        tx + tw,
+                        ty + float(nl) * lh + 2,
+                        fill="#101820",
+                        outline="#FFAA44",
+                        width=1,
+                        tags="graph_hover_tip",
+                    )
+                    for i, part in enumerate(lines_txt):
+                        cv = "#E8EEF2" if i else "#FFCC80"
+                        canvas.create_text(
+                            tx + 6,
+                            ty + 4 + lh * float(i),
+                            text=part,
+                            fill=cv,
+                            anchor=tk.NW,
+                            font=("Arial", 8, "bold") if i == 0 else ("Arial", 8),
+                            tags="graph_hover_tip",
+                        )
+                    canvas.create_oval(
+                        sx_m - 4, sy_m - 4, sx_m + 4, sy_m + 4, fill="#FFAA44", outline="#FFF3E0", width=1, tags="graph_hover_tip"
+                    )
+                    return
             best = None
             best_d2 = 1e18
             for name, col, unit, samples in hover_series:
                 for sx, sy, val in samples:
-                    dx = float(ev.x) - float(sx)
-                    dy = float(ev.y) - float(sy)
+                    dx = ex - float(sx)
+                    dy = ey - float(sy)
                     d2 = dx * dx + dy * dy
                     if d2 < best_d2:
                         best_d2 = d2
@@ -11748,6 +11541,7 @@ class DripCAD:
         return sample_pts
 
     def _draw_emitter_flow_graph_canvas(self, *_args, target_canvas=None) -> None:
+        """Прев'ю/окно: тільки точки емітерів (Q, H); без ізоліній і контурів масок тиску."""
         canvas = target_canvas
         if canvas is None:
             if (
@@ -11771,8 +11565,8 @@ class DripCAD:
         _h_band_tol = 0.02
 
         def _classify_h(hm: float) -> str:
-            ok_lo = (True if h_lo_lim <= 1e-9 else hm >= h_lo_lim - _h_band_tol)
-            ok_hi = (True if h_hi_lim <= 1e-9 else hm <= h_hi_lim + _h_band_tol)
+            ok_lo = True if h_lo_lim <= 1e-9 else hm >= h_lo_lim - _h_band_tol
+            ok_hi = True if h_hi_lim <= 1e-9 else hm <= h_hi_lim + _h_band_tol
             if ok_lo and ok_hi:
                 return "inband"
             if not ok_hi:
@@ -11788,218 +11582,33 @@ class DripCAD:
 
         def _palette_by_class(cls_name: str, t: float) -> str:
             if cls_name == "inband":
-                # Норма: зелена гамма.
                 return _lerp_rgb((198, 245, 194), (41, 163, 74), t)
             if cls_name == "overflow":
-                # Перелив: фуксія -> ало.
                 return _lerp_rgb((255, 66, 214), (255, 36, 0), t)
-            # Недолив: жовто-охряна гама.
             return _lerp_rgb((241, 208, 110), (178, 132, 38), t)
 
-        mask_lines_ov = []
-        mask_lines_un = []
-        if bool(getattr(self, "var_show_press_zone_outlines_on_map", None) and self.var_show_press_zone_outlines_on_map.get()):
+        pts = self._collect_emitter_flow_points_for_window()
+        if not pts:
             try:
-                bun = self._bad_pressure_emitter_details_active_block()
-                if bun["band_on"] and bun["has_calc"]:
-                    items = bun.get("items") or []
-                    ov_items = [it for it in items if it.get("overflow")]
-                    un_items = [it for it in items if it.get("underflow")]
-
-                    def _geom_to_lines(gm):
-                        if gm is None or gm.is_empty:
-                            return
-                        gt = gm.geom_type
-                        if gt == "Polygon":
-                            ex = list(gm.exterior.coords)
-                            if len(ex) >= 2:
-                                yield ex
-                        elif gt == "MultiPolygon":
-                            for pp in gm.geoms:
-                                ex = list(pp.exterior.coords)
-                                if len(ex) >= 2:
-                                    yield ex
-                        elif gt == "GeometryCollection":
-                            for sub in gm.geoms:
-                                for ln in _geom_to_lines(sub):
-                                    yield ln
-
-                    if ov_items:
-                        zone_ov = self._bad_emitter_pressure_zone_clipped({**bun, "items": ov_items})
-                        mask_lines_ov = list(_geom_to_lines(zone_ov))
-                    if un_items:
-                        zone_un = self._bad_emitter_pressure_zone_clipped({**bun, "items": un_items})
-                        mask_lines_un = list(_geom_to_lines(zone_un))
+                canvas.unbind("<Motion>")
+                canvas.unbind("<Leave>")
             except Exception:
-                mask_lines_ov = []
-                mask_lines_un = []
-        cache = getattr(self, "_emit_isolines_cache", None) or {}
-        contours = list(cache.get("contours") or [])
-        if not bool(getattr(self, "var_show_emitter_flow", None) and self.var_show_emitter_flow.get()):
-            contours = []
-        h_points = self._collect_emitter_flow_points_for_window()
-        # Якщо ізолінії увімкнені, але кеш ще порожній (бо не малюємо на основному полотні),
-        # будуємо їх прямо для панелі діаграми.
-        if (
-            bool(getattr(self, "var_show_emitter_flow", None) and self.var_show_emitter_flow.get())
-            and not contours
-            and h_points
-        ):
-            pts_q = [(float(x), float(y), float(q)) for x, y, q, _h in h_points if float(q) > 1e-6]
-            if len(pts_q) >= 8:
-                try:
-                    lo_q = min(p[2] for p in pts_q)
-                    hi_q = max(p[2] for p in pts_q)
-                except Exception:
-                    lo_q = hi_q = 0.0
-                if hi_q > lo_q + 1e-9:
-                    boundary = self.field_union_polygon()
-                    if boundary is None or boundary.is_empty:
-                        abi = self._safe_active_block_idx()
-                        if abi is not None and 0 <= abi < len(self.field_blocks):
-                            boundary = self._block_poly(self.field_blocks[abi])
-                    if boundary is not None and not boundary.is_empty:
-                        try:
-                            tpe = TopoEngine()
-                            tpe.power = 2.0
-                            step_q = max((hi_q - lo_q) / 6.0, 1e-6)
-                            nq = len(pts_q)
-                            if nq < 900:
-                                grid_m = 11.0
-                            elif nq < 1600:
-                                grid_m = 14.0
-                            elif nq < 2400:
-                                grid_m = 17.0
-                            else:
-                                grid_m = 21.0
-                            contours = tpe.generate_contours(
-                                boundary=boundary,
-                                step_z=step_q,
-                                grid_size=grid_m,
-                                elevation_points=pts_q,
-                            ) or []
-                        except Exception:
-                            contours = []
-        if not contours:
-            pts = h_points
-            if not pts:
-                canvas.create_text(
-                    20,
-                    20,
-                    anchor=tk.NW,
-                    fill="#D0D0D0",
-                    font=("Arial", 10),
-                    text="Немає даних емітерів. Спочатку виконайте розрахунок.",
-                )
-                return
-            min_x = min(p[0] for p in pts)
-            min_y = min(p[1] for p in pts)
-            max_x = max(p[0] for p in pts)
-            max_y = max(p[1] for p in pts)
-            min_q = min(p[2] for p in pts)
-            max_q = max(p[2] for p in pts)
-            for ln in mask_lines_ov + mask_lines_un:
-                for x, y in ln:
-                    min_x = min(min_x, float(x))
-                    min_y = min(min_y, float(y))
-                    max_x = max(max_x, float(x))
-                    max_y = max(max_y, float(y))
-            cw = max(420, int(canvas.winfo_width() or 840))
-            ch = max(300, int(canvas.winfo_height() or 560))
-            pad_l, pad_t, pad_r, pad_b = 20, 20, 20, 34
-            avail_w = max(200, cw - pad_l - pad_r)
-            avail_h = max(160, ch - pad_t - pad_b)
-            span_x = max(1e-6, max_x - min_x)
-            span_y = max(1e-6, max_y - min_y)
-            scale = min(avail_w / span_x, avail_h / span_y)
-            off_x = pad_l + (avail_w - span_x * scale) * 0.5
-            off_y = pad_t + (avail_h - span_y * scale) * 0.5
-
-            def _to_screen(wx: float, wy: float) -> tuple[float, float]:
-                sx = off_x + (wx - min_x) * scale
-                sy = off_y + (max_y - wy) * scale
-                return sx, sy
-
-            def _q_t(q_val: float) -> float:
-                if max_q <= min_q + 1e-9:
-                    return 0.5
-                return max(0.0, min(1.0, (float(q_val) - min_q) / (max_q - min_q)))
-
-            canvas.create_rectangle(
-                pad_l - 1, pad_t - 1, cw - pad_r + 1, ch - pad_b + 1, outline="#3A3A3A"
-            )
-            for ln in mask_lines_ov:
-                scr = []
-                for wx, wy in ln:
-                    sx, sy = _to_screen(float(wx), float(wy))
-                    scr.extend((sx, sy))
-                if len(scr) >= 4:
-                    canvas.create_line(scr, fill="#FF5533", width=2)
-            for ln in mask_lines_un:
-                scr = []
-                for wx, wy in ln:
-                    sx, sy = _to_screen(float(wx), float(wy))
-                    scr.extend((sx, sy))
-                if len(scr) >= 4:
-                    canvas.create_line(scr, fill="#E8C547", width=2)
-            for wx, wy, qv, hv in pts:
-                sx, sy = _to_screen(wx, wy)
-                rr = 2
-                cls = _classify_h(float(hv))
-                canvas.create_oval(
-                    sx - rr,
-                    sy - rr,
-                    sx + rr,
-                    sy + rr,
-                    fill=_palette_by_class(cls, _q_t(qv)),
-                    outline="",
-                )
+                pass
             canvas.create_text(
-                10,
-                ch - 8,
-                anchor=tk.SW,
-                fill="#BDBDBD",
-                font=("Arial", 9),
-                text=f"Точки емітерів: {len(pts)} | Q min={min_q:.2f} л/г | Q max={max_q:.2f} л/г",
+                20,
+                20,
+                anchor=tk.NW,
+                fill="#D0D0D0",
+                font=("Arial", 10),
+                text="Немає даних емітерів. Спочатку виконайте розрахунок.",
             )
             return
-
-        line_items = []
-        min_x = min_y = float("inf")
-        max_x = max_y = float("-inf")
-        min_z = float("inf")
-        max_z = float("-inf")
-        for c in contours:
-            z = float(c.get("z", 0.0))
-            g = c.get("geom")
-            if g is None or g.is_empty:
-                continue
-            geoms = getattr(g, "geoms", [g])
-            for gg in geoms:
-                if gg.geom_type != "LineString":
-                    continue
-                coords = list(gg.coords)
-                if len(coords) < 2:
-                    continue
-                for x, y in coords:
-                    min_x = min(min_x, float(x))
-                    min_y = min(min_y, float(y))
-                    max_x = max(max_x, float(x))
-                    max_y = max(max_y, float(y))
-                min_z = min(min_z, z)
-                max_z = max(max_z, z)
-                line_items.append((coords, z))
-        for ln in mask_lines_ov + mask_lines_un:
-            for x, y in ln:
-                min_x = min(min_x, float(x))
-                min_y = min(min_y, float(y))
-                max_x = max(max_x, float(x))
-                max_y = max(max_y, float(y))
-
-        if not line_items:
-            canvas.create_text(20, 20, anchor=tk.NW, fill="#D0D0D0", text="Ізолінії порожні.")
-            return
-
+        min_x = min(p[0] for p in pts)
+        min_y = min(p[1] for p in pts)
+        max_x = max(p[0] for p in pts)
+        max_y = max(p[1] for p in pts)
+        min_q = min(p[2] for p in pts)
+        max_q = max(p[2] for p in pts)
         cw = max(420, int(canvas.winfo_width() or 840))
         ch = max(300, int(canvas.winfo_height() or 560))
         pad_l, pad_t, pad_r, pad_b = 20, 20, 20, 34
@@ -12016,70 +11625,103 @@ class DripCAD:
             sy = off_y + (max_y - wy) * scale
             return sx, sy
 
-        def _q_t(z_val: float) -> float:
-            if max_z <= min_z + 1e-9:
+        def _q_t(q_val: float) -> float:
+            if max_q <= min_q + 1e-9:
                 return 0.5
-            return max(0.0, min(1.0, (float(z_val) - min_z) / (max_z - min_z)))
-
-        h_samples = h_points
-        if len(h_samples) > 2400:
-            st = max(1, len(h_samples) // 2400)
-            h_samples = h_samples[::st]
-
-        def _nearest_h_cls(wx: float, wy: float) -> str:
-            if not h_samples:
-                return "inband"
-            best_h = float(h_samples[0][3])
-            best_d2 = float("inf")
-            for sx, sy, _q, sh in h_samples:
-                dx = float(wx) - float(sx)
-                dy = float(wy) - float(sy)
-                d2 = dx * dx + dy * dy
-                if d2 < best_d2:
-                    best_d2 = d2
-                    best_h = float(sh)
-            return _classify_h(best_h)
+            return max(0.0, min(1.0, (float(q_val) - min_q) / (max_q - min_q)))
 
         canvas.create_rectangle(
             pad_l - 1, pad_t - 1, cw - pad_r + 1, ch - pad_b + 1, outline="#3A3A3A"
         )
-        for ln in mask_lines_ov:
-            scr = []
-            for wx, wy in ln:
-                sx, sy = _to_screen(float(wx), float(wy))
-                scr.extend((sx, sy))
-            if len(scr) >= 4:
-                canvas.create_line(scr, fill="#FF5533", width=2)
-        for ln in mask_lines_un:
-            scr = []
-            for wx, wy in ln:
-                sx, sy = _to_screen(float(wx), float(wy))
-                scr.extend((sx, sy))
-            if len(scr) >= 4:
-                canvas.create_line(scr, fill="#E8C547", width=2)
-        for coords, z in line_items:
-            scr = []
-            for wx, wy in coords:
-                sx, sy = _to_screen(float(wx), float(wy))
-                scr.extend((sx, sy))
-            if len(scr) >= 4:
-                mid = coords[len(coords) // 2]
-                cls = _nearest_h_cls(float(mid[0]), float(mid[1]))
-                canvas.create_line(
-                    scr,
-                    fill=_palette_by_class(cls, _q_t(z)),
-                    width=1,
-                    dash=(3, 2),
-                )
-
+        for wx, wy, qv, hv in pts:
+            sx, sy = _to_screen(wx, wy)
+            rr = 2
+            cls = _classify_h(float(hv))
+            canvas.create_oval(
+                sx - rr,
+                sy - rr,
+                sx + rr,
+                sy + rr,
+                fill=_palette_by_class(cls, _q_t(qv)),
+                outline="",
+            )
         canvas.create_text(
             10,
             ch - 8,
             anchor=tk.SW,
             fill="#BDBDBD",
             font=("Arial", 9),
-            text=f"Q min={min_z:.2f} л/г | Q max={max_z:.2f} л/г | контурів: {len(line_items)}",
+            text=f"Точки емітерів: {len(pts)} | Q min={min_q:.2f} л/г | Q max={max_q:.2f} л/г",
         )
+
+        def _ef_screen(wx: float, wy: float) -> tuple[float, float]:
+            return off_x + (wx - min_x) * scale, off_y + (max_y - wy) * scale
+
+        def _on_ef_motion(event: tk.Event) -> None:
+            try:
+                canvas.delete("ef_hover")
+            except Exception:
+                pass
+            ex, ey = float(event.x), float(event.y)
+            best: Optional[Tuple[float, float, float, float, float, float]] = None
+            best_d2 = 1e18
+            for wx, wy, qv, hv in pts:
+                sx, sy = _ef_screen(float(wx), float(wy))
+                d2 = (ex - sx) ** 2 + (ey - sy) ** 2
+                if d2 < best_d2:
+                    best_d2 = d2
+                    best = (sx, sy, float(wx), float(wy), float(qv), float(hv))
+            if best is None or best_d2 > 22.0 * 22.0:
+                return
+            sx, sy, wwx, wwy, qv, hv = best[0], best[1], best[2], best[3], best[4], best[5]
+            cls = _classify_h(float(hv))
+            st_ua = {"inband": "норма", "overflow": "перелив", "underflow": "недолив"}.get(cls, cls)
+            line1 = f"Вилив: {qv:.2f} л/г  ·  H: {hv:.2f} м"
+            line2 = f"Статус: {st_ua}  ·  XY: {wwx:.1f}, {wwy:.1f} м"
+            tw, lh, nl = 280.0, 14.0, 2.0
+            tx = min(float(cw) - tw - 8.0, ex + 12.0)
+            tx = max(6.0, tx)
+            ty = max(float(pad_t) + 4.0, min(float(ch) - nl * lh - 24.0, ey - 28.0))
+            canvas.create_rectangle(
+                tx - 3,
+                ty - 2,
+                tx + tw,
+                ty + nl * lh + 4.0,
+                fill="#141920",
+                outline="#90CAF9",
+                width=1,
+                tags="ef_hover",
+            )
+            canvas.create_text(
+                tx + 5,
+                ty + 2,
+                text=line1,
+                fill="#FFE0B2",
+                anchor=tk.NW,
+                font=("Arial", 9, "bold"),
+                tags="ef_hover",
+            )
+            canvas.create_text(
+                tx + 5,
+                ty + 2 + lh,
+                text=line2,
+                fill="#CFD8DC",
+                anchor=tk.NW,
+                font=("Arial", 8),
+                tags="ef_hover",
+            )
+            canvas.create_oval(
+                sx - 5, sy - 5, sx + 5, sy + 5, outline="#FFEB3B", width=2, fill="", tags="ef_hover"
+            )
+
+        def _on_ef_leave(_event: tk.Event) -> None:
+            try:
+                canvas.delete("ef_hover")
+            except Exception:
+                pass
+
+        canvas.bind("<Motion>", _on_ef_motion)
+        canvas.bind("<Leave>", _on_ef_leave)
 
     def show_emitter_flow_graph(self) -> None:
         if not self.calc_results.get("emitters"):
@@ -12089,7 +11731,7 @@ class DripCAD:
             self.emit_flow_window = tk.Toplevel(self.root)
             self.emit_flow_window.geometry("900x620")
             self.emit_flow_window.configure(bg="#1e1e1e")
-            self.emit_flow_window.title("Діаграма виливу (ізолінії)")
+            self.emit_flow_window.title("Діаграма виливу (точки)")
             self.emit_flow_canvas = tk.Canvas(
                 self.emit_flow_window,
                 width=860,
@@ -13741,8 +13383,8 @@ class DripCAD:
             out = v if out is None else min(out, v)
         return out
 
-    def trunk_irrigation_hydro_pump_label_lines(self) -> Optional[Tuple[str, str]]:
-        """Два рядки підпису насоса або None."""
+    def trunk_irrigation_hydro_pump_label_lines(self) -> Optional[Tuple[str, ...]]:
+        """Рядки підпису біля насоса (блок параметрів + пояснення в дужках) або None."""
         h = getattr(self, "trunk_irrigation_hydro_cache", None)
         if not isinstance(h, dict):
             return None
@@ -13778,9 +13420,6 @@ class DripCAD:
         h_extra = ""
         if not is_required_mode and abs(h_eff - h_zad) > 1e-3:
             h_extra = f"  [у моделі H_джерела≈{h_eff:.1f} м]"
-        lim_s = ""
-        if vmax > 1e-9:
-            lim_s = f"  •  v≤{vmax:.1f} м/с"
         head_caption = "H потрібний" if is_required_mode else "H задано"
         h_min_src_req: Optional[float] = None
         if not is_required_mode:
@@ -13792,30 +13431,28 @@ class DripCAD:
                     h_min_src_req = None
                 if h_min_src_req is not None and h_min_src_req <= 1e-9:
                     h_min_src_req = None
-        req_src_frag = ""
-        if h_min_src_req is not None:
-            req_src_frag = f"  •  H на джерелі мін. (оцінка) ≈ {h_min_src_req:.1f} м"
-        if h_worst is not None:
-            line1 = (
-                f"Насос: {head_caption} {h_zad:.1f} м{h_extra}{req_src_frag}  •  H мін. у споживачах ≈ {h_worst:.1f} м  •  "
-                f"Q≥{self._fmt_flow_m3h(q_m3h)} м³/год{lim_s}"
-            )
-        else:
-            line1 = (
-                f"Насос: {head_caption} {h_zad:.1f} м{h_extra}{req_src_frag}  •  Q≥{self._fmt_flow_m3h(q_m3h)} м³/год{lim_s}"
-            )
-        line2 = (
+        pump_line = f"Насос: {head_caption} {h_zad:.1f} м{h_extra}"
+        h_cons_line = (
+            f"H мін. у споживачах ≈ {h_worst:.1f} м"
+            if h_worst is not None
+            else "H мін. у споживачах — н/д"
+        )
+        q_line = f"Q≥{self._fmt_flow_m3h(q_m3h)} м³/год"
+        if vmax > 1e-9:
+            q_line += f", v≤{vmax:.1f} м/с"
+        main_lines: List[str] = [pump_line, h_cons_line, q_line]
+        footnote = (
             "(H мін. у споживачах — найнижчий напір серед активних споживачів у розрахованих поливах; "
             f"тест: Hспож≥{th:.0f} м, {tq:.0f} м³/год"
             + (
-                "; H на джерелі мін. — оцінка мінімального напору на насосі за поточними діаметрами та цілями Hспож "
-                "(бінарний пошук по найгіршому слоту поливу)"
-                if req_src_frag
+                f"; H на джерелі мін. (оцінка) ≈ {h_min_src_req:.1f} м — мінімальний напір на насосі за поточними "
+                "діаметрами та цілями Hспож (бінарний пошук по найгіршому слоту поливу)"
+                if h_min_src_req is not None
                 else ""
             )
             + ")"
         )
-        return (line1, line2)
+        return tuple(main_lines + [footnote])
 
     def trunk_irrigation_hydro_pump_qp_hover_lines(self) -> Optional[Tuple[str, str]]:
         """Два рядки для hover по насосу: Q та P (після розрахунку)."""
@@ -13866,19 +13503,26 @@ class DripCAD:
                 return
             g = 11.0
             y0 = cy + g + 14
-            self.canvas.create_text(
+            main_txt = "\n".join(lines[:-1])
+            foot_txt = lines[-1]
+            tid = self.canvas.create_text(
                 cx,
                 y0,
-                text=lines[0],
+                text=main_txt,
                 anchor=tk.N,
                 fill="#FFE082",
                 font=("Segoe UI", 8, "bold"),
                 tags=_TRUNK_MAP_TAGS_COSMETIC,
             )
+            try:
+                bb = self.canvas.bbox(tid)
+                y_foot = float(bb[3]) + 3.0 if bb else y0 + 44.0
+            except tk.TclError:
+                y_foot = y0 + 44.0
             self.canvas.create_text(
                 cx,
-                y0 + 14,
-                text=lines[1],
+                y_foot,
+                text=foot_txt,
                 anchor=tk.N,
                 fill="#B0BEC5",
                 font=("Segoe UI", 7),
@@ -14758,6 +14402,16 @@ class DripCAD:
             "out_tree": dict(trunk_tree_working),
         }
 
+    def _set_trunk_schedule_hydro_report_panel(self, text: str) -> None:
+        """Вивід підсумку магістралі на панель керування (вкладка з «Оптимізація»)."""
+        cp = getattr(self, "control_panel", None)
+        fn = getattr(cp, "set_trunk_schedule_hydro_report", None) if cp is not None else None
+        if callable(fn):
+            try:
+                fn(text)
+            except Exception:
+                pass
+
     def _finalize_run_trunk_irrigation_schedule_ui(
         self,
         cache: dict,
@@ -14768,7 +14422,7 @@ class DripCAD:
         mph: float,
         _qmax: Any,
     ) -> None:
-        """Діалоги, кеш, перемальовування після розрахунку магістралі за поливами."""
+        """Кеш, панель підсумку, перемальовування після розрахунку магістралі за поливами."""
         self.trunk_irrigation_hydro_cache = cache
         bad_slots: List[Tuple[Any, Any]] = []
         for sk, row in (cache.get("per_slot") or {}).items():
@@ -14780,13 +14434,13 @@ class DripCAD:
                 except ValueError:
                     idx = sk
                 bad_slots.append((idx, row.get("issues")))
+        report_lines: List[str] = []
         if auto_warn_msgs:
-            silent_showwarning(
-                self.root,
-                "Автопідбір магістралі",
-                "\n".join(auto_warn_msgs[:12])
-                + (f"\n… ще {len(auto_warn_msgs) - 12}." if len(auto_warn_msgs) > 12 else ""),
-            )
+            report_lines.append("[Автопідбір магістралі]")
+            report_lines.extend(auto_warn_msgs[:12])
+            if len(auto_warn_msgs) > 12:
+                report_lines.append(f"… ще {len(auto_warn_msgs) - 12}.")
+            report_lines.append("")
         note = autosized_note
         try:
             max_q_env_m3s = float(
@@ -14814,22 +14468,23 @@ class DripCAD:
             for idx, iss in bad_slots[:6]:
                 ilist = list(iss or [])[:2]
                 parts.append(f"Полив {int(idx) + 1}: " + "; ".join(str(x) for x in ilist))
-            msg = "Частина поливів з помилками:\n- " + "\n- ".join(parts)
+            msg = "Частина поливів з попередженнями:\n- " + "\n- ".join(parts)
             if len(bad_slots) > 6:
                 msg += f"\n… ще {len(bad_slots) - 6}."
             if note:
                 msg = note + "\n" + msg
-            msg += "\n\nПісля «OK» відкриється графік дефіциту напору / попереджень по слотах."
+            msg += "\n\nВідкривається графік дефіциту напору / попереджень по слотах."
+            report_lines.append("[Магістраль за поливами]")
+            report_lines.append(msg.strip())
+            self._set_trunk_schedule_hydro_report_panel("\n".join(report_lines).strip())
 
-            def _after_bad_slots_warning() -> None:
-                self._open_trunk_head_deficit_chart(cache)
+            def _open_deficit_chart() -> None:
+                try:
+                    self._open_trunk_head_deficit_chart(cache)
+                except Exception:
+                    pass
 
-            silent_showwarning(
-                self.root,
-                "Магістраль за поливами",
-                msg,
-                on_close=_after_bad_slots_warning,
-            )
+            self.root.after(120, _open_deficit_chart)
         else:
             env = cache.get("envelope") or {}
             mq = float(env.get("max_total_q_m3s", 0.0)) * 3600.0
@@ -14848,9 +14503,7 @@ class DripCAD:
                 fixed_note = (
                     "Режим фіксованих труб: діаметри не змінювались; показано гідравліку для поточних труб.\n"
                 )
-            silent_showinfo(
-                self.root,
-                "Магістраль за поливами",
+            ok_block = (
                 f"Готово.\n"
                 f"{fixed_note}"
                 f"{note}"
@@ -14860,8 +14513,11 @@ class DripCAD:
                 f"{lim_lines}"
                 f"На полотні після розрахунку з’являються підписи труби; наведіть курсор на лінію — "
                 f"деталі Q і телескоп-секцій (якщо є).\n"
-                f"Якщо є попередження по поливах — збільшіть напір насоса або дозволені діаметри труб.",
+                f"Якщо є попередження по поливах — збільшіть напір насоса або дозволені діаметри труб."
             )
+            report_lines.append("[Магістраль за поливами]")
+            report_lines.append(ok_block.strip())
+            self._set_trunk_schedule_hydro_report_panel("\n".join(report_lines).strip())
         self.notify_irrigation_schedule_ui()
         self.redraw()
         try:
@@ -15011,10 +14667,9 @@ class DripCAD:
 
         if g_issues:
             self.trunk_irrigation_hydro_cache = None
-            silent_showwarning(
-                self.root,
-                "Магістраль за поливами",
-                "Не виконано розрахунок:\n- " + "\n- ".join(g_issues[:8]),
+            self._set_trunk_schedule_hydro_report_panel(
+                "[Магістраль за поливами]\nНе виконано розрахунок:\n- "
+                + "\n- ".join(g_issues[:8])
             )
             self.notify_irrigation_schedule_ui()
             self.redraw()
@@ -15038,10 +14693,9 @@ class DripCAD:
             max_q_slot_m3s = 0.0
         if (not pipes_selected) and max_q_slot_m3s > 1e-12:
             if getattr(self, "_trunk_schedule_hydro_running", False):
-                silent_showinfo(
-                    self.root,
-                    "Магістраль за поливами",
-                    "Розрахунок магістралі з автопідбором труб уже виконується. Дочекайтесь завершення.",
+                self._set_trunk_schedule_hydro_report_panel(
+                    "[Магістраль за поливами]\n"
+                    "Розрахунок з автопідбором труб уже виконується. Дочекайтесь завершення."
                 )
                 return
             tree_backup_main = copy.deepcopy(getattr(self, "trunk_tree_data", {}) or {})
@@ -15149,6 +14803,9 @@ class DripCAD:
                 pass
 
             self._trunk_schedule_hydro_running = True
+            self._set_trunk_schedule_hydro_report_panel(
+                "[Магістраль за поливами]\nРозрахунок з автопідбором у процесі…"
+            )
             try:
                 self.root.title(f"{title_base} | Магістраль: підготовка…")
             except tk.TclError:
@@ -15168,10 +14825,9 @@ class DripCAD:
                 _close_progress_window()
                 _restore_title()
                 if opt_res.get("error"):
-                    silent_showerror(
-                        self.root,
-                        "Магістраль за поливами",
-                        f"Помилка автопідбору:\n{opt_res.get('error')}",
+                    self._set_trunk_schedule_hydro_report_panel(
+                        "[Магістраль за поливами — помилка]\n"
+                        f"Помилка автопідбору:\n{opt_res.get('error')}"
                     )
                     self.notify_irrigation_schedule_ui()
                     self.redraw()
@@ -15245,6 +14901,9 @@ class DripCAD:
         """Скинути кеш/графік результатів розрахунку розкладу без зміни труб і слотів."""
         self.trunk_irrigation_hydro_cache = None
         self._trunk_deficit_focus_node_id = None
+        self._set_trunk_schedule_hydro_report_panel(
+            "[Магістраль за поливами]\nКеш результатів скинуто. Натисніть «Оптимізація» для нового розрахунку."
+        )
         self.notify_irrigation_schedule_ui()
         self.redraw()
         try:
@@ -15690,7 +15349,7 @@ class DripCAD:
     def handle_left_click(self, event):
         self.canvas.focus_set()
         wx, wy = self.to_world(event.x, event.y)
-        self._handle_left_click_world(wx, wy, scr_x=event.x, scr_y=event.y)
+        self._handle_left_click_world(wx, wy, scr_x=event.x, scr_y=event.y, state=event.state)
 
     def handle_trunk_segment_double_click(self, event) -> None:
         self.canvas.focus_set()
@@ -15747,6 +15406,150 @@ class DripCAD:
                 seen.add(key)
                 out.append(h)
         return out
+
+    def _selected_block_indices(self) -> List[int]:
+        """Індекси блоків, вибраних на полотні через інструмент «Вибір» або Ctrl+ЛКМ."""
+        out: List[int] = []
+        seen: Set[int] = set()
+
+        def add_block_idx(raw_idx: object) -> None:
+            try:
+                bi = int(raw_idx)
+            except (TypeError, ValueError):
+                return
+            if 0 <= bi < len(self.field_blocks) and bi not in seen:
+                seen.add(bi)
+                out.append(bi)
+
+        for cat, payload, _label in list(getattr(self, "_canvas_selection_keys", []) or []):
+            add_block_idx(self._block_index_from_selection_hit(cat, payload))
+        return sorted(out)
+
+    @staticmethod
+    def _block_index_from_selection_hit(cat: str, payload: object) -> Optional[int]:
+        """Parent block index for selectable block/submain/lateral hits."""
+        try:
+            c = str(cat)
+        except Exception:
+            return None
+        raw_idx: object
+        if c == "block":
+            raw_idx = payload
+        elif c == "submain" and isinstance(payload, tuple) and len(payload) >= 1:
+            raw_idx = payload[0]
+        elif c == "lateral" and isinstance(payload, tuple) and len(payload) >= 2:
+            raw_idx = payload[1]
+        else:
+            return None
+        try:
+            return int(raw_idx)
+        except (TypeError, ValueError):
+            return None
+
+    def _toggle_block_selection_at_world(self, wx: float, wy: float) -> bool:
+        """Ctrl+ЛКМ у VIEW/PAN: додати або зняти саме блок під курсором."""
+        hits = self._collect_world_pick_hits(float(wx), float(wy))
+        block_hit = next((h for h in hits if h[2] == "block"), None)
+        if block_hit is None:
+            return False
+        _pri, _dist, _cat, payload, label = block_hit
+        try:
+            bi = int(payload)
+        except (TypeError, ValueError):
+            return False
+        if bi < 0 or bi >= len(self.field_blocks):
+            return False
+        prev = list(getattr(self, "_canvas_selection_keys", []) or [])
+        key = ("block", bi)
+        idx = next((i for i, e in enumerate(prev) if (e[0], e[1]) == key), None)
+        if idx is not None:
+            prev.pop(idx)
+        else:
+            prev.append(("block", bi, str(label)))
+        self._canvas_selection_keys = prev
+        self._destroy_select_hover_pick_ui()
+        self.redraw()
+        return True
+
+    def _right_click_targets_selected_block(self, wx: float, wy: float) -> bool:
+        selected = set(self._selected_block_indices())
+        if not selected:
+            return False
+        hits = self._collect_world_pick_hits(float(wx), float(wy))
+        for _pri, _dist, cat, payload, _label in hits:
+            hit_bi = self._block_index_from_selection_hit(cat, payload)
+            if hit_bi is None:
+                continue
+            if hit_bi in selected:
+                return True
+        return False
+
+    def _open_selected_blocks_context_menu(
+        self, *, menu_anchor: Optional[Tuple[int, int]] = None
+    ) -> bool:
+        block_indices = self._selected_block_indices()
+        if not block_indices:
+            return False
+        mx = int(menu_anchor[0]) if menu_anchor else int(self.root.winfo_pointerx())
+        my = int(menu_anchor[1]) if menu_anchor else int(self.root.winfo_pointery())
+        m = tk.Menu(self.root, tearoff=0)
+        title = (
+            f"Вибрані блоки: {', '.join(str(i + 1) for i in block_indices[:12])}"
+            + (f" … (+{len(block_indices) - 12})" if len(block_indices) > 12 else "")
+        )
+        m.add_command(label=title, state=tk.DISABLED)
+        m.add_separator()
+        def _open_selected_block_props(inds: Sequence[int]) -> None:
+            if not inds:
+                return
+            self.open_block_irrigation_scheme_dialog(
+                int(inds[0]),
+                selected_block_indices=list(inds),
+                clear_selected_blocks_on_close=True,
+            )
+
+        m.add_command(
+            label="Властивості вибраних блоків…",
+            command=lambda inds=list(block_indices): _open_selected_block_props(inds),
+        )
+        m.add_command(
+            label="Розрахувати вибрані блоки",
+            command=lambda inds=list(block_indices): (
+                self.run_calculation_for_blocks(inds)
+                if hasattr(self, "run_calculation_for_blocks")
+                else self.run_calculation()
+            ),
+        )
+
+        def _clear_selected_hydro() -> None:
+            for idx in block_indices:
+                self._strip_hydro_for_block_keep_others(int(idx))
+            self.redraw()
+
+        m.add_command(label="Очистити гідравліку вибраних блоків", command=_clear_selected_hydro)
+        m.add_separator()
+
+        def _show_pick_list() -> None:
+            msg = "\n".join(f"{n + 1}. Блок {bi + 1}" for n, bi in enumerate(block_indices))
+            silent_showinfo(self.root, "Вибір — блоки", f"Усього: {len(block_indices)}\n\n{msg}")
+
+        m.add_command(label="Показати список вибраних…", command=_show_pick_list)
+
+        def _clear_sel() -> None:
+            self._canvas_selection_keys = [
+                h for h in list(getattr(self, "_canvas_selection_keys", []) or []) if h[0] != "block"
+            ]
+            self.redraw()
+
+        m.add_command(label="Зняти виділення блоків", command=_clear_sel)
+        try:
+            m.tk_popup(mx, my)
+        finally:
+            try:
+                m.grab_release()
+            except Exception:
+                pass
+        return True
 
     def handle_left_release(self, event):
         if getattr(self, "_trunk_node_drag_idx", None) is not None:
@@ -15883,7 +15686,13 @@ class DripCAD:
             return
 
     def _handle_left_click_world(
-        self, wx: float, wy: float, *, scr_x: Optional[int] = None, scr_y: Optional[int] = None
+        self,
+        wx: float,
+        wy: float,
+        *,
+        scr_x: Optional[int] = None,
+        scr_y: Optional[int] = None,
+        state: int = 0,
     ) -> None:
         """ЛКМ у світових координатах (полотно або вкладка «Карта» після geo)."""
         m = self.mode.get()
@@ -15902,6 +15711,12 @@ class DripCAD:
                 return
 
         ct = getattr(self, "_canvas_special_tool", None)
+        if ct == "block_copy":
+            self._on_block_copy_left_click(float(wx), float(wy))
+            return
+        if m in ("VIEW", "PAN") and bool(int(state or 0) & 0x0004):
+            if self._toggle_block_selection_at_world(float(wx), float(wy)):
+                return
         # Перетягування вузла магістралі має бути раніше за рамку «Вибір», інакше ЛКМ лише починає marquee.
         # Режим лінійки (RULER) інакше лишається активним і блокує рух — виходимо у VIEW при захопленні вузла.
         if m in ("VIEW", "RULER") and ct in (None, "select"):
@@ -16167,27 +15982,15 @@ class DripCAD:
                 self.dir_points = []
         elif m == "SUBMAIN":
             if not self.active_submain:
-                bi_click = self._find_block_containing(wx, wy)
-                abi = self._safe_active_block_idx()
-                bi = bi_click
-                if bi is None and abi is not None and 0 <= abi < len(self.field_blocks):
-                    poly = self._block_poly(self.field_blocks[abi])
-                    p = Point(wx, wy)
-                    tol = 15.0 / max(self.zoom, 0.01)
-                    if not poly.is_empty and (
-                        poly.contains(p) or poly.boundary.distance(p) <= tol
-                    ):
-                        bi = abi
-                if bi is None:
-                    silent_showwarning(self.root, 
-                        "Увага",
-                        "Клікніть всередині блоку поля (або всередині обраного в панелі «Активний блок»), щоб прив'язати сабмейн.",
-                    )
+                if not self._submain_begin_draft_at_world(float(wx), float(wy)):
                     return
-                self._active_submain_block_idx = bi
-                self.active_submain.append((wx, wy))
-            elif self._current_live_end:
-                self.active_submain.append(self._current_live_end)
+            else:
+                merged = self._submain_full_chain_from_pointer(wx, wy, trim_tail=False)
+                if not merged or len(merged) < 2:
+                    self.redraw()
+                    return
+                self.active_submain = merged
+                self._submain_recalc_urgent = True
         elif m == "DRAW_LAT":
             if not self.active_manual_lat:
                 bi = self._find_block_containing(wx, wy)
@@ -16208,13 +16011,34 @@ class DripCAD:
 
         self.redraw()
 
+    def _submain_pointer_motion_update(self, wx: float, wy: float) -> None:
+        """Перерахунок snap сабмейну з throttling; після кліку — _submain_recalc_urgent."""
+        if not (
+            self.mode.get() == "SUBMAIN"
+            and self.active_submain
+            and self.action.get() != "DEL"
+        ):
+            return
+        now = time.perf_counter()
+        if not getattr(self, "_submain_recalc_urgent", False) and (
+            now - self._submain_motion_t_last
+        ) < self._SUBMAIN_MOTION_RECALC_INTERVAL_S:
+            return
+        self._submain_motion_t_last = now
+        if getattr(self, "_submain_recalc_urgent", False):
+            self._submain_recalc_urgent = False
+        self._current_live_end = self.calculate_live_submain(float(wx), float(wy))
+
     def feed_map_pointer_world(self, wx: float, wy: float, *, redraw_canvas: bool = True) -> None:
         """Рух курсора на карті: snap і живий кінець сабмейну (як handle_motion)."""
         self._last_map_pointer_world = (float(wx), float(wy))
         self._snap_point = self.get_snap(wx, wy)
-        if self.mode.get() == "SUBMAIN" and self.active_submain and self.action.get() == "ADD":
-            self._current_live_end = self.calculate_live_submain(wx, wy)
-        if redraw_canvas:
+        self._submain_pointer_motion_update(wx, wy)
+        # Повне полотно при русі курсора на карті не треба — тільки оновлення map_live_preview; SUBMAIN + чернетка тим більше
+        _wants = redraw_canvas
+        if _wants and self.mode.get() == "SUBMAIN" and self.active_submain:
+            _wants = False
+        if _wants:
             self.redraw()
 
     def handle_right_click(self, event):
@@ -16232,8 +16056,17 @@ class DripCAD:
         if self._irrigation_schedule_canvas_pick_active():
             if self._rozklad_commit_staging():
                 return
+        if getattr(self, "_canvas_special_tool", None) == "block_copy":
+            self._flash_top_mode_hint(
+                "Копіювання блоку активне: ЛКМ — наступний крок, ДБЛ ПКМ / Esc — кінець.",
+                duration_ms=3500,
+            )
+            return
         ct = getattr(self, "_canvas_special_tool", None)
         if ct == "select":
+            if self._right_click_targets_selected_block(wx, wy):
+                if self._open_selected_blocks_context_menu(menu_anchor=menu_anchor):
+                    return
             if self._open_context_menu_for_world_pick(wx, wy, menu_anchor=menu_anchor):
                 return
             keys = list(getattr(self, "_canvas_selection_keys", []) or [])
@@ -16249,41 +16082,7 @@ class DripCAD:
                 mx = int(menu_anchor[0]) if menu_anchor else int(self.root.winfo_pointerx())
                 my = int(menu_anchor[1]) if menu_anchor else int(self.root.winfo_pointery())
                 if block_indices:
-                    m = tk.Menu(self.root, tearoff=0)
-                    for bi in block_indices:
-                        m.add_command(
-                            label=f"Властивості блоку {bi + 1}…",
-                            command=lambda b=bi: self.open_block_irrigation_scheme_dialog(int(b)),
-                        )
-                    m.add_separator()
-
-                    def _show_pick_list() -> None:
-                        lines = [h[2] for h in keys]
-                        n = len(lines)
-                        head = min(n, 50)
-                        msg = "\n".join(f"{i + 1}. {lines[i]}" for i in range(head))
-                        if n > head:
-                            msg += f"\n… ще {n - head}."
-                        silent_showinfo(
-                            self.root,
-                            "Вибір — обрані об'єкти",
-                            f"Усього: {n}\n\n{msg}",
-                        )
-
-                    m.add_command(label="Показати список обраного…", command=_show_pick_list)
-
-                    def _clear_sel() -> None:
-                        self._canvas_selection_keys = []
-                        self.redraw()
-
-                    m.add_command(label="Зняти виділення", command=_clear_sel)
-                    try:
-                        m.tk_popup(mx, my)
-                    finally:
-                        try:
-                            m.grab_release()
-                        except Exception:
-                            pass
+                    self._open_selected_blocks_context_menu(menu_anchor=(mx, my))
                     return
                 lines = [h[2] for h in keys]
                 n = len(lines)
@@ -16302,7 +16101,12 @@ class DripCAD:
             self._refresh_canvas_cursor_for_special_tool()
             self.redraw()
             return
+        if self.mode.get() in ("VIEW", "PAN") and self._right_click_targets_selected_block(wx, wy):
+            if self._open_selected_blocks_context_menu(menu_anchor=menu_anchor):
+                return
         if ct == "map_pick_info":
+            if self._open_context_menu_for_world_pick(wx, wy, menu_anchor=menu_anchor):
+                return
             self._canvas_special_tool = None
             self._refresh_canvas_cursor_for_special_tool()
             self.redraw()
@@ -16349,6 +16153,11 @@ class DripCAD:
             return
 
         m = self.mode.get()
+        if m == "INFO" and ct is None:
+            if self._open_context_menu_for_world_pick(wx, wy, menu_anchor=menu_anchor):
+                return
+            return
+
         if m in ("VIEW", "PAN") and ct is None:
             ci = (
                 self._pick_trunk_consumer_node_index_for_schedule_edit(wx, wy)
@@ -16401,12 +16210,15 @@ class DripCAD:
             self._cut_line_start = None
             self.redraw()
             return
-        if m == "SUBMAIN" and self.active_submain and self._current_live_end:
-            self.active_submain.append(self._current_live_end)
+        if m == "SUBMAIN" and self.active_submain:
+            final_submain = self._submain_full_chain_from_pointer(float(wx), float(wy))
+            if not final_submain or len(final_submain) < 2:
+                self.redraw()
+                return
             bi = self._active_submain_block_idx
             if bi is not None and bi < len(self.field_blocks):
                 self._strip_hydro_for_block_keep_others(bi)
-                self.field_blocks[bi]["submain_lines"].append(list(self.active_submain))
+                self.field_blocks[bi]["submain_lines"].append(list(final_submain))
             self.active_submain = []
             self._active_submain_block_idx = None
             self._current_live_end = None
@@ -16424,10 +16236,154 @@ class DripCAD:
             self._active_draw_block_idx = None
             self.redraw()
 
-    def calculate_live_submain(self, twx, twy):
+    def _submain_begin_draft_at_world(self, wx: float, wy: float) -> bool:
         """
-        Притягування кінця сабмейну до перетинів із латералями та до кінців латералів уздовж
-        напрямку курсора; ланцюг точок уздовж променя — для попереднього креслення всіх «вузлів».
+        Початок чернетки сабмейну: перша точка (клапан) по ЛКМ.
+        Повертає True, якщо точку поставлено в блоці; інакше показує попередження.
+        """
+        sp = self.get_snap(float(wx), float(wy))
+        if sp is not None:
+            wx, wy = float(sp[0]), float(sp[1])
+        bi_click = self._find_block_containing(wx, wy)
+        abi = self._safe_active_block_idx()
+        bi = bi_click
+        if bi is None and abi is not None and 0 <= abi < len(self.field_blocks):
+            poly = self._block_poly(self.field_blocks[abi])
+            p = Point(wx, wy)
+            tol = 15.0 / max(self.zoom, 0.01)
+            if not poly.is_empty and (poly.contains(p) or poly.boundary.distance(p) <= tol):
+                bi = abi
+        if bi is None:
+            silent_showwarning(
+                self.root,
+                "Увага",
+                "Клапан: клацніть ЛКМ всередині блоку поля (або всередині обраного «Активний блок»).",
+            )
+            return False
+        self._active_submain_block_idx = bi
+        self.active_submain = [(float(wx), float(wy))]
+        self._current_live_end = None
+        self._submain_preview_world = None
+        self._submain_end_snapped = False
+        self._submain_recalc_urgent = True
+        return True
+
+    def _submain_chain_along_lateral_ends(
+        self,
+        s_pt: Tuple[float, float],
+        twx: float,
+        twy: float,
+        bi: Optional[int],
+        *,
+        trim_tail: bool = True,
+    ) -> Optional[Tuple[List[Tuple[float, float]], Tuple[float, float]]]:
+        """
+        На кожному сегменті ЛКМ → курсор шукаємо фактичні перетини з латералями.
+        Якщо перетину немає, але кінець латералі лежить біля сегмента — він теж може бути
+        кінцевою snap-точкою.
+        На фінальному ПКМ обрізаємо хвіст після останньої врізки; на проміжному ЛКМ лишаємо точку
+        курсора як наступну вершину ламаної. Самі врізки не додаємо у геометрію сабмейну, інакше
+        кожен ряд стає окремою секцією гідравліки.
+        """
+        sx, sy = s_pt
+        ex_m, ey_m = float(twx), float(twy)
+        rlen = math.hypot(ex_m - sx, ey_m - sy)
+        if rlen < 1e-9:
+            return None
+        ux, uy = (ex_m - sx) / rlen, (ey_m - sy) / rlen
+        t_cut = max(0.0, (ex_m - sx) * ux + (ey_m - sy) * uy)
+        t_cut = min(t_cut, rlen + 1.0)  # не злітати, якщо курсор трохи далі «кінця»
+
+        e_seg = (sx + ux * t_cut, sy + uy * t_cut)
+        run_seg = LineString([s_pt, e_seg])
+        # Мін. ~1 м: кінці рядів часто осторонь гумової «хорди» (ряд не доходить до сабмейна у плані)
+        tol_f = max(self._submain_lateral_snap_m(), 1.0)
+
+        if bi is not None and 0 <= bi < len(self.field_blocks):
+            b = self.field_blocks[bi]
+            lats = list(b.get("auto_laterals") or []) + list(b.get("manual_laterals") or [])
+        else:
+            lats = self._flatten_all_lats()
+
+        by_t: List[Tuple[float, float, Tuple[float, float]]] = []
+
+        def _append_candidate(points: List[Tuple[float, float]], px: float, py: float) -> None:
+            p = (float(px), float(py))
+            t = (p[0] - sx) * ux + (p[1] - sy) * uy
+            # Було: t <= 1e-3 — хибно відсікало всі кінці з t≈0 (напр. вертикальні ряди при гориз. сабмейні)
+            if t < -0.05:
+                return
+            if math.hypot(p[0] - sx, p[1] - sy) < 0.02:
+                return
+            if t > t_cut + 0.2:
+                return
+            if Point(p).distance(run_seg) > tol_f:
+                return
+            for q in points:
+                if math.hypot(p[0] - q[0], p[1] - q[1]) <= 1e-3:
+                    return
+            points.append(p)
+
+        def _candidate_points_from_intersection(inter) -> List[Tuple[float, float]]:
+            points: List[Tuple[float, float]] = []
+            if inter is None or inter.is_empty:
+                return points
+            geoms = list(inter.geoms) if hasattr(inter, "geoms") else [inter]
+            for g in geoms:
+                if g.is_empty:
+                    continue
+                if g.geom_type == "Point":
+                    _append_candidate(points, g.x, g.y)
+                elif g.geom_type == "LineString":
+                    coords = list(g.coords)
+                    if coords:
+                        # Якщо сабмейн частково лежить по латералі, беремо downstream-кінець перекриття.
+                        best = max(
+                            coords,
+                            key=lambda c: (float(c[0]) - sx) * ux + (float(c[1]) - sy) * uy,
+                        )
+                        _append_candidate(points, best[0], best[1])
+            return points
+
+        for lat in lats:
+            if lat is None or lat.is_empty or len(lat.coords) < 2:
+                continue
+            a = (float(lat.coords[0][0]), float(lat.coords[0][1]))
+            b = (float(lat.coords[-1][0]), float(lat.coords[-1][1]))
+            try:
+                candidates = _candidate_points_from_intersection(lat.intersection(run_seg))
+            except Exception:
+                continue
+            if not candidates:
+                try:
+                    da = float(Point(a).distance(run_seg))
+                    db = float(Point(b).distance(run_seg))
+                except Exception:
+                    continue
+                endpoint_candidates: List[Tuple[float, float]] = []
+                if da <= tol_f:
+                    _append_candidate(endpoint_candidates, a[0], a[1])
+                if db <= tol_f:
+                    _append_candidate(endpoint_candidates, b[0], b[1])
+                candidates = endpoint_candidates
+            for p in candidates:
+                t = (p[0] - sx) * ux + (p[1] - sy) * uy
+                by_t.append((t, math.hypot(p[0] - sx, p[1] - sy), p))
+
+        by_t.sort(key=lambda x: (x[0], x[1]))
+        if trim_tail and by_t:
+            # Курсор далі останньої врізки вздовж напрямку ЛКМ→курсор — не тягнути сабмейн
+            # у «порожнечу» за останнім рядом. Геометрія лишається простою: тільки початок і кінець.
+            t_last, _d_last, p_last = by_t[-1]
+            if float(t_cut) - float(t_last) > 0.2:
+                return [s_pt, p_last], p_last
+
+        return [s_pt, e_seg], e_seg
+
+    def calculate_live_submain(self, twx, twy, *, trim_tail: bool = True):
+        """
+        Побудова ламаного сабмейну через перетини/кінці латералів уздовж бігу ЛКМ → курсор.
+        Якщо snap вимкнено — вільна лінія.
         """
         self._submain_preview_world = None
         self._submain_end_snapped = False
@@ -16450,84 +16406,38 @@ class DripCAD:
         if not self.snap_enabled or self.snap_disabled_next_click:
             return _preview_free(twx, twy)
 
-        rdx, rdy = twx - sx, twy - sy
-        rlen = math.hypot(rdx, rdy)
-        if rlen < 1e-9:
-            return _preview_free(twx, twy)
-        dx, dy = rdx / rlen, rdy / rlen
-
-        tol = max(15.0 / self.zoom, 0.5)
-        huge = 1.0e7
-        far = (sx + dx * huge, sy + dy * huge)
-        long_ray = LineString([s_pt, far])
-
         bi = self._active_submain_block_idx
-        lats = (
-            self.field_blocks[bi]["auto_laterals"] + self.field_blocks[bi]["manual_laterals"]
-            if bi is not None and bi < len(self.field_blocks)
-            else self._flatten_all_lats()
+        built = self._submain_chain_along_lateral_ends(
+            s_pt, float(twx), float(twy), bi, trim_tail=trim_tail
         )
-
-        def along_t(px, py):
-            return (px - sx) * dx + (py - sy) * dy
-
-        candidates = []
-
-        def add_pt(px, py):
-            t = along_t(px, py)
-            if t > 1e-6:
-                candidates.append((t, (float(px), float(py))))
-
-        for lat in lats:
-            if lat.is_empty or len(lat.coords) < 2:
-                continue
-            try:
-                inter = long_ray.intersection(lat)
-            except Exception:
-                continue
-            if inter.is_empty:
-                pass
-            elif inter.geom_type == "Point":
-                add_pt(inter.x, inter.y)
-            elif inter.geom_type == "LineString":
-                for c in inter.coords:
-                    add_pt(c[0], c[1])
-            elif inter.geom_type == "MultiPoint":
-                for p in inter.geoms:
-                    add_pt(p.x, p.y)
-            elif inter.geom_type == "MultiLineString":
-                for g in inter.geoms:
-                    for c in g.coords:
-                        add_pt(c[0], c[1])
-            elif hasattr(inter, "geoms"):
-                for g in inter.geoms:
-                    if g.geom_type == "Point":
-                        add_pt(g.x, g.y)
-                    elif g.geom_type == "LineString":
-                        for c in g.coords:
-                            add_pt(c[0], c[1])
-
-            for end in (lat.coords[0], lat.coords[-1]):
-                ex, ey = float(end[0]), float(end[1])
-                t = (ex - sx) * dx + (ey - sy) * dy
-                if t <= 1e-6:
-                    continue
-                fx, fy = sx + t * dx, sy + t * dy
-                perp = math.hypot(ex - fx, ey - fy)
-                if perp <= tol:
-                    add_pt(fx, fy)
-
-        if not candidates:
+        if built is None:
             return _preview_free(twx, twy)
-        candidates.sort(key=lambda x: x[0])
-        dedup = []
-        for _t, pt in candidates:
-            if not dedup or math.hypot(pt[0] - dedup[-1][0], pt[1] - dedup[-1][1]) > 1e-4:
-                dedup.append(pt)
-        end_xy = dedup[-1]
-        self._submain_preview_world = [s_pt] + dedup
+        chain, e_seg = built
+        if len(chain) < 2:
+            return _preview_free(twx, twy)
+        self._submain_preview_world = list(chain)
         self._submain_end_snapped = True
-        return end_xy
+        return e_seg
+
+    def _submain_full_chain_from_pointer(
+        self, wx: float, wy: float, *, trim_tail: bool = True
+    ) -> Optional[List[Tuple[float, float]]]:
+        """Ланцюг від останньої вершини чернетки до (wx, wy) з врізками/ламаною. None — якщо чернетки немає."""
+        if not self.active_submain:
+            return None
+        sp = self.get_snap(float(wx), float(wy))
+        if sp is not None:
+            wx, wy = float(sp[0]), float(sp[1])
+        live_end = self.calculate_live_submain(wx, wy, trim_tail=trim_tail)
+        if live_end is None:
+            live_end = self._current_live_end
+        if live_end is None:
+            return None
+        self._current_live_end = live_end
+        if self._submain_preview_world and len(self._submain_preview_world) >= 2:
+            return list(self.active_submain[:-1]) + list(self._submain_preview_world)
+        nxt = list(self.active_submain) + [live_end]
+        return nxt if len(nxt) >= 2 else None
 
     def handle_motion(self, event):
         wx, wy = self.to_world(event.x, event.y)
@@ -16544,14 +16454,14 @@ class DripCAD:
             self._zoom_box_end = (float(wx), float(wy))
         zoom_rubber = m == "ZOOM_BOX" and self._zoom_box_start is not None
 
-        if m == "SUBMAIN" and self.active_submain and self.action.get() == "ADD":
-            self._current_live_end = self.calculate_live_submain(wx, wy)
-            
+        self._submain_pointer_motion_update(wx, wy)
         z_val = self.topo.get_z(wx, wy) if self.topo.elevation_points else 0.0
         if hasattr(self.control_panel, 'lbl_z_cursor'):
             self.control_panel.lbl_z_cursor.config(text=f"Z= {z_val:.2f} м")
-        
-        self.redraw(skip_heavy_canvas_layers=zoom_rubber)
+        _submain_rubber = m == "SUBMAIN" and bool(self.active_submain)
+        self.redraw(
+            skip_heavy_canvas_layers=bool(zoom_rubber or _submain_rubber)
+        )
         self.canvas.delete("preview")
         
         if m == "RULER" and self.ruler_start:
@@ -16833,6 +16743,25 @@ class DripCAD:
             scr = [self.to_screen(*p) for p in chain if p is not None]
             if len(scr) >= 2:
                 self.canvas.create_line(scr, fill="#FF3366", width=8, tags="preview")
+            # Гумова вісь: останній ЛКМ → курсор (орієнтир для snap, як пунктир у контури блоку)
+            _lx, _ly = float(self.active_submain[-1][0]), float(self.active_submain[-1][1])
+            _tw, _th = float(wx), float(wy)
+            if self.ortho_on.get():
+                if abs(_tw - _lx) > abs(_th - _ly):
+                    _th = _ly
+                else:
+                    _tw = _lx
+            _g0, _g1 = self.to_screen(_lx, _ly), self.to_screen(_tw, _th)
+            self.canvas.create_line(
+                _g0[0],
+                _g0[1],
+                _g1[0],
+                _g1[1],
+                fill="#E8E8E8",
+                dash=(5, 4),
+                width=2,
+                tags="preview",
+            )
             if self._current_live_end and getattr(self, "_submain_end_snapped", False):
                 cx, cy = self.to_screen(*self._current_live_end)
                 self.canvas.create_oval(cx - 7, cy - 7, cx + 7, cy + 7, outline="#00FFCC", width=2, tags="preview")
@@ -17202,6 +17131,94 @@ class DripCAD:
         except Exception:
             pass
         return True
+
+    def collect_field_valve_pressure_to_trunk_consumers(self) -> None:
+        """Перечитати Q/H на кранах сабмейнів і записати їх у найближчі споживачі магістралі."""
+        nodes = list(getattr(self, "trunk_map_nodes", []) or [])
+        if not nodes:
+            silent_showwarning(self.root, "Зібрати тиск", "Немає вузлів магістралі.")
+            return
+        try:
+            valves = list(self.get_valves())
+        except Exception:
+            valves = []
+        if not valves:
+            silent_showwarning(
+                self.root,
+                "Зібрати тиск",
+                "Немає кранів сабмейнів. Спочатку намалюйте сабмейн/виконайте гідророзрахунок блоку.",
+            )
+            return
+
+        updated = 0
+        no_valve_near = 0
+        no_hydro = 0
+        tol = self._consumer_valve_snap_radius_m()
+        for node in nodes:
+            if not isinstance(node, dict):
+                continue
+            if str(node.get("kind", "")).lower() not in ("consumption", "valve"):
+                continue
+            try:
+                wx = float(node.get("x"))
+                wy = float(node.get("y"))
+            except (TypeError, ValueError):
+                continue
+            best_valve: Optional[Tuple[float, float]] = None
+            best_d: Optional[float] = None
+            for vx, vy in valves:
+                try:
+                    d = math.hypot(float(vx) - wx, float(vy) - wy)
+                except (TypeError, ValueError):
+                    continue
+                if d > tol:
+                    continue
+                if best_d is None or d < best_d:
+                    best_d = d
+                    best_valve = (float(vx), float(vy))
+            if best_valve is None:
+                no_valve_near += 1
+                continue
+            sx, sy = best_valve
+            if self._apply_field_valve_hydraulic_to_consumer_node(node, float(sx), float(sy)):
+                updated += 1
+            else:
+                no_hydro += 1
+
+        if updated <= 0:
+            parts = []
+            if no_valve_near:
+                parts.append(f"без крана поруч: {no_valve_near}")
+            if no_hydro:
+                parts.append(f"немає розрахованого H/Q: {no_hydro}")
+            detail = f" ({'; '.join(parts)})" if parts else ""
+            silent_showwarning(
+                self.root,
+                "Зібрати тиск",
+                "Не оновлено жодного споживача. Перевірте, що споживачі стоять біля кранів і гідравліка блоку порахована."
+                + detail,
+            )
+            return
+
+        self.trunk_irrigation_hydro_cache = None
+        self.notify_irrigation_schedule_ui()
+        self.redraw()
+        try:
+            self._schedule_embedded_map_overlay_refresh()
+        except Exception:
+            pass
+        skipped_parts = []
+        if no_valve_near:
+            skipped_parts.append(f"без крана поруч: {no_valve_near}")
+        if no_hydro:
+            skipped_parts.append(f"без H/Q: {no_hydro}")
+        suffix = f"\nПропущено: {'; '.join(skipped_parts)}." if skipped_parts else ""
+        silent_showinfo(
+            self.root,
+            "Зібрати тиск",
+            f"Оновлено споживачів: {updated}.\nКеш магістралі скинуто — натисніть «Оптимізація» для перерахунку."
+            + suffix,
+        )
 
     def _snap_world_xy_to_nearest_field_valve(self, wx: float, wy: float) -> Tuple[float, float]:
         """Якщо поруч кран (початок відрізка сабмейну) — координати крана; інакше (wx, wy) без змін."""
@@ -17889,20 +17906,6 @@ class DripCAD:
                         width=line_width,
                     )
                 return
-            abi_map = self._safe_active_block_idx()
-            mask_outlines_on = bool(self.var_show_press_zone_outlines_on_map.get())
-            if (
-                mask_outlines_on
-                and abi_map is not None
-                and int(block_bi) == int(abi_map)
-            ):
-                for piece in self._split_lateral_at_block_submains(lat, block):
-                    self.canvas.create_line(
-                        [self.to_screen(*c) for c in piece.coords],
-                        fill=okc,
-                        width=line_width,
-                    )
-                return
             faud = (self.calc_results.get("lateral_flow_audit") or {}).get(f"lat_{li_use}")
             if faud and faud.get("q_min") is not None:
                 lc = _lat_line_color(li_use, True, okc, okc)
@@ -18046,389 +18049,6 @@ class DripCAD:
                 if not drawn_any:
                     _draw_q_pair(ext.get("min"), ext.get("max"))
 
-        # Ізолінії виливу на блоці/мапі вимкнені: показ тільки в окремому вікні.
-        if (
-            is_calculated
-            and self.var_show_emitter_flow.get()
-            and bool(getattr(self, "_emit_flow_draw_on_canvas", False))
-            and not bool(self.var_show_press_zone_outlines_on_map.get())
-            and not skip_heavy_canvas_layers
-        ):
-            em_db = self.calc_results.get("emitters") or {}
-            if em_db:
-                lat_list = self._flatten_all_lats()
-                lpa = self.calc_results.get("lateral_pressure_audit") or {}
-                try:
-                    h_lo_lim = float(
-                        self.var_emit_h_press_min.get().replace(",", ".")
-                    )
-                except Exception:
-                    h_lo_lim = 0.0
-                try:
-                    h_hi_lim = float(
-                        self.var_emit_h_press_max.get().replace(",", ".")
-                    )
-                except Exception:
-                    h_hi_lim = 0.0
-                band_on = (h_lo_lim > 1e-9) or (h_hi_lim > 1e-9)
-                _h_band_tol = 0.02
-                sm_for_conn = self._hydraulic_submain_lines()
-                sample_all = []
-
-                def _append_wing_rows(lat, pay, wing_rows, conn, sign_xa: float):
-                    """sign_xa: -1 для L1 (along = conn - xa), +1 для L2 (along = conn + xa)."""
-                    for row in wing_rows or []:
-                        qe = float(row.get("q_emit", 0))
-                        if qe <= 1e-4:
-                            continue
-                        xa = float(row.get("x", 0))
-                        along = conn + sign_xa * xa
-                        along = max(0.0, min(float(lat.length), float(along)))
-                        h_em = float(row.get("h", 0))
-                        if not band_on:
-                            continue
-                        try:
-                            pt = lat.interpolate(along)
-                            sample_all.append((float(pt.x), float(pt.y), float(qe), float(h_em)))
-                        except Exception:
-                            pass
-
-                def _densify_lateral_wing(lat, wing_rows, conn, sign_xa: float, n_between: int = 4):
-                    """Додаткові точки між емітерами на крилі — щоб q/h поле змінювалось уздовж латераля і ізолінії його перетинали."""
-                    pts_along = []
-                    for row in wing_rows or []:
-                        qe = float(row.get("q_emit", 0))
-                        if qe <= 1e-4:
-                            continue
-                        xa = float(row.get("x", 0))
-                        along = conn + sign_xa * xa
-                        along = max(0.0, min(float(lat.length), float(along)))
-                        h_em = float(row.get("h", 0))
-                        try:
-                            pt = lat.interpolate(along)
-                            pts_along.append((along, float(pt.x), float(pt.y), qe, h_em))
-                        except Exception:
-                            pass
-                    pts_along.sort(key=lambda t: t[0])
-                    for i in range(len(pts_along) - 1):
-                        a1, x1, y1, q1, h1 = pts_along[i]
-                        a2, x2, y2, q2, h2 = pts_along[i + 1]
-                        span = abs(a2 - a1)
-                        if span < 1e-6:
-                            continue
-                        n_sub = min(8, max(2, int(span / 2.4)))
-                        for k in range(1, n_sub):
-                            t = k / n_sub
-                            al = a1 + t * (a2 - a1)
-                            try:
-                                pt = lat.interpolate(al)
-                            except Exception:
-                                continue
-                            qe = q1 + t * (q2 - q1)
-                            h_em = h1 + t * (h2 - h1)
-                            sample_all.append((float(pt.x), float(pt.y), float(qe), float(h_em)))
-
-                bad_wing_status = frozenset({"overflow", "underflow", "both"})
-
-                def _lateral_needs_densify(li: int) -> bool:
-                    aud = lpa.get(f"lat_{li}")
-                    if not aud:
-                        return False
-                    if aud.get("status") in bad_wing_status:
-                        return True
-                    return (
-                        aud.get("status_l1") in bad_wing_status
-                        or aud.get("status_l2") in bad_wing_status
-                    )
-
-                for key, pay in em_db.items():
-                    if not str(key).startswith("lat_"):
-                        continue
-                    try:
-                        li = int(str(key).split("_", 1)[1])
-                    except (ValueError, IndexError):
-                        continue
-                    if li < 0 or li >= len(lat_list):
-                        continue
-                    lat = lat_list[li]
-                    if lat.is_empty or lat.length < 1e-6:
-                        continue
-                    try:
-                        conn = lat_sol.connection_distance_along_lateral(
-                            lat, sm_for_conn, snap_m=self._submain_lateral_snap_m()
-                        )
-                    except Exception:
-                        conn = 0.0
-                    conn = max(0.0, min(float(lat.length), float(conn)))
-                    _append_wing_rows(lat, pay, pay.get("L1"), conn, -1.0)
-                    _append_wing_rows(lat, pay, pay.get("L2"), conn, 1.0)
-                    if band_on and _lateral_needs_densify(li):
-                        _densify_lateral_wing(lat, pay.get("L1"), conn, -1.0)
-                        _densify_lateral_wing(lat, pay.get("L2"), conn, 1.0)
-
-                def _classify_emit(hm: float) -> str:
-                    ok_lo = (True if h_lo_lim <= 1e-9 else hm >= h_lo_lim - _h_band_tol)
-                    ok_hi = (True if h_hi_lim <= 1e-9 else hm <= h_hi_lim + _h_band_tol)
-                    if ok_lo and ok_hi:
-                        return "inband"
-                    if not ok_hi:
-                        return "overflow"
-                    return "underflow"
-
-                def _downsample(arr, max_pts=2500):
-                    n = len(arr)
-                    if n <= max_pts:
-                        return arr
-                    step = max(1, n // max_pts)
-                    return arr[::step]
-
-                # Єдине поле q_emit: так ізолінії не "борються" між незалежними полями.
-                pts_h_classify = [
-                    (float(x), float(y), float(h)) for x, y, _q, h in sample_all
-                ]
-                if len(pts_h_classify) > 5000:
-                    _st = max(1, len(pts_h_classify) // 5000)
-                    pts_h_classify = pts_h_classify[::_st]
-
-                pts_q = [(x, y, q) for x, y, q, _h in sample_all]
-                pts_q = _downsample(pts_q, max_pts=2200)
-
-                if pts_q:
-                    lo_q = min(p[2] for p in pts_q)
-                    hi_q = max(p[2] for p in pts_q)
-                else:
-                    lo_q = 0.0
-                    hi_q = 0.0
-
-                sig = (
-                    len(pts_q),
-                    round(sum((p[0] for p in pts_q), 3), 3),
-                    round(sum((p[1] for p in pts_q), 3), 3),
-                    round(sum((p[2] for p in pts_q), 3), 3),
-                    round(lo_q, 4),
-                    round(hi_q, 4),
-                    round(h_lo_lim, 4),
-                    round(h_hi_lim, 4),
-                    "idw",
-                )
-                _emit_boundary = self.field_union_polygon()
-                if _emit_boundary is None or _emit_boundary.is_empty:
-                    _abi_fb = self._safe_active_block_idx()
-                    if _abi_fb is not None and 0 <= _abi_fb < len(self.field_blocks):
-                        _emit_boundary = self._block_poly(self.field_blocks[_abi_fb])
-                _emit_bsig = (
-                    tuple(round(x, 1) for x in _emit_boundary.bounds)
-                    if _emit_boundary is not None and not _emit_boundary.is_empty
-                    else (0, 0, 0, 0)
-                )
-                # Версія кешу: зміна рівнів / сітки / спрощення інвалідує старий кеш.
-                _emit_flow_n_levels = 6
-                sig = sig + (
-                    _emit_bsig,
-                    len(sample_all),
-                    _emit_flow_n_levels,
-                    "v4",
-                )
-
-                cache = getattr(self, "_emit_isolines_cache", None) or {}
-                contours = []
-                if cache.get("sig") == sig:
-                    contours = list(cache.get("contours") or [])
-                else:
-                    boundary = _emit_boundary
-                    if boundary is not None and not boundary.is_empty and len(pts_q) >= 8 and hi_q > lo_q + 1e-9:
-                        q_step = max(
-                            (hi_q - lo_q) / float(_emit_flow_n_levels), 1e-6
-                        )
-                        nq = len(pts_q)
-                        # Грубіша сітка за горизонталями рельєфу — менше сегментів ізоліній виливу.
-                        if nq < 900:
-                            grid_m = 11.0
-                        elif nq < 1600:
-                            grid_m = 14.0
-                        elif nq < 2400:
-                            grid_m = 17.0
-                        else:
-                            grid_m = 21.0
-                        tpe = TopoEngine()
-                        # Фіксований метод: IDW.
-                        tpe.power = 2.0
-                        try:
-                            contours = tpe.generate_contours(
-                                boundary=boundary,
-                                step_z=q_step,
-                                grid_size=grid_m,
-                                elevation_points=pts_q,
-                            ) or []
-                        except Exception:
-                            contours = []
-                    self._emit_isolines_cache = {
-                        "sig": sig,
-                        "contours": contours,
-                        "contours_by_cls": {},
-                    }
-
-                def _palette(cls_name: str, t: float) -> str:
-                    t = max(0.0, min(1.0, float(t)))
-                    if cls_name == "inband":
-                        c0, c1 = (198, 239, 255), (119, 214, 255)   # light blue
-                    elif cls_name == "overflow":
-                        c0, c1 = (255, 170, 90), (255, 72, 0)       # hot orange
-                    else:
-                        c0, c1 = (241, 208, 110), (178, 132, 38)    # yellow/ochre
-                    r = int(c0[0] + (c1[0] - c0[0]) * t)
-                    g = int(c0[1] + (c1[1] - c0[1]) * t)
-                    b = int(c0[2] + (c1[2] - c0[2]) * t)
-                    return f"#{r:02x}{g:02x}{b:02x}"
-
-                _emit_idw_power = 2.0
-                _h_buckets = None
-                if pts_h_classify:
-                    _h_buckets = _build_point_buckets(
-                        pts_h_classify, float(_BUCKET_CELL_M)
-                    )
-
-                def _h_at_xy(mx: float, my: float) -> float:
-                    if not pts_h_classify:
-                        return 0.0
-                    if _h_buckets is None:
-                        return _idw_z(mx, my, pts_h_classify, _emit_idw_power)
-                    return _z_at_grid_node(
-                        mx,
-                        my,
-                        _h_buckets,
-                        float(_BUCKET_CELL_M),
-                        pts_h_classify,
-                        _emit_idw_power,
-                    )
-
-                def _smooth_coords(coords, passes=0):
-                    out = [(float(x), float(y)) for x, y in coords]
-                    for _ in range(max(0, int(passes))):
-                        if len(out) < 3:
-                            break
-                        nxt = [out[0]]
-                        for i in range(len(out) - 1):
-                            x1, y1 = out[i]
-                            x2, y2 = out[i + 1]
-                            qx, qy = (0.75 * x1 + 0.25 * x2), (0.75 * y1 + 0.25 * y2)
-                            rx, ry = (0.25 * x1 + 0.75 * x2), (0.25 * y1 + 0.75 * y2)
-                            nxt.append((qx, qy))
-                            nxt.append((rx, ry))
-                        nxt.append(out[-1])
-                        out = nxt
-                    return out
-
-                _emit_line_tol = 0.55
-                try:
-                    if _emit_boundary is not None and not _emit_boundary.is_empty:
-                        ex0, ey0, ex1, ey1 = _emit_boundary.bounds
-                        _emit_line_tol = max(
-                            0.4,
-                            min(3.2, 0.00022 * math.hypot(ex1 - ex0, ey1 - ey0)),
-                        )
-                except Exception:
-                    pass
-
-                n_in = n_ov = n_un = 0
-                for c in contours:
-                    z = float(c.get("z", 0.0))
-                    if z < lo_q - 1e-9 or z > hi_q + 1e-9:
-                        continue
-                    t = 0.0 if hi_q <= lo_q + 1e-9 else (z - lo_q) / (hi_q - lo_q)
-                    g = c.get("geom")
-                    if g is None or g.is_empty:
-                        continue
-                    geoms = getattr(g, "geoms", [g])
-                    for gg_raw in geoms:
-                        if gg_raw.geom_type != "LineString" or len(gg_raw.coords) <= 1:
-                            continue
-                        try:
-                            gsimp = gg_raw.simplify(
-                                _emit_line_tol, preserve_topology=True
-                            )
-                        except Exception:
-                            gsimp = gg_raw
-                        if gsimp is None or gsimp.is_empty:
-                            continue
-                        if gsimp.geom_type == "LineString":
-                            line_chunks = [gsimp]
-                        elif gsimp.geom_type == "MultiLineString":
-                            line_chunks = [
-                                s
-                                for s in gsimp.geoms
-                                if s.geom_type == "LineString"
-                                and len(s.coords) >= 2
-                            ]
-                        else:
-                            line_chunks = [gg_raw]
-                        for gg in line_chunks:
-                            draw_coords = list(gg.coords)
-                            if len(draw_coords) >= 3:
-                                draw_coords = _smooth_coords(draw_coords, passes=0)
-                            g_draw = LineString(draw_coords)
-                            mid = g_draw.interpolate(0.5, normalized=True)
-                            if pts_h_classify:
-                                h_mid = _h_at_xy(float(mid.x), float(mid.y))
-                                cls_name = _classify_emit(h_mid)
-                            else:
-                                cls_name = "inband"
-                            if cls_name == "inband":
-                                n_in += 1
-                            elif cls_name == "overflow":
-                                n_ov += 1
-                            else:
-                                n_un += 1
-                            col = _palette(cls_name, t)
-                            scr_ln = [self.to_screen(*pt) for pt in g_draw.coords]
-                            self.canvas.create_line(
-                                scr_ln,
-                                fill=col,
-                                width=1,
-                                dash=(2, 2),
-                                tags="emit_flow_iso",
-                            )
-                            try:
-                                mx, my = self.to_screen(float(mid.x), float(mid.y))
-                                if abs(z) >= 100.0:
-                                    q_txt = f"{z:.0f} л/г"
-                                elif abs(z) >= 10.0:
-                                    q_txt = f"{z:.1f} л/г"
-                                else:
-                                    q_txt = f"{z:.2f} л/г"
-                                self.canvas.create_text(
-                                    mx + 1,
-                                    my + 1,
-                                    text=q_txt,
-                                    fill="#101010",
-                                    font=("Segoe UI", 8, "bold"),
-                                    tags="emit_flow_iso",
-                                )
-                                self.canvas.create_text(
-                                    mx,
-                                    my,
-                                    text=q_txt,
-                                    fill="#F5F5F5",
-                                    font=("Segoe UI", 8, "bold"),
-                                    tags="emit_flow_iso",
-                                )
-                            except Exception:
-                                pass
-                try:
-                    _ch = max(100, int(self.canvas.winfo_height()))
-                except tk.TclError:
-                    _ch = 600
-                if band_on:
-                    _leg = (
-                        "Ізолінії виливу (6 рівнів, IDW; підпис — Q, л/г; колір за тиском як у латералів): "
-                        "норма — світло-блакитні, перелив — гаряча помаранчева гама, "
-                        "недолив — жовто-охряна гама"
-                    )
-                    _leg += f" (контурів: норм={n_in}, перелив={n_ov}, недолив={n_un})"
-                else:
-                    _leg = "Ізолінії виливу: діапазон тиску не задано — не показуються"
-                self.canvas.create_text(12, _ch - 6, text=_leg, fill="#AAAAAA", font=("Arial", 7), anchor=tk.SW)
-            
         if is_calculated and (show_submain_base or show_valves):
             if show_submain_base:
                 for sm in self._all_submain_lines():
@@ -18643,43 +18263,6 @@ class DripCAD:
                 self.canvas.create_polygon(scr + [scr[0]], fill="", outline="#888844", dash=(4,6), width=2)
                 self.canvas.create_text(scr[0][0], scr[0][1]-15, text="Межа SRTM", fill="#888844", font=("Arial", 9, "bold"), anchor=tk.W)
 
-        if (
-            bool(self.var_show_press_zone_outlines_on_map.get())
-            and bool(getattr(self, "_emit_flow_draw_on_canvas", False))
-            and not skip_heavy_canvas_layers
-        ):
-            try:
-                bun = self._bad_pressure_emitter_details_active_block()
-                if bun["band_on"] and bun["has_calc"]:
-                    items = bun.get("items") or []
-                    ov_items = [it for it in items if it.get("overflow")]
-                    un_items = [it for it in items if it.get("underflow")]
-                    lw = max(3, min(6, int(max(self.zoom, 1.0) + 1)))
-                    if ov_items:
-                        zone_ov = self._bad_emitter_pressure_zone_clipped(
-                            {**bun, "items": ov_items}
-                        )
-                        if zone_ov is not None and not zone_ov.is_empty:
-                            self._draw_emitter_pressure_zone_on_canvas(
-                                zone_ov,
-                                outline="#FF5533",
-                                width=lw,
-                                canvas_tag="bad_emit_zone_overflow",
-                            )
-                    if un_items:
-                        zone_un = self._bad_emitter_pressure_zone_clipped(
-                            {**bun, "items": un_items}
-                        )
-                        if zone_un is not None and not zone_un.is_empty:
-                            self._draw_emitter_pressure_zone_on_canvas(
-                                zone_un,
-                                outline="#E8C547",
-                                width=lw,
-                                canvas_tag="bad_emit_zone_underflow",
-                            )
-            except Exception:
-                pass
-
         for seg in getattr(self, "scene_lines", []) or []:
             if len(seg) >= 2:
                 scr_sl = [self.to_screen(float(p[0]), float(p[1])) for p in seg]
@@ -18745,11 +18328,6 @@ class DripCAD:
             else:
                 self.control_panel.stats_label.config(text=base_stats)
         except: pass
-
-        try:
-            self.refresh_block_out_of_range_emitters_panel()
-        except Exception:
-            pass
 
         try:
             self._schedule_embedded_map_overlay_refresh()
@@ -18987,15 +18565,39 @@ class DripCAD:
             pass
         return default
 
-    def open_block_irrigation_scheme_dialog(self, block_index: int) -> None:
+    def open_block_irrigation_scheme_dialog(
+        self,
+        block_index: int,
+        selected_block_indices: Optional[Sequence[int]] = None,
+        clear_selected_blocks_on_close: bool = False,
+    ) -> None:
         """
-        Властивості блоку: сітка поливу, модель крапельниці / Q ном, внутрішній Ø латераля.
+        Властивості блоку: сітка поливу, модель крапельниці / Q ном, K/x емітера (перегляд з довідника),
+        внутрішній Ø латераля; на вкладці «Гідравліка» — Hmin/Hmax (бажаний діапазон латераля) та Hmax.work (макс. безпечний тиск емітера за довідником лінії).
         Зберігається в field_blocks[i]['params'] (JSON проєкту).
         """
         bi = int(block_index)
         if bi < 0 or bi >= len(self.field_blocks):
             return
         block = self.field_blocks[bi]
+        selected_scope: List[int] = []
+        if selected_block_indices is not None:
+            seen_scope: Set[int] = set()
+            for raw_idx in selected_block_indices:
+                try:
+                    idx = int(raw_idx)
+                except (TypeError, ValueError):
+                    continue
+                if 0 <= idx < len(self.field_blocks) and idx not in seen_scope:
+                    seen_scope.add(idx)
+                    selected_scope.append(idx)
+            if bi not in seen_scope:
+                selected_scope.insert(0, bi)
+        else:
+            current_scope = self._selected_block_indices()
+            if len(current_scope) > 1 and bi in set(current_scope):
+                selected_scope = list(current_scope)
+                clear_selected_blocks_on_close = True
         dlg = tk.Toplevel(self.root)
         dlg.title(f"Властивості блоку {bi + 1}")
         dlg.geometry("520x520")
@@ -19003,6 +18605,29 @@ class DripCAD:
         dlg.configure(bg="#1e1e1e")
         try:
             dlg.transient(self.root)
+        except tk.TclError:
+            pass
+
+        _selection_close_done = [False]
+
+        def _clear_selected_blocks_after_close() -> None:
+            if not clear_selected_blocks_on_close or _selection_close_done[0]:
+                return
+            _selection_close_done[0] = True
+            self._canvas_selection_keys = []
+            self._destroy_select_hover_pick_ui()
+            self.redraw()
+
+        def _close_dialog() -> None:
+            try:
+                if dlg.winfo_exists():
+                    dlg.destroy()
+            except tk.TclError:
+                pass
+            _clear_selected_blocks_after_close()
+
+        try:
+            dlg.protocol("WM_DELETE_WINDOW", _close_dialog)
         except tk.TclError:
             pass
 
@@ -19075,10 +18700,43 @@ class DripCAD:
         except (TypeError, ValueError):
             _n_emit_eq = 0
 
-        top = tk.Frame(dlg, bg="#1e1e1e")
-        top.pack(fill=tk.BOTH, expand=True, padx=14, pady=12)
+        def _fmt_head_band_display(key: str, glob_var: tk.Variable, default: str) -> str:
+            s = self._block_param_display_str(block, key, glob_var, default)
+            try:
+                return f"{float(str(s).replace(',', '.')):.3f}"
+            except (TypeError, ValueError):
+                t = str(s).strip()
+                return t if t else "—"
+
+        v_bl_hmin = tk.StringVar(
+            value=_fmt_head_band_display("emitter_h_press_min_m", self.var_emit_h_press_min, "0")
+        )
+        v_bl_hmax = tk.StringVar(
+            value=_fmt_head_band_display("emitter_h_press_max_m", self.var_emit_h_press_max, "0")
+        )
+        v_bl_h_work = tk.StringVar(value="—")
+
+        content_panel = tk.Frame(dlg, bg="#1e1e1e")
+        _block_irrig_nb_style = ttk.Style()
+        _block_irrig_nb_style.configure("BlockIrrig.TNotebook", background="#1e1e1e", borderwidth=0)
+        _block_irrig_nb_style.configure(
+            "BlockIrrig.TNotebook.Tab",
+            background="#333333",
+            foreground="white",
+            padding=[10, 4],
+            font=("Segoe UI", 9, "bold"),
+        )
+        _block_irrig_nb_style.map("BlockIrrig.TNotebook.Tab", background=[("selected", "#0066FF")])
+        nb = ttk.Notebook(content_panel, style="BlockIrrig.TNotebook")
+        tab_params = tk.Frame(nb, bg="#1e1e1e")
+        tab_hydro = tk.Frame(nb, bg="#1e1e1e")
+        tab_method = tk.Frame(nb, bg="#1e1e1e")
+        nb.add(tab_params, text="Параметри")
+        nb.add(tab_hydro, text="Гідравліка")
+        nb.add(tab_method, text="Метод розрахунку")
+
         tk.Label(
-            top,
+            tab_params,
             text="Параметри блоку зберігаються в проєкті. «Застосувати» перебудовує авто-латералі та скидає гідравліку.",
             bg="#1e1e1e",
             fg="#AAAAAA",
@@ -19106,9 +18764,9 @@ class DripCAD:
             e.pack(side=tk.RIGHT)
             attach_tooltip(e, hint)
 
-        def _section_title(text: str) -> None:
+        def _section_title(parent, text: str) -> None:
             tk.Label(
-                top,
+                parent,
                 text=text,
                 bg="#1e1e1e",
                 fg="#88DDFF",
@@ -19136,34 +18794,34 @@ class DripCAD:
             if hint:
                 attach_tooltip(lb, hint)
 
-        _section_title("Схема поливу (сітка)")
+        _section_title(tab_params, "Схема поливу (сітка)")
         _row(
-            top,
+            tab_params,
             "Крок між лініями латералів (м):",
             v_lat,
             "Відстань між паралельними лініями сітки вздовж поля.",
         )
         _row(
-            top,
+            tab_params,
             "Крок між емітерами вздовж латераля (м):",
             v_emit,
             "Крок емітера для сітки та гідравліки (разом із Q ном нижче).",
         )
         _row(
-            top,
+            tab_params,
             "Макс. довж. латералі (м), 0 = вимк:",
             v_max,
             "Розбиття довгих авто-латералів; 0 — без обмеження.",
         )
         _row(
-            top,
+            tab_params,
             "Пропуск рядів кожні N, 0 = вимк:",
             v_blocks,
             "Кожен (N+1)-й ряд сітки пропускається.",
         )
 
-        _section_title("Крапельниця (емітер)")
-        em_fr = tk.Frame(top, bg="#1e1e1e")
+        _section_title(tab_params, "Крапельниця (емітер)")
+        em_fr = tk.Frame(tab_params, bg="#1e1e1e")
         em_fr.pack(fill=tk.X, pady=4)
         tk.Label(em_fr, text="Модель:", bg="#1e1e1e", fg="#E0E0E0", font=("Segoe UI", 9)).pack(
             side=tk.LEFT
@@ -19179,7 +18837,7 @@ class DripCAD:
         cb_emit_m.pack(side=tk.RIGHT)
         attach_tooltip(cb_emit_m, "Модель з бази крапельниць (як на вкладці «Блок»).")
 
-        em_fr2 = tk.Frame(top, bg="#1e1e1e")
+        em_fr2 = tk.Frame(tab_params, bg="#1e1e1e")
         em_fr2.pack(fill=tk.X, pady=4)
         tk.Label(
             em_fr2, text="Q номінал (л/г):", bg="#1e1e1e", fg="#E0E0E0", font=("Segoe UI", 9)
@@ -19203,8 +18861,42 @@ class DripCAD:
             else:
                 v_emit_nominal.set("")
 
+        v_emit_k_ro = tk.StringVar(value="—")
+        v_emit_x_ro = tk.StringVar(value="—")
+
+        def _sync_emit_kx_readonly(*_a):
+            rec = self._dripper_record(v_emit_model.get(), v_emit_nominal.get())
+            if not isinstance(rec, dict):
+                v_emit_k_ro.set("—")
+                v_emit_x_ro.set("—")
+                return
+            try:
+                v_emit_k_ro.set(f"{float(rec.get('constant_k')):.8f}")
+            except (TypeError, ValueError):
+                v_emit_k_ro.set("—")
+            try:
+                v_emit_x_ro.set(f"{float(rec.get('exponent_x')):.6f}")
+            except (TypeError, ValueError):
+                v_emit_x_ro.set("—")
+
         v_emit_model.trace_add("write", _sync_emit_nominal_choices)
+        v_emit_model.trace_add("write", _sync_emit_kx_readonly)
+        v_emit_nominal.trace_add("write", _sync_emit_kx_readonly)
         _sync_emit_nominal_choices()
+        _sync_emit_kx_readonly()
+
+        _row_readonly(
+            tab_params,
+            "K (q = K·H^x):",
+            v_emit_k_ro,
+            "З довідника крапельниць для обраної моделі та Q номінал; редагування — на вкладці «Блок».",
+        )
+        _row_readonly(
+            tab_params,
+            "x (ступінь):",
+            v_emit_x_ro,
+            "Показник степеня у q = K·H^x з довідника; редагування k/x — на вкладці «Блок».",
+        )
 
         def _on_lat_model_pick(*_a):
             rec = self._lateral_record_by_model(v_lat_model.get())
@@ -19216,14 +18908,47 @@ class DripCAD:
 
         v_lat_model.trace_add("write", _on_lat_model_pick)
 
-        _section_title("Латераль (труба)")
-        _row(
-            top,
-            "Внутрішній Ø латераля (мм):",
-            v_lat_inner,
-            "Діаметр для гідравліки латералів цього блоку (окремо від інших блоків).",
-        )
-        lat_fr = tk.Frame(top, bg="#1e1e1e")
+        def _working_pressure_bar_to_max_m_h2o(raw: Any) -> Optional[float]:
+            """Макс. числове значення тиску (бар) у рядку довідника → м вод. ст. (1 бар ≈ 10,197 м)."""
+            s = "" if raw is None else str(raw).strip()
+            if not s:
+                return None
+            buf = s.replace("–", "-").replace(",", ".")
+            nums: List[float] = []
+            cur: List[str] = []
+            for ch in buf + " ":
+                if ch.isdigit() or ch == ".":
+                    cur.append(ch)
+                else:
+                    if cur:
+                        try:
+                            nums.append(float("".join(cur)))
+                        except ValueError:
+                            pass
+                        cur = []
+            if not nums:
+                return None
+            return float(max(nums)) * 10.197
+
+        def _sync_hmax_work_from_lateral(*_a):
+            rec = self._lateral_record_by_model(v_lat_model.get())
+            if not rec:
+                v_bl_h_work.set("—")
+                return
+            bar_raw = rec.get("working_pressure_bar")
+            if bar_raw is None or str(bar_raw).strip() == "":
+                bar_raw = rec.get("max_working_pressure_bar")
+            m_h2o = _working_pressure_bar_to_max_m_h2o(bar_raw)
+            if m_h2o is None:
+                v_bl_h_work.set("—")
+            else:
+                v_bl_h_work.set(f"{m_h2o:.3f}")
+
+        v_lat_model.trace_add("write", _sync_hmax_work_from_lateral)
+        _sync_hmax_work_from_lateral()
+
+        _section_title(tab_params, "Латераль (труба)")
+        lat_fr = tk.Frame(tab_params, bg="#1e1e1e")
         lat_fr.pack(fill=tk.X, pady=4)
         tk.Label(
             lat_fr, text="Модель латералі (довідник):", bg="#1e1e1e", fg="#E0E0E0", font=("Segoe UI", 9)
@@ -19237,49 +18962,75 @@ class DripCAD:
         cb_lat_m.pack(side=tk.RIGHT)
         attach_tooltip(
             cb_lat_m,
-            "Необов’язково: вибір з бази латералів; можна лише задати Ø вручну вище.",
+            "Необов’язково: вибір з бази латералів; можна лише задати Ø вручну нижче.",
+        )
+        _row(
+            tab_params,
+            "Внутрішній Ø латераля (мм):",
+            v_lat_inner,
+            "Діаметр для гідравліки латералів цього блоку (окремо від інших блоків).",
         )
 
-        _section_title("Еквівалентний емітер (після розрахунку)")
+        _section_title(tab_hydro, "Еквівалентний емітер (після розрахунку)")
         _row_readonly(
-            top,
+            tab_hydro,
             "K_eq (для q = K·H^x):",
             v_eq_k,
             "Розраховується після гідравліки блоку при фіксованому x моделі емітера.",
         )
         _row_readonly(
-            top,
+            tab_hydro,
             "x (ступінь):",
             v_eq_x,
             "Показник степеня у формулі q = K·H^x для еквівалентного емітера блоку.",
         )
         _row_readonly(
-            top,
+            tab_hydro,
             "P_ref (м):",
             v_eq_pref,
             "Опорний напір, відносно якого обчислено K_eq.",
         )
+        _section_title(tab_hydro, "Латераль: бажаний робочий діапазон тиску")
+        _row_readonly(
+            tab_hydro,
+            "Hmin (м):",
+            v_bl_hmin,
+            "Нижня межа бажаного робочого діапазону тиску на латералі (м вод. ст.); з params блоку або панелі «Блок» (0 = вимк. перевірку).",
+        )
+        _row_readonly(
+            tab_hydro,
+            "Hmax (м):",
+            v_bl_hmax,
+            "Верхня межа бажаного робочого діапазону тиску на латералі; з params блоку або панелі «Блок» (0 = вимк.).",
+        )
+        _section_title(tab_hydro, "Емітер: максимальний безпечний робочий тиск")
+        _row_readonly(
+            tab_hydro,
+            "Hmax.work (м):",
+            v_bl_h_work,
+            "Орієнтовний максимальний безпечний робочий тиск емітера/лінії за полем робочого тиску (бар) у довіднику латераля цього блоку; перетворення 1 бар ≈ 10,197 м вод. ст. Якщо модель латераля не обрана або немає даних — «—».",
+        )
         _row(
-            top,
+            tab_hydro,
             "Hвст. (встановлений тиск, м):",
             v_eq_h_set,
             "Робочий встановлений тиск для блоку; використовується для оцінки Q_total.",
         )
         _row_readonly(
-            top,
+            tab_hydro,
             "Q_total @ H (л/г):",
             v_eq_q_eval,
             "Оцінка за формулою q = K_eq · H^x для поточного блоку.",
         )
         _row_readonly(
-            top,
+            tab_hydro,
             "% до Q_nom блоку:",
             v_eq_q_nom_pct,
             "Відхилення оціненого Q_total від номіналу блоку (n_emitters × Q номінал).",
         )
         v_eq_h_qnom = tk.StringVar(value="—")
         _row_readonly(
-            top,
+            tab_hydro,
             "H для Q_nom блоку (м):",
             v_eq_h_qnom,
             "Оцінений тиск, за якого Q_total еквівалентного емітера дорівнює номіналу блоку.",
@@ -19327,6 +19078,62 @@ class DripCAD:
         v_emit_nominal.trace_add("write", _refresh_eq_eval_fields)
         _refresh_eq_eval_fields()
 
+        tk.Label(
+            tab_method,
+            text=(
+                "Метод застосовується під час наступного «▶ РОЗРАХУНОК». "
+                "Перемикання не змінює вже зроблений розрахунок на карті й у звіті."
+            ),
+            bg="#1e1e1e",
+            fg="#AAAAAA",
+            font=("Segoe UI", 9),
+            wraplength=480,
+            justify=tk.LEFT,
+        ).pack(anchor=tk.W, pady=(0, 10))
+        lat_sol_fr = tk.LabelFrame(
+            tab_method,
+            text="Розрахунок латералів (HW / вузловий Ньютон)",
+            bg="#1e1e1e",
+            fg="#00FFCC",
+            font=("Arial", 9, "bold"),
+        )
+        lat_sol_fr.pack(fill=tk.X, pady=(0, 8))
+        for txt, val in (
+            ("Порівняти бісекцію та Ньютона", "compare"),
+            ("Лише бісекція (shooting)", "bisection"),
+            ("Лише Ньютон–Рафсон", "newton"),
+            (
+                "Ньютон по вузлах лінії (q∼(Δh/C)^0.54)",
+                "trickle_nr",
+            ),
+        ):
+            tk.Radiobutton(
+                lat_sol_fr,
+                text=txt,
+                variable=self.var_lateral_solver_mode,
+                value=val,
+                bg="#1e1e1e",
+                fg="white",
+                selectcolor="#333",
+                activebackground="#1e1e1e",
+                activeforeground="#00FFCC",
+                font=("Arial", 8),
+                anchor=tk.W,
+            ).pack(fill=tk.X, padx=8, pady=2)
+        tk.Label(
+            tab_method,
+            text=(
+                "У звіті: ітерації та (у режимі порівняння) макс. розбіжності ΔH_tip, ΔQ.\n"
+                "Режим «Ньютон по вузлах лінії» — окрема модель втрат між випусками "
+                "(інверсія HW); для компенсованих крапельниць автоматично лишається HW+бісекція."
+            ),
+            bg="#1e1e1e",
+            fg="#888888",
+            font=("Arial", 8),
+            wraplength=480,
+            justify=tk.LEFT,
+        ).pack(anchor=tk.W, pady=(2, 0))
+
         def _normalized_dialog_state() -> dict:
             return {
                 "lat": str(v_lat.get() or "").strip(),
@@ -19336,15 +19143,105 @@ class DripCAD:
                 "emit_model": str(v_emit_model.get() or "").strip(),
                 "emit_nominal_flow": str(v_emit_nominal.get() or "").strip(),
                 "flow": str(v_emit_nominal.get() or "").strip(),
+                "h_set_m": str(v_eq_h_set.get() or "").strip(),
                 "lateral_inner_d_mm": str(v_lat_inner.get() or "").strip(),
                 "lateral_model": str(v_lat_model.get() or "").strip(),
+                "lateral_solver_mode": str(self.var_lateral_solver_mode.get() or "").strip().lower(),
             }
 
         _last_applied_state = _normalized_dialog_state()
+        if selected_scope:
+            _scope_preview = ", ".join(str(i + 1) for i in selected_scope[:8])
+            if len(selected_scope) > 8:
+                _scope_preview += f" … +{len(selected_scope) - 8}"
+            _all_blocks_label = f"Всі вибрані: {_scope_preview}"
+        else:
+            _all_blocks_label = "Всі блоки"
+        _all_targets_label = "вибрані блоки" if selected_scope else "всі блоки"
+        _all_target_indices = list(selected_scope) if selected_scope else list(range(len(self.field_blocks)))
+
+        block_selector_frame = tk.Frame(content_panel, bg="#1e1e1e")
+        block_selector_frame.pack(fill=tk.X, pady=(0, 8))
+        tk.Label(
+            block_selector_frame,
+            text="Блок:",
+            bg="#1e1e1e",
+            fg="#E0E0E0",
+            font=("Segoe UI", 9, "bold"),
+        ).pack(side=tk.LEFT)
+        _block_selector_values = [_all_blocks_label] + [
+            f"Блок {i + 1}" for i in _all_target_indices
+        ]
+        _block_selector_index_by_label = {
+            f"Блок {i + 1}": int(i) for i in _all_target_indices
+        }
+        v_dialog_block = tk.StringVar(value=_all_blocks_label if selected_scope else f"Блок {bi + 1}")
+        cb_dialog_block = ttk.Combobox(
+            block_selector_frame,
+            textvariable=v_dialog_block,
+            values=_block_selector_values,
+            state="readonly",
+            width=18,
+        )
+        cb_dialog_block.pack(side=tk.RIGHT)
+        attach_tooltip(
+            cb_dialog_block,
+            (
+                "Оберіть блок або «Всі блоки» для масового запису параметрів. "
+                "Якщо діалог відкрито з виділення, «Всі блоки» означає всі вибрані."
+            ),
+        )
+        _block_selector_syncing = [False]
+
+        def _dialog_all_blocks_mode() -> bool:
+            return str(v_dialog_block.get()).strip() == _all_blocks_label
+
+        def _on_dialog_block_selected(_event=None) -> None:
+            if _block_selector_syncing[0]:
+                return
+            if _dialog_all_blocks_mode():
+                dlg.title(f"Властивості блоків — {_all_targets_label}")
+                status.config(
+                    text=(
+                        "Режим «Всі блоки»: Apply/OK запише вкладки «Параметри» "
+                        f"і «Метод розрахунку» в {_all_targets_label}."
+                    )
+                )
+                return
+            new_bi = _block_selector_index_by_label.get(v_dialog_block.get(), bi)
+            if new_bi == bi:
+                return
+            if _normalized_dialog_state() != _last_applied_state:
+                ok = silent_askyesno(
+                    dlg,
+                    "Властивості блоку",
+                    "Є незастосовані зміни. Перейти до іншого блоку без збереження?",
+                )
+                if not ok:
+                    _block_selector_syncing[0] = True
+                    try:
+                        v_dialog_block.set(f"Блок {bi + 1}")
+                    finally:
+                        _block_selector_syncing[0] = False
+                    return
+            self.var_active_block_idx.set(int(new_bi))
+            self._refresh_active_block_combo()
+            dlg.destroy()
+            self.root.after_idle(
+                lambda idx=int(new_bi), scope=list(selected_scope): self.open_block_irrigation_scheme_dialog(
+                    idx,
+                    selected_block_indices=scope if scope else None,
+                    clear_selected_blocks_on_close=clear_selected_blocks_on_close,
+                )
+            )
+
+        cb_dialog_block.bind("<<ComboboxSelected>>", _on_dialog_block_selected)
+
+        nb.pack(fill=tk.BOTH, expand=True)
 
         if not eq_rec:
             tk.Label(
-                top,
+                tab_hydro,
                 text="Дані з’являться після «Розрахунок».",
                 bg="#1e1e1e",
                 fg="#AAAAAA",
@@ -19352,14 +19249,14 @@ class DripCAD:
             ).pack(anchor=tk.W, pady=(0, 2))
         elif not _eq_ready:
             tk.Label(
-                top,
+                tab_hydro,
                 text="Немає валідних K_eq/x для оцінки Q_total.",
                 bg="#1e1e1e",
                 fg="#AAAAAA",
                 font=("Segoe UI", 8),
             ).pack(anchor=tk.W, pady=(0, 2))
 
-        status = tk.Label(top, text="", bg="#1e1e1e", fg="#FFAB40", font=("Segoe UI", 9))
+        status = tk.Label(content_panel, text="", bg="#1e1e1e", fg="#FFAB40", font=("Segoe UI", 9))
         status.pack(anchor=tk.W, pady=(10, 0))
 
         def _apply(*, close: bool) -> None:
@@ -19383,14 +19280,16 @@ class DripCAD:
             except (TypeError, ValueError):
                 status.config(text="Некоректний Q номінал (л/г).")
                 return
-            try:
-                h_set = float(str(v_eq_h_set.get()).replace(",", ".").strip())
-            except (TypeError, ValueError):
-                status.config(text="Некоректне поле Hвст. (м).")
-                return
-            if h_set < 0:
-                status.config(text="Hвст. не може бути від’ємним.")
-                return
+            h_set = 0.0
+            if not _dialog_all_blocks_mode():
+                try:
+                    h_set = float(str(v_eq_h_set.get()).replace(",", ".").strip())
+                except (TypeError, ValueError):
+                    status.config(text="Некоректне поле Hвст. (м).")
+                    return
+                if h_set < 0:
+                    status.config(text="Hвст. не може бути від’ємним.")
+                    return
             if lat_f < 0.1:
                 status.config(text="Крок між лініями латералів має бути ≥ 0.1 м.")
                 return
@@ -19402,6 +19301,70 @@ class DripCAD:
                 return
             if blk_i < 0:
                 status.config(text="Пропуск рядів не може бути від’ємним.")
+                return
+            if _dialog_all_blocks_mode():
+                lm = str(v_lat_model.get()).strip()
+                rec_emit = self._dripper_record(
+                    str(v_emit_model.get()).strip(),
+                    str(v_emit_nominal.get()).strip(),
+                )
+                for bi_all in _all_target_indices:
+                    b_all = self.field_blocks[int(bi_all)]
+                    p_all = b_all.setdefault("params", {})
+                    p_all["lat"] = str(v_lat.get()).strip()
+                    p_all["emit"] = str(v_emit.get()).strip()
+                    p_all["max_len"] = str(v_max.get()).strip()
+                    p_all["blocks"] = str(v_blocks.get()).strip()
+                    p_all["emit_model"] = str(v_emit_model.get()).strip()
+                    p_all["emit_nominal_flow"] = str(v_emit_nominal.get()).strip()
+                    p_all["flow"] = str(q_nom)
+                    p_all["lateral_inner_d_mm"] = str(d_mm)
+                    if lm:
+                        p_all["lateral_model"] = lm
+                    else:
+                        p_all.pop("lateral_model", None)
+                try:
+                    self.var_lat_step.set(str(v_lat.get()).strip())
+                    self.var_emit_step.set(str(v_emit.get()).strip())
+                    self.var_max_lat_len.set(str(v_max.get()).strip())
+                    self.var_lat_block_count.set(str(v_blocks.get()).strip())
+                    self.var_emit_model.set(str(v_emit_model.get()).strip())
+                    self.var_emit_nominal_flow.set(str(v_emit_nominal.get()).strip())
+                    if isinstance(rec_emit, dict):
+                        try:
+                            self.var_emit_k_coeff.set(str(float(rec_emit.get("constant_k"))))
+                        except (TypeError, ValueError):
+                            self.var_emit_k_coeff.set("")
+                        try:
+                            self.var_emit_x_exp.set(str(float(rec_emit.get("exponent_x"))))
+                        except (TypeError, ValueError):
+                            self.var_emit_x_exp.set("")
+                        try:
+                            kd_loc = float(rec_emit.get("kd", 1.0))
+                            if kd_loc <= 1e-12:
+                                kd_loc = 1.0
+                            self.var_emit_kd_coeff.set(str(kd_loc))
+                        except (TypeError, ValueError):
+                            self.var_emit_kd_coeff.set("1.0")
+                    self.var_emit_flow.set(str(q_nom))
+                    self.var_lat_inner_d_mm.set(str(d_mm))
+                    self.var_lateral_model.set(lm)
+                except Exception:
+                    pass
+                for bi_all in _all_target_indices:
+                    self._regenerate_block_grid(int(bi_all), redraw=False)
+                if selected_scope:
+                    for bi_all in _all_target_indices:
+                        self._strip_hydro_for_block_keep_others(int(bi_all))
+                else:
+                    self.reset_calc()
+                _last_applied_state = _normalized_dialog_state()
+                status.config(
+                    text=f"Параметри записано в {_all_targets_label}. Для гідравліки натисніть «▶ РОЗРАХУНОК»."
+                )
+                self.redraw()
+                if close:
+                    _close_dialog()
                 return
             p = block.setdefault("params", {})
             p["lat"] = str(v_lat.get()).strip()
@@ -19490,25 +19453,32 @@ class DripCAD:
             status.config(text="")
             if need_recalc:
                 self._regenerate_block_grid(bi, redraw=False)
-                self.reset_calc()
+                self._strip_hydro_for_block_keep_others(bi)
             _last_applied_state = state_now
             self.redraw()
             if close:
-                dlg.destroy()
+                _close_dialog()
 
         def _apply_and_run_hydraulic() -> None:
             _apply(close=False)
-            if status.cget("text"):
+            msg = str(status.cget("text") or "")
+            if msg and not msg.startswith("Параметри записано"):
                 return
+            status.config(text="")
             try:
-                self.run_calculation()
+                if _dialog_all_blocks_mode():
+                    if selected_scope and hasattr(self, "run_calculation_for_blocks"):
+                        self.run_calculation_for_blocks(_all_target_indices)
+                    else:
+                        self.run_calculation(active_block_only=False)
+                else:
+                    self.run_calculation()
             except Exception as exc:
                 status.config(text=f"Не вдалося запустити розрахунок: {exc}")
 
-        btn_fr = tk.Frame(dlg, bg="#1e1e1e")
-        btn_fr.pack(fill=tk.X, padx=14, pady=(0, 12))
+        button_panel = tk.Frame(dlg, bg="#1e1e1e")
         tk.Button(
-            btn_fr,
+            button_panel,
             text="Застосувати",
             command=lambda: _apply(close=False),
             bg="#0066FF",
@@ -19516,7 +19486,7 @@ class DripCAD:
             font=("Segoe UI", 9, "bold"),
         ).pack(side=tk.LEFT, padx=(0, 8))
         tk.Button(
-            btn_fr,
+            button_panel,
             text="OK",
             command=lambda: _apply(close=True),
             bg="#2e7d32",
@@ -19524,7 +19494,7 @@ class DripCAD:
             font=("Segoe UI", 9, "bold"),
         ).pack(side=tk.LEFT, padx=(0, 8))
         tk.Button(
-            btn_fr,
+            button_panel,
             text="▶ РОЗРАХУНОК",
             command=_apply_and_run_hydraulic,
             bg="#1f7a1f",
@@ -19532,13 +19502,18 @@ class DripCAD:
             font=("Segoe UI", 9, "bold"),
         ).pack(side=tk.LEFT, padx=(0, 8))
         tk.Button(
-            btn_fr,
+            button_panel,
             text="Скасувати",
-            command=dlg.destroy,
+            command=_close_dialog,
             bg="#444444",
             fg="white",
             font=("Segoe UI", 9),
         ).pack(side=tk.LEFT)
+
+        _props_sep = ttk.Separator(dlg, orient=tk.HORIZONTAL)
+        button_panel.pack(side=tk.BOTTOM, fill=tk.X, padx=14, pady=(0, 12))
+        _props_sep.pack(side=tk.BOTTOM, fill=tk.X, padx=14, pady=8)
+        content_panel.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=14, pady=(12, 0))
 
         dlg.after_idle(lambda: (dlg.lift(), dlg.focus_force()))
 

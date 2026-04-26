@@ -20,7 +20,12 @@
 | `main_app/ui/map_left_draw_widgets.py` | Ліва панель: вкладки **Малювання / Магістраль** (траса, збереження графа; **LBL** — підписи сабмейну + телескоп магістралі) |
 | `main_app/ui/silent_messagebox.py` | Діалоги без системного звуку |
 | `main_app/io/file_io_impl.py` | Збереження/завантаження проєкту, KML/PDF |
+| `main_app/io/project_serialization.py` | JSON-safe sanitize, atomic write, readable JSON decode errors, trunk hydro cache key restore |
+| `main_app/io/project_normalizers.py` | Нормалізація payload-ів зі зворотною сумісністю (`consumer_schedule` тощо) |
+| `main_app/io/project_blocks.py` | Save/restore `field_blocks_data` runtime geometry ↔ JSON |
+| `main_app/io/project_trunk.py` | Підготовка trunk payload для збереження (`sections` / `telescoped_sections`, allowed pipes, hydro cache) |
 | `modules/hydraulic_module/trunk_irrigation_schedule_hydro.py` | Розрахунок магістралі за слотами поливу; slack ΔH для телескопа на ребрі; **`estimate_min_pump_head_m_uniform_largest_allowed_pipe`** (оцінка H при «напір = 0»); плоский список дозволених труб без імпорту `hydraulics_core` |
+| `modules/hydraulic_module/api.py` | Публічний façade для UI-facing hydraulic helper-ів; UI не має імпортувати приватні helper-и напряму з `hydraulics_core` |
 | `modules/hydraulic_module/pipe_weight_optimizer.py` | Оптимізація Ø/телескоп (money/weight); порядок секцій **апстрім → тонше** |
 | `modules/hydraulic_module/trunk_tree_compute.py` | HW по дереву магістралі |
 | `modules/hydraulic_module/trunk_map_graph.py` | Граф магістралі: валідація, пари ребер, орієнтація, **`ensure_trunk_node_ids`** (дедуп дубль-`id`) |
@@ -65,15 +70,21 @@ python -m main_app.main
 | `main_app/ui/dripcad_legacy.py` | `DripCAD` — canvas, події, **field_blocks**, рельєф, гідравлічне відображення, snap сабмейну, графіки |
 | `main_app/ui/control_panel_impl.py` | Панель керування |
 | `main_app/ui/control_panel.py` | Реекспорт `ControlPanel` |
-| `main_app/io/file_io_impl.py` | JSON (`field_blocks_data` + legacy), KML/DXF/PDF; збереження лише під **`designs/<проєкт>/`** (`ensure_project_dir`, санітизація імені); **«Зберегти як»** — завжди `designs/<ім’я>/<ім’я>.json` + `pipes_db.json` |
+| `main_app/io/file_io_impl.py` | Основний entrypoint JSON load/save + KML/DXF/PDF; збереження лише під **`designs/<проєкт>/`** (`ensure_project_dir`, санітизація імені); **«Зберегти як»** — завжди `designs/<ім’я>/<ім’я>.json` + `pipes_db.json` |
+| `main_app/io/project_serialization.py` | Технічні JSON helpers: sanitize, atomic write, форматування JSON-помилки, відновлення int-ключів trunk hydro cache |
+| `main_app/io/project_normalizers.py` | Payload normalizers зі зворотною сумісністю; зараз `consumer_schedule` (`nodes` legacy, `cost_index` → `money`, clamping, source mode) |
+| `main_app/io/project_blocks.py` | `field_blocks_data` save/restore: `LineString` runtime geometry ↔ JSON координати, legacy rings-only payload |
+| `main_app/io/project_trunk.py` | Підготовка trunk JSON payload перед save: вузли, ребра, `sections` / `telescoped_sections`, `trunk_allowed_pipes`, hydro cache |
 | `main_app/ui/map_viewer_tk_window.py` | Вкладка «Карта»: `tkintermapview`, **ліва колонка** — вертикальний **`PanedWindow`**: **зверху** блок **«Зона / тайли / шари»** (без вкладок); **знизу** окрема **«Панель малювання»** з **`ttk.Notebook`** лише на **2 вкладки** — **«Малювання»** (режими/дії) та **«Магістраль»** (траса); оверлеї, межі кешу, `geo_ref`, прев’ю чернеток, лінійка |
 | `main_app/ui/tooltips.py` | Спільні тултіпи: `attach_tooltip` (панель), `attach_tooltip_dark` (карта) |
 | `main_app/io/file_io.py` | Реекспорт |
 | `main_app/orchestrator.py` | Geo / Hydraulic / BOM / stress-test; `build_contours(..., elevation_points=?, progress_cb=?, interp_method=?)` |
+| `main_app/contracts/orchestrator_models.py` | Typed snapshots для `last_hydraulic` / `last_bom` / `last_stress`; назовні зберігається сумісний `dict` |
 | `modules/geo_module/topography_core.py` | `TopoEngine`: ізолінії (marching squares, обрізка Polygon), SRTM-сітка; сітка Z — **IDW** або **кріггінг**; **згладжування сітки Z** перед marching squares (`_CONTOUR_GRID_Z_SMOOTH_PASSES`); `_fetch_earthdata_batch` підхоплює креди з **`load_earthdata_credentials_from_project_file`**; рівні **k×крок** / **`fixed_z_levels`** |
 | `modules/geo_module/srtm_tiles.py` | Завантаження 1°×1° тайлів: **Skadi**, **Earthdata** (власний URL або **`earthaccess` + SRTMGL1**), **`configure_earthdata_tk_bridge`** + діалог логіну; межі тайлів на карті |
 | `modules/geo_module/engine.py` | `GeoModule` |
 | `modules/hydraulic_module/__init__.py` | Лінивий імпорт `HydraulicModule` (`__getattr__`) — імпорт `lateral_drip_core` без Shapely |
+| `modules/hydraulic_module/api.py` | Публічний hydraulic façade для UI (`HydraulicEngine`, allowed pipe helpers, `pn_sort_tuple`) |
 | `modules/hydraulic_module/lateral_drip_core.py` | 1D латераль (HW, shooting) **без Shapely** |
 | `modules/hydraulic_module/lateral_solver.py` | Геометрія Shapely + реекспорт ядра |
 | `modules/hydraulic_module/lateral_field_compute.py` | API польового розрахунку: `LateralFieldInput` / `compute_lateral_field` |
@@ -106,6 +117,8 @@ python -m main_app.main
 - **`trunk_map_nodes`** / **`trunk_map_segments`** — магістраль на карті/полотні: вузли (`kind`: source, valve, bend, junction, consumption; координати `x`,`y`, опційно `lat`,`lon`; у споживачів опційно **`trunk_schedule_q_m3h`**, **`trunk_schedule_h_m`** для сценарію «магістраль за поливами»), сегменти як **ребра** (два індекси в `node_indices` + **`path_local`** — полілінія труби в метрах; опційно **`pipe_material`**, **`pipe_pn`**, **`pipe_od`** після діалогу труби). Вузол `consumption` може бути як листом, так і проміжним вузлом у ланцюгу відборів. Після завантаження/завершення траси нормалізація до пар ребер у `file_io_impl.py` / `DripCAD.normalize_trunk_segments_to_graph_edges`.
 - **`consumer_schedule`:** **`max_pump_head_m`** — напір насоса для розрахунку магістралі за поливами; **0** означає запит на **автопідстановку** орієнтовного мінімуму (найтовстіша дозволена труба на всіх ребрах, див. `estimate_min_pump_head_m_uniform_largest_allowed_pipe`); після успішної підстановки в полі й у JSON зберігається число **1…400**. **`trunk_display_velocity_warn_mps`** (0–8 м/с) — поріг **підсвітки** v на магістралі (UI на вкладці **«Магістраль (HW)»**); **`trunk_telescope_label_pos`** — збережені позиції підписів телескопа (`"segIdx:chunkIdx"` → `[x,y]` м, режим **LBL**).
 - **`field_blocks`** — лише кільця для сумісності; повне відновлення — з `field_blocks_data`.
+
+**Правило сумісності JSON:** якщо формат проєкту змінюється, старі payload-и мають лишатися завантажуваними через normalizer/fallback, а збереження пише поточний канонічний формат. Тестові проєкти в `designs/` є цінними fixtures для перевірок, тому їх не можна ламати без явної міграції.
 
 ---
 
@@ -495,4 +508,25 @@ py -c "import tkinter, shapely; print('ok')"
 - **Підписи кранів поля:** підпис клапана зроблено **багаторядковим**, **left-aligned**, з темною підкладкою та **двокроковим drag** у `SUB_LABEL`; положення пишеться в `consumer_schedule.field_valve_label_pos`.
 - **Qmin/Qmax по гілках:** `_emitter_q_extrema_overlay` тепер зберігає екстремуми **окремо по `branches[sm_idx]`**, а `redraw()` показує мін/макс вилив не лише по блоку, а й **по кожній гілці сабмейну**.
 
-*Останнє оновлення опису: 2026-04-24 — canvas layers / сабмейн Ø-шари / draggable підписи кранів / Qmin-Qmax по гілках, плюс Hвст. і UX-фікси діалогу блоку.*
+## Нотатка сесії 2026-04-24 (рефакторинг contracts / I/O / hydraulic API)
+
+- **Orchestrator contracts:** додано `main_app/contracts/orchestrator_models.py` (`HydraulicRunSnapshot`, `HydraulicResultsSnapshot`, `BomSnapshot`). `main_app/orchestrator.py` нормалізує `last_hydraulic`, `last_bom`, `last_stress` через ці snapshots; для UI лишається сумісний словниковий контракт.
+- **I/O split без зміни поведінки:** з `main_app/io/file_io_impl.py` винесено JSON helpers (`project_serialization.py`), нормалізацію `consumer_schedule` (`project_normalizers.py`), save/restore блоків (`project_blocks.py`) і підготовку trunk payload (`project_trunk.py`). `file_io_impl.py` лишається основним entrypoint для load/save/export.
+- **Сумісність форматів:** зафіксовано правило — старий JSON має завантажуватись через normalizer/fallback, а збереження пише новий канонічний формат. Проєкти в `designs/` використовуються як тестові fixtures і не мають ламатися без міграції.
+- **Hydraulic façade:** додано `modules/hydraulic_module/api.py`; `dripcad_legacy.py` імпортує UI-facing helper-и через façade, а не напряму з `hydraulics_core`.
+- **Регресія load_project:** після винесення trunk payload повернуто імпорт `ensure_trunk_node_ids` у `file_io_impl.py`; додано `tests/test_file_io_imports.py`.
+- **Focused tests:** локально `py -m pytest tests/test_file_io_imports.py tests/test_hydraulic_api.py tests/test_project_trunk.py tests/test_project_blocks.py tests/test_project_normalizers.py tests/test_project_serialization.py tests/test_orchestrator_models.py tests/test_orchestrator_memory_trim.py` → **18 passed**.
+
+## Нотатка сесії 2026-04-26
+
+- **Документація / memory-bank:** оновлено **PROJECT_CONTEXT.md** (додано знімок 2026-04-26 про синхронізацію з `memory-bank/`), **PROJECT_STATE.md** (цей футер і нотатка), а також `memory-bank/activeContext.md` та `memory-bank/progress.md` для узгодження дати останнього вирівнювання з репозиторієм.
+- **Контекст коду:** на момент оновлення у робочому дереві залишались незакомічені зміни в `orchestrator`, `file_io_impl`, I/O helper-модулях, UI, `modules/hydraulic_module` і нові/доповнені тести в `tests/`; орієнтир по функціоналу — нотатки **2026-04-24** (contracts / I/O split / `api.py`) і **2026-04-23** (K_eq, аудит Q) у цьому файлі та в **PROJECT_CONTEXT.md** §7.
+
+## Нотатка сесії 2026-04-26 (UI: вибрані блоки)
+
+- **Властивості вибраних блоків:** у `main_app/ui/dripcad_legacy.py` виправлено збір scope для multi-block selection. `_selected_block_indices()` тепер враховує не тільки явні `block`, а й вибрані `submain` / `lateral`, прив'язані до своїх блоків.
+- **Dropdown у діалозі:** контекстне меню **«Властивості вибраних блоків…»** передає snapshot повного списку блоків у `open_block_irrigation_scheme_dialog`; при active multi-selection комбобокс **Блок:** стартує з `Всі вибрані: ...` і показує всі блоки scope, а не тільки перший.
+- **Скидання selected:** selection на canvas очищується при закритті діалогу (`OK`, `Скасувати`, хрестик), а не одразу після відкриття, щоб вікно параметрів встигло стабільно прочитати повний список вибраних блоків.
+- **Перевірка:** `ReadLints` для `main_app/ui/dripcad_legacy.py` — без помилок; `python -m py_compile main_app/ui/dripcad_legacy.py` — OK.
+
+*Останнє оновлення опису: 2026-04-26 — UI-фікс вибраних блоків у властивостях + синхронізація PROJECT_CONTEXT / PROJECT_STATE / memory-bank.*
