@@ -62,6 +62,76 @@ class TestTrunkIrrigationScheduleHydro(unittest.TestCase):
         self.assertIsNotNone(ps0)
         self.assertFalse(ps0.get("issues"))
 
+    def test_fixed_pipes_mode_evaluates_at_user_pump_head(self):
+        """Режим use_required_pump_head (фіксовані труби): показувати H при заданому насосі, не лише h_min."""
+        nodes, segs = self._basic_nodes_and_segments()
+        nodes[1]["trunk_schedule_q_m3h"] = 30.0
+        nodes[1]["trunk_schedule_h_m"] = 15.0
+        tree = {
+            "edges": [
+                {
+                    "parent_id": "S",
+                    "child_id": "C1",
+                    "length_m": 100.0,
+                    "d_inner_mm": 200.0,
+                    "c_hw": 140.0,
+                    "sections": [{"length_m": 100.0, "d_inner_mm": 200.0, "c_hw": 140.0}],
+                }
+            ],
+        }
+        slots = [["C1"]]
+        cache, issues = compute_trunk_irrigation_schedule_hydro(
+            nodes,
+            segs,
+            slots,
+            tree,
+            pump_operating_head_m=120.0,
+            target_head_m=15.0,
+            q_consumer_m3h=30.0,
+            use_required_pump_head=True,
+        )
+        self.assertFalse(issues)
+        ps0 = cache["per_slot"].get("0", {})
+        self.assertFalse(ps0.get("issues"))
+        self.assertAlmostEqual(float(ps0["source_head_m"]), 120.0, places=2)
+        mreq = ps0.get("min_required_source_head_m")
+        self.assertIsNotNone(mreq)
+        self.assertLess(float(mreq), 110.0, msg="мінімум для цілей має бути набагато нижче 120 м")
+
+    def test_slot_required_source_head_display_uses_minimum_head(self):
+        """Фінальний display-кеш автопідбору має показувати слот при його мінімальному H, а не worst-case насос."""
+        nodes, segs = self._basic_nodes_and_segments()
+        nodes[1]["trunk_schedule_q_m3h"] = 30.0
+        nodes[1]["trunk_schedule_h_m"] = 15.0
+        tree = {
+            "edges": [
+                {
+                    "parent_id": "S",
+                    "child_id": "C1",
+                    "length_m": 100.0,
+                    "d_inner_mm": 200.0,
+                    "c_hw": 140.0,
+                    "sections": [{"length_m": 100.0, "d_inner_mm": 200.0, "c_hw": 140.0}],
+                }
+            ],
+        }
+        cache, issues = compute_trunk_irrigation_schedule_hydro(
+            nodes,
+            segs,
+            [["C1"]],
+            tree,
+            pump_operating_head_m=120.0,
+            target_head_m=15.0,
+            q_consumer_m3h=30.0,
+            use_required_source_head_per_slot=True,
+        )
+        self.assertFalse(issues)
+        self.assertEqual(cache.get("mode", {}).get("slot_source_head_mode"), "min_required")
+        ps0 = cache["per_slot"].get("0", {})
+        self.assertFalse(ps0.get("issues"))
+        self.assertLess(float(ps0["source_head_m"]), 120.0)
+        self.assertAlmostEqual(float(ps0["node_head_m"]["C1"]), 15.0, places=3)
+
     def test_schedule_q_ignores_branch_count_fields(self):
         nodes, segs = self._basic_nodes_and_segments()
         nodes[1]["trunk_schedule_q_m3h"] = 25.0

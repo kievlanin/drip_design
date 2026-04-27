@@ -27,6 +27,9 @@
 
 ## Latest completed in this session
 
+- 2026-04-26: standardized trunk pipe hover/pick labels to `ABBR ØOD/PN Lм` via `_format_pipe_signature` in `dripcad_legacy.py` (e.g. `ПВХ Ø150/6 629.2м`), replacing the old two-line `L ≈ ...` / `Ø ... мм` label. Verified with lints and `py_compile`.
+- 2026-04-26: fixed trunk schedule auto-sizing display cache: after optimized pipe selection, UI hover/overlays can now use per-slot minimum required source head (`use_required_source_head_per_slot`) so a lightly loaded slot such as `atest` C2/T6 shows ~17 m at the consumer instead of the global worst-case pump head (~50.6 m). Verified with focused pytest and an `atest` recompute.
+- 2026-04-26: user-requested **state/context save** — updated [PROJECT_CONTEXT.md](../PROJECT_CONTEXT.md), [PROJECT_STATE.md](../PROJECT_STATE.md), and memory-bank after the trunk HW display/label fixes.
 - 2026-04-26: fixed selected-block properties UX in `dripcad_legacy.py`: selected block scope now includes parent blocks for selected submains/laterals, the dialog dropdown starts as `Всі вибрані: ...` with all selected blocks available, and canvas `selected` state is cleared on dialog close. Verified with lints and `py_compile`; PROJECT docs + memory-bank were updated.
 - 2026-04-26: user-requested **documentation sync** — updated [PROJECT_CONTEXT.md](../PROJECT_CONTEXT.md) (new §7 snapshot 2026-04-26), [PROJECT_STATE.md](../PROJECT_STATE.md) (session note + footer), and this memory-bank set (`activeContext`, `progress`) so the next session can anchor on the same “last aligned” date.
 - Prior work (2026-04-24 era, still the functional baseline in §7): typed orchestrator snapshots; I/O helper split; `modules/hydraulic_module/api.py`; `ensure_trunk_node_ids` import fix; focused pytest runs noted in `PROJECT_STATE` session 2026-04-24.

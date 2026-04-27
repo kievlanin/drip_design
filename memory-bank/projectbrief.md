@@ -9,6 +9,8 @@ Desktop CAD for agricultural drip irrigation: field blocks, submains, auto/manua
 - **[PROJECT_CONTEXT.md](../PROJECT_CONTEXT.md)** — architecture, modules, hydraulic notes, file layout.
 - **[PROJECT_STATE.md](../PROJECT_STATE.md)** — run instructions, JSON model, UI behavior, session log.
 
+*Memory-bank / project docs last aligned: 2026-04-26 (see `PROJECT_STATE` session note 2026-04-26, `PROJECT_CONTEXT` §7 snapshot 2026-04-26).*
+
 ## Planned / reference specs (not necessarily implemented)
 
 - [docs/plans/profil-magistral-lateral-q-audit.md](../docs/plans/profil-magistral-lateral-q-audit.md) — trunk profile along `path_local`, lateral emitter Q audit, Block tab.

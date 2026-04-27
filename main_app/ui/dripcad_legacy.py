@@ -1914,7 +1914,14 @@ class DripCAD:
                 except (TypeError, ValueError):
                     d_h = 0.0
             od = self._trunk_pipe_row_outer_d_mm_str(None, seg, d_h)
-            return f"L ≈ {lm:.1f} м\nØ {od} мм (зовнішній діаметр)"
+            mat = str(seg.get("pipe_material", "")).strip()
+            pn = str(seg.get("pipe_pn", "")).strip()
+            if not mat or not pn:
+                try:
+                    mat, pn, _od = self._trunk_segment_initial_catalog_selection(seg)
+                except Exception:
+                    mat, pn = "", ""
+            return self._format_pipe_signature(mat, pn, od, lm)
         from modules.hydraulic_module.trunk_irrigation_schedule_hydro import _segment_length_m
 
         segs = list(getattr(self, "trunk_map_segments", []) or [])
@@ -2087,7 +2094,15 @@ class DripCAD:
             d_h = 0.0
         lm = float(self._polyline_length_m(chunk_pl))
         od = self._trunk_pipe_row_outer_d_mm_str(sec, base_seg, d_h)
-        lines = [f"L ≈ {lm:.1f} м", f"Ø {od} мм (зовнішній діаметр)"]
+        src = sec if isinstance(sec, dict) else base_seg
+        mat = str(src.get("material", src.get("pipe_material", ""))).strip()
+        pn = str(src.get("pn", src.get("pipe_pn", ""))).strip()
+        if not mat or not pn:
+            try:
+                mat, pn, _od = self._trunk_segment_initial_catalog_selection(base_seg)
+            except Exception:
+                mat, pn = "", ""
+        lines = [self._format_pipe_signature(mat, pn, od, lm)]
         return chunk_pl, lines, sec
 
     def _trunk_telescope_short_label(self, seg: dict) -> str:
@@ -5179,17 +5194,12 @@ class DripCAD:
         _ambiguous_radius_m: float,
     ) -> Optional[Tuple[int, float, str, object, str]]:
         """
-        Одне попадання по магістралі: завжди об'єкт із меншою відстанню до курсора (вузол або ребро).
-        Раніше в «сірій зоні» біля вузла завжди вигравав вузол — через це не можна було вибрати суміжне ребро.
+        Вузол має пріоритет над ребром/трубою, якщо курсор у зоні вузла.
+        Ребра при цьому вибираються прямо й безумовно, коли вузла під курсором немає.
         """
         best_n = min(node_hits, key=lambda h: h[1]) if node_hits else None
         best_s = min(seg_hits, key=lambda h: h[1]) if seg_hits else None
-        if best_n is None:
-            return best_s
-        if best_s is None:
-            return best_n
-        dn, ds = float(best_n[1]), float(best_s[1])
-        return best_n if dn <= ds else best_s
+        return best_n if best_n is not None else best_s
 
     def _collect_world_pick_hits(self, wx: float, wy: float) -> List[Tuple[int, float, str, object, str]]:
         """
@@ -14038,6 +14048,26 @@ class DripCAD:
                     continue
             return float(wd)
 
+        def _display_cache_for_slot_required_head(fallback_cache: dict) -> dict:
+            payload = self._normalize_trunk_tree_payload(trunk_tree_working)
+            cache_disp, g_disp = compute_trunk_irrigation_schedule_hydro(
+                trunk_nodes,
+                trunk_segments,
+                slots,
+                payload,
+                q_consumer_m3h=float(dq),
+                target_head_m=float(dh),
+                max_pipe_velocity_mps=v_pipe_max,
+                pump_operating_head_m=mph,
+                use_required_pump_head=False,
+                use_required_source_head_per_slot=True,
+                surface_z_at_xy=surf_z,
+            )
+            if g_disp:
+                auto_warn_msgs.extend(g_disp[:4])
+                return fallback_cache
+            return cache_disp
+
         # --- Оцінка геодезичного перепаду dz_eff по найгіршому споживачу ---
         # Optimizer не знає про геодезію: він працює лише з бюджетом ΔH (втрати напору).
         # Щоб його бюджет відповідав реальній фізиці compute_trunk_irrigation_schedule_hydro,
@@ -14329,7 +14359,7 @@ class DripCAD:
                             return {
                                 "optimized_used": True,
                                 "trunk_hydro_opt_applied": True,
-                                "cache": cache_u,
+                                "cache": _display_cache_for_slot_required_head(cache_u),
                                 "autosized_note": (
                                     "Автопідбір не дав кращого допустимого телескопа; "
                                     "застосовано однорідну найбільшу дозволену трубу "
@@ -14353,7 +14383,7 @@ class DripCAD:
                 return {
                     "optimized_used": True,
                     "trunk_hydro_opt_applied": True,
-                    "cache": best_def_cache,
+                    "cache": _display_cache_for_slot_required_head(best_def_cache),
                     "autosized_note": (
                         "Автопідбір виконано, але жоден варіант не закрив дефіцит напору; "
                         "повернуто варіант з найменшим дефіцитом.\n"
@@ -14394,7 +14424,7 @@ class DripCAD:
         return {
             "optimized_used": True,
             "trunk_hydro_opt_applied": True,
-            "cache": last_cache_ok,
+            "cache": _display_cache_for_slot_required_head(last_cache_ok),
             "autosized_note": autosized_note,
             "auto_warn_msgs": auto_warn_msgs,
             "out_nodes": trunk_nodes,

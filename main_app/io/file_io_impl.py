@@ -3,9 +3,17 @@ import os
 import json
 import math
 import re
-import tempfile
 from tkinter import filedialog
 
+from main_app.io.project_blocks import field_block_from_dict, field_blocks_to_save_payload
+from main_app.io.project_normalizers import normalize_consumer_schedule_payload
+from main_app.io.project_serialization import (
+    atomic_write_text,
+    format_json_decode_error,
+    normalize_trunk_irrigation_hydro_cache_from_json,
+    sanitize_for_json_export,
+)
+from main_app.io.project_trunk import collect_trunk_save_payload
 from main_app.ui.silent_messagebox import silent_showerror, silent_showinfo, silent_showwarning
 from shapely.geometry import LineString, Polygon, Point
 from shapely.ops import unary_union
@@ -18,127 +26,6 @@ from modules.hydraulic_module.trunk_map_graph import (
 )
 
 
-def _json_dict_key_str(k) -> str:
-    """Ключі JSON-об'єкта мають бути рядками (tuple тощо — у стабільний рядок)."""
-    if isinstance(k, str):
-        return k
-    if isinstance(k, bool):
-        return "true" if k else "false"
-    if isinstance(k, int):
-        return str(int(k))
-    if isinstance(k, float):
-        if math.isnan(k) or math.isinf(k):
-            return "_invalid_numeric_key_"
-        if abs(k - round(k)) < 1e-9:
-            return str(int(round(k)))
-        return str(k)
-    if isinstance(k, tuple) and len(k) == 2:
-        return f"{str(k[0]).strip()}->{str(k[1]).strip()}"
-    return str(k)
-
-
-def _sanitize_for_json_export(obj, *, _depth: int = 0):
-    """
-    Рекурсивно приводить структуру до типів, безпечних для json.dumps(allow_nan=False).
-    Усі ключі словників — str (tuple-ключі з кешів тощо не ламають серіалізацію).
-    """
-    if _depth > 120:
-        return None
-    if obj is None:
-        return None
-    if isinstance(obj, bool):
-        return obj
-    if isinstance(obj, int) and not isinstance(obj, bool):
-        return int(obj)
-    if isinstance(obj, float):
-        if math.isnan(obj) or math.isinf(obj):
-            return None
-        return float(obj)
-    if isinstance(obj, str):
-        return obj
-    if isinstance(obj, (bytes, bytearray)):
-        try:
-            return obj.decode("utf-8", errors="replace")
-        except Exception:
-            return str(obj)
-    if isinstance(obj, dict):
-        out: dict = {}
-        for k, v in obj.items():
-            out[_json_dict_key_str(k)] = _sanitize_for_json_export(v, _depth=_depth + 1)
-        return out
-    if isinstance(obj, (list, tuple)):
-        return [_sanitize_for_json_export(x, _depth=_depth + 1) for x in obj]
-    if isinstance(obj, (set, frozenset)):
-        return [_sanitize_for_json_export(x, _depth=_depth + 1) for x in obj]
-    return str(obj)
-
-
-def _atomic_write_text(filepath: str, text: str) -> None:
-    """Атомарний запис UTF-8 (temp у тій самій теці + os.replace), щоб не залишати обірваний JSON."""
-    filepath = os.path.abspath(filepath)
-    d = os.path.dirname(filepath)
-    os.makedirs(d, exist_ok=True)
-    fd, tmp_path = tempfile.mkstemp(prefix=".drdproj_", suffix=".tmp", dir=d)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as wf:
-            wf.write(text)
-        os.replace(tmp_path, filepath)
-    except Exception:
-        try:
-            if os.path.isfile(tmp_path):
-                os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
-
-
-def _format_json_decode_error(filepath: str, err: json.JSONDecodeError) -> str:
-    """Контекст рядка з файлу для діагностики пошкодженого JSON."""
-    fp = os.path.abspath(filepath)
-    lines: list = []
-    try:
-        with open(fp, "r", encoding="utf-8") as f:
-            lines = f.read().splitlines()
-    except Exception:
-        return f"{fp}\n{err}"
-    ln = int(getattr(err, "lineno", 1) or 1)
-    col = int(getattr(err, "colno", 1) or 1)
-    i0 = max(0, ln - 4)
-    i1 = min(len(lines), ln + 3)
-    parts = [f"Файл: {fp}", f"Помилка JSON: {err}", f"Рядок {ln}, колонка {col}:", ""]
-    for i in range(i0, i1):
-        prefix = ">" if i + 1 == ln else " "
-        parts.append(f"{prefix} {i + 1:5d}: {lines[i]}")
-    return "\n".join(parts)
-
-
-def _normalize_trunk_irrigation_hydro_cache_from_json(cache: dict) -> dict:
-    """Після json.load ключі слотів/ребер стають str — відновлюємо int-ключі сегментів у seg_dominant_slot."""
-    if not isinstance(cache, dict):
-        return cache
-    out = copy.deepcopy(cache)
-    m = out.get("seg_dominant_slot")
-    if isinstance(m, dict):
-        new_m: dict = {}
-        for k, v in m.items():
-            try:
-                ik = int(k)
-            except (TypeError, ValueError):
-                continue
-            if v is None:
-                new_m[ik] = None
-            else:
-                try:
-                    new_m[ik] = int(v)
-                except (TypeError, ValueError):
-                    try:
-                        new_m[ik] = int(float(v))
-                    except (TypeError, ValueError):
-                        new_m[ik] = v
-        out["seg_dominant_slot"] = new_m
-    return out
-
-
 def _trim_orchestrator_after_persist(app) -> None:
     orch = getattr(app, "orchestrator", None)
     trim = getattr(orch, "trim_auxiliary_results_after_persist", None) if orch is not None else None
@@ -149,173 +36,16 @@ def _trim_orchestrator_after_persist(app) -> None:
             pass
 
 
-def _normalize_consumer_schedule_payload(raw) -> dict:
-    """Розклад: групи (legacy) + 48 слотів поливу (irrigation_slots[i] = id вузлів)."""
-    out_groups = []
-    if isinstance(raw, dict):
-        groups = raw.get("groups")
-        if isinstance(groups, list):
-            for g in groups:
-                if not isinstance(g, dict):
-                    continue
-                title = str(g.get("title", "")).strip() or "Група"
-                ids = g.get("node_ids")
-                if ids is None:
-                    ids = g.get("nodes")
-                if not isinstance(ids, list):
-                    ids = []
-                clean = []
-                for x in ids:
-                    s = str(x).strip()
-                    if s and s not in clean:
-                        clean.append(s)
-                out_groups.append({"title": title, "node_ids": clean})
-
-    slots: list = []
-    sraw = None
-    if isinstance(raw, dict):
-        sraw = raw.get("irrigation_slots")
-    if isinstance(sraw, list):
-        for i in range(48):
-            cell: list = []
-            if i < len(sraw) and isinstance(sraw[i], list):
-                for x in sraw[i]:
-                    s = str(x).strip()
-                    if s and s not in cell:
-                        cell.append(s)
-            slots.append(cell)
-    else:
-        slots = [[] for _ in range(48)]
-
-    out: dict = {"groups": out_groups, "irrigation_slots": slots}
-    if isinstance(raw, dict):
-        try:
-            v = raw.get("max_pump_head_m")
-            if v is not None and str(v).strip() != "":
-                fv = float(v)
-                if fv >= 0.0:
-                    out["max_pump_head_m"] = max(0.0, min(400.0, float(fv)))
-        except (TypeError, ValueError):
-            pass
-        try:
-            vm = raw.get("trunk_schedule_v_max_mps")
-            if vm is not None and str(vm).strip() != "":
-                fvm = float(vm)
-                if fvm >= 0.0:
-                    out["trunk_schedule_v_max_mps"] = max(0.0, min(8.0, float(fvm)))
-        except (TypeError, ValueError):
-            pass
-        try:
-            tq = raw.get("trunk_schedule_test_q_m3h")
-            if tq is not None and str(tq).strip() != "":
-                ftq = float(tq)
-                if ftq >= 0.0:
-                    out["trunk_schedule_test_q_m3h"] = max(0.0, min(10000.0, float(ftq)))
-        except (TypeError, ValueError):
-            pass
-        try:
-            th = raw.get("trunk_schedule_test_h_m")
-            if th is not None and str(th).strip() != "":
-                fth = float(th)
-                if fth >= 0.0:
-                    out["trunk_schedule_test_h_m"] = max(0.0, min(400.0, float(fth)))
-        except (TypeError, ValueError):
-            pass
-        try:
-            ms = raw.get("trunk_schedule_max_sections_per_edge")
-            if ms is not None and str(ms).strip() != "":
-                fms = int(float(ms))
-                out["trunk_schedule_max_sections_per_edge"] = max(1, min(4, int(fms)))
-        except (TypeError, ValueError):
-            pass
-        try:
-            vw = raw.get("trunk_display_velocity_warn_mps")
-            if vw is not None and str(vw).strip() != "":
-                fvw = float(vw)
-                if fvw >= 0.0:
-                    out["trunk_display_velocity_warn_mps"] = max(0.0, min(8.0, float(fvw)))
-        except (TypeError, ValueError):
-            pass
-        goal = str(raw.get("trunk_schedule_opt_goal", "weight")).strip().lower()
-        if goal not in ("weight", "money", "cost_index"):
-            goal = "weight"
-        if goal == "cost_index":
-            goal = "money"
-        out["trunk_schedule_opt_goal"] = goal
-        out["trunk_pipes_selected"] = bool(raw.get("trunk_pipes_selected", False))
-        fv_pos = raw.get("field_valve_label_pos")
-        clean_fv_pos = {}
-        if isinstance(fv_pos, dict):
-            for ks, vv in fv_pos.items():
-                k = str(ks).strip()
-                if not k:
-                    continue
-                if isinstance(vv, (list, tuple)) and len(vv) >= 2:
-                    try:
-                        clean_fv_pos[k] = [float(vv[0]), float(vv[1])]
-                    except (TypeError, ValueError):
-                        pass
-        out["field_valve_label_pos"] = clean_fv_pos
-        src_mode = str(raw.get("srtm_source_mode", "auto")).strip().lower()
-        if src_mode not in ("auto", "skadi_local", "open_elevation", "earthdata"):
-            src_mode = "auto"
-        out["srtm_source_mode"] = src_mode
-    return out
-
-
-def _field_block_from_dict(item):
-    """Restore one field block from JSON (field_blocks_data)."""
-    ring = [tuple(p[:2]) if len(p) >= 2 else tuple(p) for p in item.get("ring", [])]
-    ea = item.get("edge_angle")
-    if ea is not None:
-        ea = float(ea)
-    sub = [list(s) for s in item.get("submain", [])]
-    auto = [LineString(c) for c in item.get("auto", []) if len(c) > 1]
-    manual = [LineString(c) for c in item.get("manual", []) if len(c) > 1]
-    bp = item.get("params")
-    if not isinstance(bp, dict):
-        bp = {}
-    ssp = item.get("submain_segment_plan")
-    if not isinstance(ssp, dict):
-        ssp = {}
-    return {
-        "ring": ring,
-        "edge_angle": ea,
-        "submain_lines": sub,
-        "auto_laterals": auto,
-        "manual_laterals": manual,
-        "params": dict(bp),
-        "submain_segment_plan": ssp,
-    }
-
-
-def field_blocks_to_save_payload(app):
-    """Serialize field_blocks for JSON."""
-    blocks = getattr(app, "field_blocks", None)
-    if not blocks:
-        return [], []
-    payload = []
-    rings_only = []
-    for b in blocks:
-        rings_only.append(b["ring"])
-        bp = b.get("params")
-        if not isinstance(bp, dict):
-            bp = {}
-        ssp = b.get("submain_segment_plan")
-        if not isinstance(ssp, dict):
-            ssp = {}
-        payload.append(
-            {
-                "ring": b["ring"],
-                "edge_angle": b.get("edge_angle"),
-                "submain": b["submain_lines"],
-                "auto": [list(lat.coords) for lat in b["auto_laterals"]],
-                "manual": [list(lat.coords) for lat in b["manual_laterals"]],
-                "params": dict(bp),
-                "submain_segment_plan": ssp,
-            }
-        )
-    return payload, rings_only
+def _root_busy_cursor(app, busy: bool) -> None:
+    """Курсор «пісочний годинник» (watch) на головному вікні під час тривалої операції."""
+    root = getattr(app, "root", None)
+    if root is None:
+        return
+    try:
+        root.config(cursor="watch" if busy else "")
+        root.update_idletasks()
+    except Exception:
+        pass
 
 
 def _sanitize_project_dir_name(name: str) -> str:
@@ -397,31 +127,7 @@ def _collect_project_data(app, force_georeferenced=False):
             app._sync_trunk_segment_hydraulic_props_from_tree()
         except Exception:
             pass
-    trunk_nodes = getattr(app, "trunk_map_nodes", None) or []
-    if trunk_nodes:
-        ensure_trunk_node_ids(trunk_nodes)
-    trunk_segments = []
-    for seg in list(getattr(app, "trunk_map_segments", []) or []):
-        if not isinstance(seg, dict):
-            continue
-        rec = dict(seg)
-        raw_secs = rec.get("sections")
-        if not isinstance(raw_secs, list):
-            raw_secs = rec.get("telescoped_sections")
-        if isinstance(raw_secs, list):
-            rec["sections"] = copy.deepcopy(raw_secs)
-            rec["telescoped_sections"] = copy.deepcopy(raw_secs)
-        trunk_segments.append(rec)
-    _tap = getattr(app, "trunk_allowed_pipes", None)
-    if not isinstance(_tap, dict):
-        _tap = {}
-    _thc = getattr(app, "trunk_irrigation_hydro_cache", None)
-    trunk_hydro_json = copy.deepcopy(_thc) if isinstance(_thc, dict) else None
-    trunk_payload = {
-        "nodes": list(trunk_nodes),
-        "segments": trunk_segments,
-        "allowed_pipes": copy.deepcopy(_tap),
-    }
+    trunk_payload, trunk_nodes, trunk_segments, trunk_hydro_json = collect_trunk_save_payload(app)
 
     fb_data, fb_rings = field_blocks_to_save_payload(app)
     fbs = getattr(app, "field_blocks", []) or []
@@ -452,7 +158,7 @@ def _collect_project_data(app, force_georeferenced=False):
         "trunk_map_nodes": list(trunk_nodes),
         "trunk_map_segments": trunk_segments,
         "consumer_schedule": copy.deepcopy(
-            _normalize_consumer_schedule_payload(getattr(app, "consumer_schedule", None))
+            normalize_consumer_schedule_payload(getattr(app, "consumer_schedule", None))
         ),
         "trunk_irrigation_hydro_cache": trunk_hydro_json,
         "project_zone_bounds_local": (
@@ -486,8 +192,6 @@ def _collect_project_data(app, force_georeferenced=False):
             "valve_h_max_m": getattr(app, "var_valve_h_max_m", None) and app.var_valve_h_max_m.get() or "0",
             "valve_h_max_optimize": getattr(app, "var_valve_h_max_optimize", None)
             and app.var_valve_h_max_optimize.get(),
-            "show_emitter_flow_on_map": getattr(app, "var_show_emitter_flow", None)
-            and app.var_show_emitter_flow.get(),
             "show_contours": bool(getattr(app, "show_contours", None) and app.show_contours.get()),
             "show_topo_points": bool(getattr(app, "show_topo_points", None) and app.show_topo_points.get()),
             "show_topo_computation_zone": bool(
@@ -549,7 +253,7 @@ def _write_project_to_disk(app, filepath, data):
     filepath = os.path.abspath(filepath)
     proj_dir = os.path.dirname(filepath)
     os.makedirs(proj_dir, exist_ok=True)
-    clean = _sanitize_for_json_export(data)
+    clean = sanitize_for_json_export(data)
     text = json.dumps(
         clean,
         indent=4,
@@ -557,9 +261,9 @@ def _write_project_to_disk(app, filepath, data):
         allow_nan=False,
         default=str,
     )
-    _atomic_write_text(filepath, text)
+    atomic_write_text(filepath, text)
     project_db_path = os.path.join(proj_dir, "pipes_db.json")
-    clean_pipes = _sanitize_for_json_export(app.pipe_db)
+    clean_pipes = sanitize_for_json_export(app.pipe_db)
     text_pipes = json.dumps(
         clean_pipes,
         indent=4,
@@ -567,7 +271,7 @@ def _write_project_to_disk(app, filepath, data):
         allow_nan=False,
         default=str,
     )
-    _atomic_write_text(project_db_path, text_pipes)
+    atomic_write_text(project_db_path, text_pipes)
 
 
 def persist_project_snapshot(app, *, silent: bool = True) -> bool:
@@ -576,6 +280,7 @@ def persist_project_snapshot(app, *, silent: bool = True) -> bool:
     Використовує останній шлях відкриття/збереження або designs/<ім'я>/<ім'я>.json.
     """
     try:
+        _root_busy_cursor(app, True)
         proj_dir = ensure_project_dir(app)
         fp = getattr(app, "_project_json_filepath", None)
         if fp:
@@ -586,8 +291,6 @@ def persist_project_snapshot(app, *, silent: bool = True) -> bool:
         data = _collect_project_data(app, force_georeferenced=False)
         _write_project_to_disk(app, fp, data)
         app._project_json_filepath = fp
-        if not silent:
-            silent_showinfo(app.root, "Збережено", f"Проект успішно збережено в:\n{fp}")
         _trim_orchestrator_after_persist(app)
         return True
     except Exception as e:
@@ -603,6 +306,8 @@ def persist_project_snapshot(app, *, silent: bool = True) -> bool:
         else:
             silent_showerror(app.root, "Помилка", f"Не вдалося зберегти проект:\n{e}")
         return False
+    finally:
+        _root_busy_cursor(app, False)
 
 
 def save_project(app, force_georeferenced=False):
@@ -615,14 +320,16 @@ def save_project(app, force_georeferenced=False):
     proj_dir = ensure_project_dir(app)
     filename = f"{app.var_proj_name.get().strip()}.json"
     filepath = os.path.join(proj_dir, filename)
-    data = _collect_project_data(app, force_georeferenced)
     try:
+        _root_busy_cursor(app, True)
+        data = _collect_project_data(app, force_georeferenced)
         _write_project_to_disk(app, filepath, data)
         app._project_json_filepath = os.path.abspath(filepath)
-        silent_showinfo(app.root, "Збережено", f"Проект успішно збережено в:\n{filepath}")
         _trim_orchestrator_after_persist(app)
     except Exception as e:
         silent_showerror(app.root, "Помилка", f"Не вдалося зберегти проект:\n{e}")
+    finally:
+        _root_busy_cursor(app, False)
 
 
 def save_project_as(app, force_georeferenced=False):
@@ -654,18 +361,17 @@ def save_project_as(app, force_georeferenced=False):
     proj_dir = os.path.join(designs_root, stem)
     os.makedirs(proj_dir, exist_ok=True)
     filepath = os.path.join(proj_dir, f"{stem}.json")
-    data = _collect_project_data(app, force_georeferenced)
-    data["proj_name"] = app.var_proj_name.get()
     try:
+        _root_busy_cursor(app, True)
+        data = _collect_project_data(app, force_georeferenced)
+        data["proj_name"] = app.var_proj_name.get()
         _write_project_to_disk(app, filepath, data)
         app._project_json_filepath = os.path.abspath(filepath)
-        silent_showinfo(app.root, 
-            "Збережено",
-            f"Проект збережено:\n{filepath}\n\nТека проєкту:\n{proj_dir}",
-        )
         _trim_orchestrator_after_persist(app)
     except Exception as e:
         silent_showerror(app.root, "Помилка", f"Не вдалося зберегти проект:\n{e}")
+    finally:
+        _root_busy_cursor(app, False)
 
 
 def save_project_georeferenced(app):
@@ -705,7 +411,7 @@ def load_project(app):
         app.is_georeferenced = bool(data.get("is_georeferenced", bool(app.geo_ref)))
         v2 = data.get("field_blocks_data")
         if v2:
-            app.field_blocks = [_field_block_from_dict(x) for x in v2]
+            app.field_blocks = [field_block_from_dict(x) for x in v2]
         else:
             rings = [list(r) for r in data.get("field_blocks", []) if len(r) >= 3]
             sm = data.get("submain") or []
@@ -843,7 +549,12 @@ def load_project(app):
                     rec["q_demand_m3s"] = float(qm)
                 except (TypeError, ValueError):
                     pass
-            for _sq in ("trunk_schedule_q_m3h", "trunk_schedule_h_m"):
+            for _sq in (
+                "trunk_schedule_q_m3h",
+                "trunk_schedule_h_m",
+                "trunk_schedule_valve_head_m",
+                "trunk_schedule_valve_loss_m",
+            ):
                 if _sq not in row:
                     continue
                 try:
@@ -965,7 +676,7 @@ def load_project(app):
                 pass
 
         if hasattr(app, "consumer_schedule"):
-            app.consumer_schedule = _normalize_consumer_schedule_payload(
+            app.consumer_schedule = normalize_consumer_schedule_payload(
                 data.get("consumer_schedule")
             )
         if hasattr(app, "normalize_consumer_schedule"):
@@ -1121,8 +832,6 @@ def load_project(app):
             app.var_valve_h_max_m.set(str(p.get("valve_h_max_m", "0")))
         if hasattr(app, "var_valve_h_max_optimize"):
             app.var_valve_h_max_optimize.set(bool(p.get("valve_h_max_optimize", True)))
-        if hasattr(app, "var_show_emitter_flow"):
-            app.var_show_emitter_flow.set(bool(p.get("show_emitter_flow_on_map", True)))
         if hasattr(app, "show_contours"):
             app.show_contours.set(bool(p.get("show_contours", True)))
         if hasattr(app, "show_topo_points"):
@@ -1175,7 +884,7 @@ def load_project(app):
 
         raw_thc = data.get("trunk_irrigation_hydro_cache")
         if isinstance(raw_thc, dict) and raw_thc:
-            app.trunk_irrigation_hydro_cache = _normalize_trunk_irrigation_hydro_cache_from_json(
+            app.trunk_irrigation_hydro_cache = normalize_trunk_irrigation_hydro_cache_from_json(
                 raw_thc
             )
         else:
@@ -1208,7 +917,7 @@ def load_project(app):
         silent_showerror(
             app.root,
             "Помилка JSON",
-            _format_json_decode_error(filepath, e),
+            format_json_decode_error(filepath, e),
         )
     except Exception as e:
         silent_showerror(app.root, "Помилка", f"Не вдалося завантажити проект:\n{e}")

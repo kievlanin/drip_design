@@ -351,17 +351,7 @@ def create_embedded_map_panel(parent: tk.Misc, app=None):
             seg_hits = [h for h in trunk_hits if not h[4]]
             best_n = min(node_hits, key=lambda h: h[1]) if node_hits else None
             best_s = min(seg_hits, key=lambda h: h[1]) if seg_hits else None
-            if best_n is None:
-                best_trunk = best_s
-            elif best_s is None:
-                best_trunk = best_n
-            else:
-                dn, ds = float(best_n[1]), float(best_s[1])
-                amb_m = 2.0
-                if dn <= amb_m and ds <= amb_m:
-                    best_trunk = best_n
-                else:
-                    best_trunk = best_n if dn <= ds else best_s
+            best_trunk = best_n if best_n is not None else best_s
             trunk_priority = bool(
                 app is not None
                 and hasattr(app, "_trunk_interaction_priority_active")
@@ -462,19 +452,27 @@ def create_embedded_map_panel(parent: tk.Misc, app=None):
                 if hasattr(app, "trunk_irrigation_hydro_pump_label_lines"):
                     plab = app.trunk_irrigation_hydro_pump_label_lines()
                     if plab:
-                        c.create_text(
+                        y_lab = cy + g + 14
+                        main_txt = "\n".join(plab[:-1])
+                        foot_txt = plab[-1]
+                        tid = c.create_text(
                             cx,
-                            cy + g + 14,
-                            text=plab[0],
+                            y_lab,
+                            text=main_txt,
                             anchor=tk.N,
                             fill="#FFE082",
                             font=("Segoe UI", 8, "bold"),
                             tags="trunk_map_glyph",
                         )
+                        try:
+                            bb = c.bbox(tid)
+                            y_foot = float(bb[3]) + 3.0 if bb else y_lab + 44.0
+                        except tk.TclError:
+                            y_foot = y_lab + 44.0
                         c.create_text(
                             cx,
-                            cy + g + 28,
-                            text=plab[1],
+                            y_foot,
+                            text=foot_txt,
                             anchor=tk.N,
                             fill="#9E9E9E",
                             font=("Segoe UI", 7),
@@ -1245,6 +1243,27 @@ def create_embedded_map_panel(parent: tk.Misc, app=None):
                         scr.extend(xy)
                 if len(scr) >= 4:
                     c.create_line(*scr, fill="#FF5588", width=6, tags="map_live_preview")
+                # Гумова вісь останній ЛКМ → курсор (як пунктир у DRAW на карті)
+                smx, smy = float(app.active_submain[-1][0]), float(app.active_submain[-1][1])
+                tx_r, ty_r = cx, cy
+                if app.ortho_on.get():
+                    if abs(tx_r - smx) > abs(ty_r - smy):
+                        ty_r = smy
+                    else:
+                        tx_r = smx
+                p_r0 = _canvas_xy_from_world(smx, smy)
+                p_r1 = _canvas_xy_from_world(tx_r, ty_r)
+                if p_r0 and p_r1:
+                    c.create_line(
+                        p_r0[0],
+                        p_r0[1],
+                        p_r1[0],
+                        p_r1[1],
+                        fill="#E8E8E8",
+                        dash=(5, 4),
+                        width=2,
+                        tags="map_live_preview",
+                    )
             if m == "DRAW_LAT" and app.active_manual_lat:
                 aml = list(app.active_manual_lat)
                 if len(aml) >= 2:
@@ -2353,7 +2372,7 @@ def create_embedded_map_panel(parent: tk.Misc, app=None):
             if (
                 app is not None
                 and getattr(app, "geo_ref", None)
-                and app.mode.get() in ("VIEW", "PAN")
+                and app.mode.get() in ("VIEW", "PAN", "INFO")
                 and hasattr(app, "_handle_right_click_world")
             ):
                 try:
@@ -2377,7 +2396,7 @@ def create_embedded_map_panel(parent: tk.Misc, app=None):
             return "break"
         if app is not None and getattr(app, "geo_ref", None):
             m = app.mode.get()
-            if m in ("VIEW", "PAN"):
+            if m in ("VIEW", "PAN", "INFO"):
                 if hasattr(app, "_irrigation_schedule_canvas_pick_active") and app._irrigation_schedule_canvas_pick_active():
                     try:
                         lat, lon = map_widget.convert_canvas_coords_to_decimal_coords(int(event.x), int(event.y))

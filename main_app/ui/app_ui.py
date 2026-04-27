@@ -1,9 +1,10 @@
 import threading
 import time
 import tkinter as tk
-from typing import Optional
+from typing import Optional, Sequence
 from tkinter import ttk
 
+from main_app.contracts import HydraulicRunSnapshot
 from main_app.ui.silent_messagebox import silent_showerror, silent_showinfo, silent_showwarning
 from main_app.ui.dripcad_legacy import DripCAD
 from main_app.orchestrator import IrrigationOrchestrator
@@ -566,19 +567,22 @@ class DripCADUI(DripCAD):
         mat_str, pn_str = self._derive_hydro_mat_pn_from_allowed(eff_ref)
         emit_model_name = (self.var_emit_model.get() or "").strip()
         emit_nominal_str = (self.var_emit_nominal_flow.get() or "").strip()
-        if active_block_only and (not emit_model_name or not emit_nominal_str):
+        active_block_params = {}
+        if active_block_only:
             try:
                 abi2 = int(merge_meta.get("_orig_block_idx", -1))
             except (TypeError, ValueError):
                 abi2 = -1
             if 0 <= abi2 < len(self.field_blocks):
-                p_blk = self.field_blocks[abi2].get("params") or {}
-                if not emit_model_name:
-                    emit_model_name = str(p_blk.get("emit_model", "") or "").strip()
-                if not emit_nominal_str:
-                    emit_nominal_str = str(
-                        p_blk.get("emit_nominal_flow", p_blk.get("flow", "")) or ""
-                    ).strip()
+                active_block_params = self.field_blocks[abi2].get("params") or {}
+                block_emit_model = str(active_block_params.get("emit_model", "") or "").strip()
+                block_emit_nominal = str(
+                    active_block_params.get("emit_nominal_flow", active_block_params.get("flow", "")) or ""
+                ).strip()
+                if block_emit_model:
+                    emit_model_name = block_emit_model
+                if block_emit_nominal:
+                    emit_nominal_str = block_emit_nominal
         try:
             emitter_k_coeff = float((self.var_emit_k_coeff.get().strip() or "0").replace(",", "."))
         except (TypeError, ValueError):
@@ -591,6 +595,25 @@ class DripCADUI(DripCAD):
             emitter_kd_coeff = float((self.var_emit_kd_coeff.get().strip() or "1").replace(",", "."))
         except (TypeError, ValueError):
             emitter_kd_coeff = 1.0
+        if active_block_only and isinstance(active_block_params, dict):
+            rec_from_block = None
+            try:
+                rec_from_block = self._dripper_record(emit_model_name, emit_nominal_str)
+            except Exception:
+                rec_from_block = None
+            if isinstance(rec_from_block, dict):
+                try:
+                    emitter_k_coeff = float(rec_from_block.get("constant_k", emitter_k_coeff))
+                except (TypeError, ValueError):
+                    pass
+                try:
+                    emitter_x_exp = float(rec_from_block.get("exponent_x", emitter_x_exp))
+                except (TypeError, ValueError):
+                    pass
+                try:
+                    emitter_kd_coeff = float(rec_from_block.get("kd", emitter_kd_coeff))
+                except (TypeError, ValueError):
+                    pass
         if emitter_x_exp <= 1e-12:
             try:
                 rec = self._dripper_record(emit_model_name, emit_nominal_str)
@@ -658,32 +681,48 @@ class DripCADUI(DripCAD):
         dto.update(merge_meta)
         return dto
 
-    def run_calculation(self):
+    def run_calculation(self, *, active_block_only: bool = True):
         if not self._ensure_emitter_kx_ready():
             return
         abi = self._safe_active_block_idx()
-        if abi is None or not self.field_blocks:
-            silent_showwarning(self.root, "Увага", "Немає блоку поля для розрахунку.")
-            return
-        blk = self.field_blocks[abi]
-        if not any(len(sm) > 1 for sm in (blk.get("submain_lines") or [])):
-            silent_showwarning(self.root, 
-                "Увага",
-                "У активному блоці немає магістралі (полілінія ≥2 точок).",
-            )
-            return
-        if not self._active_block_submains_have_connected_laterals():
-            dmax = self._submain_lateral_snap_m()
-            silent_showwarning(self.root, 
-                "Увага",
-                f"Кожен сабмейн активного блоку має перетинати латераль або бути поруч з нею (≤{dmax:.2f} м — "
-                "див. «Керування»). Замкніть ручну dripline ПКМ біля сабмейну або збільшіть допуск.",
-            )
-            return
+        if active_block_only:
+            if abi is None or not self.field_blocks:
+                silent_showwarning(self.root, "Увага", "Немає блоку поля для розрахунку.")
+                return
+            blk = self.field_blocks[abi]
+            if not any(len(sm) > 1 for sm in (blk.get("submain_lines") or [])):
+                silent_showwarning(self.root, 
+                    "Увага",
+                    "У активному блоці немає магістралі (полілінія ≥2 точок).",
+                )
+                return
+            if not self._active_block_submains_have_connected_laterals():
+                dmax = self._submain_lateral_snap_m()
+                silent_showwarning(self.root, 
+                    "Увага",
+                    f"Кожен сабмейн активного блоку має перетинати латераль або бути поруч з нею (≤{dmax:.2f} м — "
+                    "див. «Керування»). Замкніть ручну dripline ПКМ біля сабмейну або збільшіть допуск.",
+                )
+                return
+        else:
+            if not self._all_submain_lines():
+                silent_showwarning(self.root, "Увага", "Намалюйте хоча б один сабмейн!")
+                return
+            if not self._all_submains_have_connected_laterals():
+                dmax = self._submain_lateral_snap_m()
+                silent_showwarning(self.root, 
+                    "Увага",
+                    f"Кожен сабмейн має перетинати латераль або бути поруч з нею (≤{dmax:.2f} м — "
+                    "див. «Керування»). Замкніть ручну dripline ПКМ біля сабмейну або збільшіть допуск.",
+                )
+                return
 
         old_label_pts = dict(self.calc_results.get("section_label_pos") or {})
-        self._strip_hydro_for_block_keep_others(abi)
-        use_active_block = True
+        if active_block_only:
+            self._strip_hydro_for_block_keep_others(abi)
+        else:
+            self.reset_calc()
+        use_active_block = bool(active_block_only)
         try:
             data = self._collect_hydro_dto(active_block_only=use_active_block)
         except Exception as err:
@@ -778,10 +817,12 @@ class DripCADUI(DripCAD):
                 self._refresh_emitter_q_extrema_overlay_state()
             self._restore_section_label_positions(old_label_pts)
             self.last_report = hydro_result["report"]
-            self.orchestrator.last_hydraulic = {
-                "report": self.last_report,
-                "results": self.calc_results,
-            }
+            self.orchestrator.last_hydraulic = HydraulicRunSnapshot.from_mapping(
+                {
+                    "report": self.last_report,
+                    "results": self.calc_results,
+                }
+            ).to_dict()
 
             try:
                 if prog_win.winfo_exists():
@@ -803,6 +844,246 @@ class DripCADUI(DripCAD):
             _finish_ok()
 
         def _finish_ok() -> None:
+            try:
+                if prog_win.winfo_exists():
+                    try:
+                        prog_bar.config(maximum=100, value=100)
+                        prog_lbl.config(text="Готово.")
+                        prog_win.update_idletasks()
+                    except (tk.TclError, ValueError, TypeError):
+                        pass
+                    prog_win.destroy()
+            except tk.TclError:
+                pass
+            self.redraw()
+            self.sync_hydro_pipe_summary()
+            if hasattr(self, "control_panel"):
+                self.control_panel.sync_report_block_selector()
+                self.control_panel._render_block_report_text()
+                try:
+                    self.control_panel.notebook.select(self.control_panel.tab_results)
+                except Exception:
+                    pass
+
+        threading.Thread(target=_hydro_task, daemon=True).start()
+
+    def run_calculation_for_blocks(self, block_indices: Sequence[int]):
+        valid: list[int] = []
+        seen: set[int] = set()
+        for raw_idx in block_indices or []:
+            try:
+                bi = int(raw_idx)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= bi < len(self.field_blocks) and bi not in seen:
+                seen.add(bi)
+                valid.append(bi)
+        if not valid:
+            silent_showwarning(self.root, "Увага", "Немає вибраних блоків для розрахунку.")
+            return
+        if not self._emitter_compensated_effective():
+            for bi in valid:
+                p = self.field_blocks[bi].get("params") or {}
+                model = str(p.get("emit_model", self.var_emit_model.get()) or "").strip()
+                nominal = str(
+                    p.get("emit_nominal_flow", p.get("flow", self.var_emit_nominal_flow.get())) or ""
+                ).strip()
+                rec = self._dripper_record(model, nominal)
+                has_rec_kx = False
+                if isinstance(rec, dict):
+                    try:
+                        has_rec_kx = (
+                            float(rec.get("constant_k", 0.0) or 0.0) > 0.0
+                            and float(rec.get("exponent_x", 0.0) or 0.0) > 1e-12
+                        )
+                    except (TypeError, ValueError):
+                        has_rec_kx = False
+                if has_rec_kx:
+                    continue
+                try:
+                    has_global_kx = (
+                        float((self.var_emit_k_coeff.get().strip() or "0").replace(",", ".")) > 0.0
+                        and float((self.var_emit_x_exp.get().strip() or "0").replace(",", ".")) > 1e-12
+                    )
+                except (TypeError, ValueError):
+                    has_global_kx = False
+                if not has_global_kx:
+                    silent_showwarning(
+                        self.root,
+                        "Потрібні параметри емітера",
+                        f"Для блоку {bi + 1} потрібно задати модель/Q номінал з k і x "
+                        "або заповнити k / x на вкладці «Гідравліка».",
+                    )
+                    return
+        dmax = self._submain_lateral_snap_m()
+        for bi in valid:
+            blk = self.field_blocks[bi]
+            if not any(len(sm) > 1 for sm in (blk.get("submain_lines") or [])):
+                silent_showwarning(
+                    self.root,
+                    "Увага",
+                    f"У блоці {bi + 1} немає сабмейну (полілінія ≥2 точок).",
+                )
+                return
+            for sm in blk.get("submain_lines") or []:
+                if len(sm) > 1 and not self._submain_has_connected_lateral(sm):
+                    silent_showwarning(
+                        self.root,
+                        "Увага",
+                        f"У блоці {bi + 1} кожен сабмейн має перетинати латераль або бути поруч з нею "
+                        f"(≤{dmax:.2f} м — див. «Керування»).",
+                    )
+                    return
+
+        prev_active = self._safe_active_block_idx()
+        old_label_pts = dict(self.calc_results.get("section_label_pos") or {})
+        data_rows = []
+        try:
+            for bi in valid:
+                self.var_active_block_idx.set(int(bi))
+                data = self._collect_hydro_dto(active_block_only=True)
+                data["_selected_calc_block_idx"] = int(bi)
+                data_rows.append(data)
+        except Exception as err:
+            if prev_active is not None:
+                self.var_active_block_idx.set(int(prev_active))
+            self._refresh_active_block_combo()
+            silent_showerror(self.root, "Помилка", f"Некоректні дані: {err}")
+            return
+        if valid:
+            self.var_active_block_idx.set(int(valid[0]))
+        self._refresh_active_block_combo()
+        for bi in valid:
+            self._strip_hydro_for_block_keep_others(int(bi))
+
+        prog_win = tk.Toplevel(self.root)
+        prog_win.title("Розрахунок вибраних блоків")
+        prog_win.configure(bg="#1e1e1e")
+        prog_win.transient(self.root)
+        prog_win.resizable(False, False)
+        prog_win.protocol("WM_DELETE_WINDOW", lambda: None)
+        fr = tk.Frame(prog_win, bg="#1e1e1e", padx=20, pady=16)
+        fr.pack(fill=tk.BOTH, expand=True)
+        prog_lbl = tk.Label(
+            fr,
+            text="Підготовка…",
+            fg="#00FFCC",
+            bg="#1e1e1e",
+            font=("Segoe UI", 10),
+            wraplength=420,
+            justify=tk.LEFT,
+        )
+        prog_lbl.pack(anchor=tk.W, pady=(0, 10))
+        _pb_style = self._ochre_progressbar_style(prog_win)
+        prog_bar = ttk.Progressbar(
+            fr, length=420, mode="determinate", maximum=100, style=_pb_style
+        )
+        prog_bar.config(value=0)
+        prog_bar.pack(fill=tk.X)
+
+        _prog_snap = {"done": 0, "total": max(1, len(data_rows) * 100), "msg": ""}
+        _prog_paint_armed = [False]
+
+        def _schedule_progress(done: int, total: int, msg: str) -> None:
+            _prog_snap["done"] = max(0, int(done))
+            _prog_snap["total"] = max(1, int(total))
+            _prog_snap["msg"] = msg
+            if _prog_paint_armed[0]:
+                return
+            _prog_paint_armed[0] = True
+
+            def _paint_prog() -> None:
+                _prog_paint_armed[0] = False
+                try:
+                    if not prog_win.winfo_exists():
+                        return
+                    tt = _prog_snap["total"]
+                    dd = min(_prog_snap["done"], tt)
+                    pct = min(100, int(100.0 * float(dd) / float(tt)))
+                    prog_lbl.config(text=_prog_snap["msg"])
+                    prog_bar.config(maximum=100, value=pct)
+                except tk.TclError:
+                    pass
+
+            self.root.after(0, _paint_prog)
+
+        total_units = max(1, len(data_rows) * 100)
+        for order, data in enumerate(data_rows):
+            bi = int(data.get("_selected_calc_block_idx", valid[order]))
+
+            def _make_progress(order_idx: int, block_idx: int):
+                def _progress(done: int, total: int, msg: str) -> None:
+                    tt = max(1, int(total))
+                    pct_units = int(100.0 * min(max(0, int(done)), tt) / float(tt))
+                    _schedule_progress(
+                        order_idx * 100 + pct_units,
+                        total_units,
+                        f"Блок {block_idx + 1}: {msg}",
+                    )
+
+                return _progress
+
+            data["progress"] = _make_progress(order, bi)
+
+        def _hydro_task() -> None:
+            try:
+                results = []
+                for order, data in enumerate(data_rows):
+                    bi = int(data.get("_selected_calc_block_idx", valid[order]))
+                    _schedule_progress(order * 100, total_units, f"Блок {bi + 1}: підготовка…")
+                    hydro_result = self.orchestrator.run_hydraulic_preset(data)
+                    results.append((data, hydro_result))
+                self.root.after(0, _after_hydro, results, None)
+            except Exception as err:
+                self.root.after(0, _after_hydro, None, err)
+
+        def _after_hydro(results, err) -> None:
+            if err is not None:
+                try:
+                    prog_win.destroy()
+                except tk.TclError:
+                    pass
+                silent_showerror(self.root, "Помилка", f"Некоректні дані: {err}")
+                return
+            reports = []
+            touched_blocks = []
+            for data, hydro_result in results:
+                partial = hydro_result["results"]
+                remapped = self._remap_partial_hydro_results(
+                    partial,
+                    data["_orig_sm_indices"],
+                    int(data["_merge_lat_lo"]),
+                    int(data.get("_orig_block_idx", -1)),
+                )
+                self._merge_hydro_slice_into_state(remapped)
+                touched_blocks.append(int(data.get("_orig_block_idx", -1)))
+                rep = str(hydro_result.get("report", "") or "").strip()
+                if rep:
+                    reports.append(rep)
+            self._refresh_emitter_q_extrema_overlay_state(touched_blocks)
+            self._restore_section_label_positions(old_label_pts)
+            self.last_report = "\n\n".join(reports)
+            self.orchestrator.last_hydraulic = HydraulicRunSnapshot.from_mapping(
+                {"report": self.last_report, "results": self.calc_results}
+            ).to_dict()
+
+            try:
+                if prog_win.winfo_exists():
+                    prog_bar.config(maximum=100, value=100)
+            except (tk.TclError, ValueError, TypeError):
+                pass
+            prog_lbl.config(text="Відомість матеріалів (BOM)…")
+            self.root.update_idletasks()
+            try:
+                self.orchestrator.run_bom(self.calc_results.get("sections", []), self.pipe_db)
+            except Exception as e2:
+                try:
+                    prog_win.destroy()
+                except tk.TclError:
+                    pass
+                silent_showerror(self.root, "Помилка", f"BOM: {e2}")
+                return
+
             try:
                 if prog_win.winfo_exists():
                     try:

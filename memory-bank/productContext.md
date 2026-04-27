@@ -20,3 +20,7 @@ Irrigation designers need a single tool to draw fields and pipe layouts, run cre
 ## Locale
 
 - UI, tooltips, and reports: **Ukrainian**.
+
+## Documentation anchors (maintenance)
+
+- Canonical technical snapshots: [PROJECT_CONTEXT.md](../PROJECT_CONTEXT.md) §7 and session notes in [PROJECT_STATE.md](../PROJECT_STATE.md). Last full doc alignment recorded: **2026-04-26** (user-requested sync with memory-bank).

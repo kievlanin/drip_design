@@ -346,7 +346,7 @@ class ControlPanel:
         snap_lf.pack(fill=tk.X, padx=10, pady=(10, 6))
         tk.Label(
             snap_lf,
-            text="Допуск (м), якщо полілінії не перетинаються:",
+            text="Допуск (м) до сегмента сабмейн «клапан→курсор»; більше — якщо кінці рядів далеко в плані:",
             bg="#1e1e1e",
             fg="white",
             font=("Arial", 8),
@@ -425,7 +425,7 @@ class ControlPanel:
         tk.Label(
             tab,
             text="До 100 блоків. Після «Завершити блоки» — ЛКМ всередині блоку, потім два ЛКМ напрямку рядів (авто-латералі лише цього блоку). "
-            "Сабмейн/ручна лінія: спочатку ЛКМ всередині блоку; ПКМ ручної — обрізка/подовження до сабмейну. Розрахунок: кожен сабмейн має бути з'єднаний з латераллю. "
+            "Сабмейн: ЛКМ — клапан (старт) у блоці; далі ЛКМ — проміжні вершини, остання ПКМ — кінець. Ручна dripline: ЛКМ у блоці; ПКМ — обрізка/подовження до сабмейну. Кожен сабмейн має врізатися в латералі. "
             "Видалення: блок — ЛКМ у контурі (ВИДАЛИТИ); латераль — поруч або режим 8. ПКМ замикає контур. Delete — усі контури. "
             "Скасувати незавершену чернетку (сабмейн, ручна лінія, контур, напрямок, різ, лінійка): Escape або подвійне ПКМ на полотні. "
             "ІНФО: ЛКМ по латералі — графік ряду; по сабмейну — тиск, витрата та рельєф вздовж магістралі (після розрахунку). "
@@ -887,52 +887,6 @@ class ControlPanel:
         self.app.var_emit_x_exp.trace_add("write", lambda *_: _sync_q_flow_label())
         _sync_q_flow_label()
 
-        lat_sol_fr = tk.LabelFrame(
-            tab,
-            text="Розрахунок латералів (HW / вузловий Ньютон)",
-            bg="#1e1e1e",
-            fg="#00FFCC",
-            font=("Arial", 9, "bold"),
-        )
-        lat_sol_fr.pack(fill=tk.X, padx=10, pady=(8, 4))
-        for txt, val in (
-            ("Порівняти бісекцію та Ньютона", "compare"),
-            ("Лише бісекція (shooting)", "bisection"),
-            ("Лише Ньютон–Рафсон", "newton"),
-            (
-                "Ньютон по вузлах лінії (q∼(Δh/C)^0.54)",
-                "trickle_nr",
-            ),
-        ):
-            tk.Radiobutton(
-                lat_sol_fr,
-                text=txt,
-                variable=self.app.var_lateral_solver_mode,
-                value=val,
-                bg="#1e1e1e",
-                fg="white",
-                selectcolor="#333",
-                activebackground="#1e1e1e",
-                activeforeground="#00FFCC",
-                font=("Arial", 8),
-                anchor=tk.W,
-            ).pack(fill=tk.X, padx=8, pady=1)
-        tk.Label(
-            lat_sol_fr,
-            text=(
-                "У звіті: ітерації та (у режимі порівняння) макс. розбіжності ΔH_tip, ΔQ.\n"
-                "Режим «Ньютон по вузлах лінії» — окрема модель втрат між випусками (інверсія HW); "
-                "для компенсованих крапельниць автоматично лишається HW+бісекція.\n"
-                "Перемикання режиму не змінює вже зроблений розрахунок на карті й у звіті — "
-                "новий варіант піде лише в наступний «▶ РОЗРАХУНОК» (активний блок)."
-            ),
-            bg="#1e1e1e",
-            fg="#888888",
-            font=("Arial", 7),
-            wraplength=260,
-            justify=tk.LEFT,
-        ).pack(padx=8, pady=(0, 6))
-        
         sec_frame = tk.Frame(tab, bg="#1e1e1e")
         sec_frame.pack(fill=tk.X, padx=10, pady=5)
         cb_sec = tk.Checkbutton(sec_frame, text="Фіксована к-сть секцій:", variable=self.app.var_fixed_sec, bg="#1e1e1e", fg="#00FFCC", selectcolor="#333", activebackground="#1e1e1e", activeforeground="#00FFCC", font=("Arial", 9, "bold"), command=self.toggle_sec_entry)
@@ -1286,6 +1240,20 @@ class ControlPanel:
     def _schedule_run_trunk_hydro(self):
         if hasattr(self.app, "run_trunk_irrigation_schedule_hydro"):
             self.app.run_trunk_irrigation_schedule_hydro()
+
+    def set_trunk_schedule_hydro_report(self, text: str) -> None:
+        """Оновлює текстову панель під «Оптимізація» (замість модальних вікон з підсумком)."""
+        w = getattr(self, "txt_trunk_schedule_hydro_report", None)
+        if w is None:
+            return
+        try:
+            w.configure(state=tk.NORMAL)
+            w.delete("1.0", tk.END)
+            body = (text or "").strip()
+            w.insert("1.0", body if body else "—")
+            w.configure(state=tk.DISABLED)
+        except tk.TclError:
+            pass
 
     def _estimate_max_pump_head_from_largest_allowed_trunk_pipe(self) -> Optional[float]:
         """Мінімальний орієнтовний напір насоса (м), якщо магістраль з однієї найтовстішої дозволеної труби."""
@@ -2119,6 +2087,20 @@ class ControlPanel:
             "Вимкнено: перед розрахунком виконується автопідбір діаметрів під заданий H насоса. "
             "Увімкнено: використовуються вже призначені труби магістралі, а розрахунок оцінює потрібний H насоса.",
         )
+        btn_collect_pressure = tk.Button(
+            calc,
+            text="↧ Зібрати тиск",
+            command=self.app.collect_field_valve_pressure_to_trunk_consumers,
+            bg="#2E3D32",
+            fg="#E8F5E9",
+            font=("Segoe UI", 9, "bold"),
+        )
+        btn_collect_pressure.pack(fill=tk.X, padx=6, pady=(6, 0))
+        self._attach_tooltip(
+            btn_collect_pressure,
+            "Перечитати Q та H на польових кранах сабмейнів і записати їх у найближчі вузли-споживачі магістралі. "
+            "Після цього натисніть «Оптимізація», щоб перерахувати магістраль з оновленими цілями.",
+        )
         btn_tr_hydro = tk.Button(
             calc,
             text="▶ Оптимізація",
@@ -2134,6 +2116,34 @@ class ControlPanel:
             "HW по поливах: типові Q/H — у полях нижче (або індивідуально на споживачі); напір на насосі — "
             "у полі «Напір насоса». Мін. довжина сегмента і критерій задають автопідбір діаметрів. "
             "Фарбування відрізків — домінантний полив; підпис біля насоса.",
+        )
+        fr_tr_hydro_report = tk.Frame(calc, bg="#181818")
+        fr_tr_hydro_report.pack(fill=tk.BOTH, padx=6, pady=(6, 0))
+        tk.Label(
+            fr_tr_hydro_report,
+            text="Результат оптимізації / розрахунку",
+            bg="#181818",
+            fg="#9E9E9E",
+            font=("Segoe UI", 8),
+            justify=tk.LEFT,
+        ).pack(anchor=tk.W)
+        self.txt_trunk_schedule_hydro_report = scrolledtext.ScrolledText(
+            fr_tr_hydro_report,
+            height=8,
+            wrap=tk.WORD,
+            bg="#222222",
+            fg="#ECEFF1",
+            insertbackground="#ECEFF1",
+            font=("Consolas", 8),
+            relief=tk.FLAT,
+            borderwidth=1,
+            highlightthickness=0,
+        )
+        self.txt_trunk_schedule_hydro_report.pack(fill=tk.BOTH, expand=False, pady=(2, 0))
+        self.txt_trunk_schedule_hydro_report.configure(state=tk.DISABLED)
+        self._attach_tooltip(
+            self.txt_trunk_schedule_hydro_report,
+            "Текст замість спливаючих вікон після «Оптимізація»: автопідбір, готово або попередження по слотах.",
         )
         fr_test_qh = tk.Frame(calc, bg="#181818")
         fr_test_qh.pack(fill=tk.X, padx=6, pady=(8, 0))

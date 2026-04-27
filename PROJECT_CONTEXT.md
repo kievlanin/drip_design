@@ -264,6 +264,13 @@ DripCAD is a specialized CAD application for agricultural drip irrigation: field
 - **Скидання selected:** canvas selection очищується лише при закритті вікна властивостей вибраних блоків (`OK`, `Скасувати` або хрестик), щоб діалог встиг стабільно прочитати й показати повний selected scope.
 - **Перевірка:** `ReadLints` для `main_app/ui/dripcad_legacy.py` без помилок; `python -m py_compile main_app/ui/dripcad_legacy.py` — OK.
 
+### Snapshot 2026-04-26 (магістраль HW: display H по слотах, підпис труб)
+- **Фінальний display-кеш після автопідбору труб:** `compute_trunk_irrigation_schedule_hydro` отримав режим **`use_required_source_head_per_slot`**. У цьому режимі кожен непорожній слот перераховується при своєму `min_required_source_head_m`, а не при глобальному worst-case `max_pump_head_m`. Це використовується в `dripcad_legacy._run_trunk_irrigation_optimize_loop` лише для кешу відображення hover/оверлеїв після того, як труби вже підібрані та перевірені.
+- **Практичний кейс `designs/atest/atest.json`:** споживач **C2 / T6** у поливі 2 замовляє `H=17 м`; раніше hover показував `H≈50.60 м`, бо слот рахувався при глобальному `H_насоса=55 м`. Новий display-режим дає `source≈22.45 м`, `T6≈17.00 м`.
+- **Старий режим фіксованих труб не зламано:** `use_required_pump_head=True` і далі показує фактичну гідравліку при заданому насосі, а `min_required_source_head_m` лишається довідковим мінімумом.
+- **Підпис труби у hover/pick:** старий формат `L ≈ ... м` + `Ø ... мм (зовнішній діаметр)` замінено на єдиний формат через `_format_pipe_signature`: **`ABBR ØOD/PN Lм`** (наприклад `ПВХ Ø150/6 629.2м`, або `ABBR` з `pipes_db`, якщо заданий).
+- **Перевірка:** `c:\DRD\.venv\Scripts\python.exe -m pytest tests/test_trunk_irrigation_schedule_hydro.py` → **16 passed**; `py_compile main_app/ui/dripcad_legacy.py` → OK; `ReadLints` для змінених файлів — без помилок.
+
 ### Snapshot 2026-04-16 (ізолінії виливу, підпис насоса, індикація v на магістралі)
 - **Ізолінії виливу (полотно):** після увімкнення показу ізоліній виливу на кожну лінію додається підпис **Q** у **л/г** (середина сегмента, тінь + світлий текст, тег `emit_flow_iso`); легенда згадує підпис.
 - **Підпис насоса (магістраль за поливами, режим заданого H):** у `trunk_irrigation_schedule_hydro` для кожного слота обчислюється **`min_required_source_head_m`** (бінарний пошук мінімального H на джерелі під цілі Hспож); у **`envelope.min_required_source_head_m`** — максимум по слотах (найгірший сценарій). У `dripcad_legacy.trunk_irrigation_hydro_pump_label_lines` додано рядок **«H на джерелі мін. (оцінка) ≈ … м»** (лише коли не режим `pump_head_mode=required`). Тест: `tests/test_trunk_irrigation_schedule_hydro.py` (`test_fixed_pump_envelope_has_min_required_source_head`).

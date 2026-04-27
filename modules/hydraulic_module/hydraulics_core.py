@@ -1442,16 +1442,15 @@ class HydraulicEngine:
                     _enforce_submain_nonwidening(math_zones, pipes_db, eff_allowed)
                     if use_lat_q:
                         calc_results["submain_math_zones"][str(sm_idx)] = copy.deepcopy(math_zones)
-                # Розрізи вздовж довжини: математичні межі зон + усі вершини полілінії (повороти).
-                # Діаметр кожного відрізка береться з math_zones за СЕРЕДИНОЮ відрізка [d_start,d_end],
-                # тому після повороту короткий прямий шматок часто потрапляє в іншу гідравлічну зону
-                # (інша Q по довжині магістралі) — візуально «не продовжується» той самий d, хоча труба одна.
+                # Розрізи вздовж довжини: математичні межі зон. Не ріжемо по кожній вершині
+                # полілінії: substring() збереже проміжні точки всередині секції, а надто щільні
+                # вершини від snap до латералей інакше перетворюють один сабмейн на сотні секцій.
                 final_cuts = []
                 Math_dists = list(bounds[1:-1])
                 for md in Math_dists:
-                    if all(abs(md - lmc) >= 10.0 for lmc in LMC_dists):
+                    if 0.5 <= md <= L_total - 0.5:
                         final_cuts.append(md)
-                final_cuts.extend(LMC_dists)
+                final_cuts.extend([0.0, L_total])
                 final_cuts.sort()
                 cleaned_cuts = [final_cuts[0]]
                 for fc in final_cuts[1:]:
@@ -1816,11 +1815,35 @@ class HydraulicEngine:
             report_lines.append(
                 f"--- Підбір d сабмейну під H на крані ≤ {valve_h_max_m:.2f} м вод. ст. ---"
             )
+            # Лише крани на початках сабмейнів цього прогону (у т.ч. «лише активний блок»):
+            # інакше в calc_results лишаються старі записи інших блоків — «найгірший» H без
+            # відповідного sm_idx у submain_lines і підбір d ніколи не спрацьовує.
+            _valve_keys_in_this_run = set()
+            for _sji in range(n_sm):
+                _line = submain_lines[_sji] if _sji < len(submain_lines) else None
+                if not _line or len(_line) < 1:
+                    continue
+                try:
+                    _valve_keys_in_this_run.add(
+                        str(
+                            (
+                                round(float(_line[0][0]), 2),
+                                round(float(_line[0][1]), 2),
+                            )
+                        )
+                    )
+                except (TypeError, ValueError, IndexError):
+                    continue
             _VALVE_HMAX_MAX_STEPS = 100
             for _vh_step in range(_VALVE_HMAX_MAX_STEPS):
                 worst_vk = None
                 worst_h = 0.0
                 for vk, vr in (calc_results.get("valves") or {}).items():
+                    if (
+                        len(_valve_keys_in_this_run) > 0
+                        and str(vk) not in _valve_keys_in_this_run
+                    ):
+                        continue
                     hc = float(vr.get("H", 0))
                     if hc > valve_h_max_m + 0.03 and hc > worst_h:
                         worst_h = hc

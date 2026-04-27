@@ -26,7 +26,7 @@ from .lateral_drip_core import (
 )
 
 # Макс. зазор (м) між латералем і сабмейном: вважаємо врізку навіть без точного перетину поліліній.
-SUBMAIN_LATERAL_SNAP_M = 2.0
+SUBMAIN_LATERAL_SNAP_M = 4.0
 
 __all__ = [
     "approx_wing_q_m3s_nominal",

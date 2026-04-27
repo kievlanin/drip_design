@@ -529,4 +529,12 @@ py -c "import tkinter, shapely; print('ok')"
 - **Скидання selected:** selection на canvas очищується при закритті діалогу (`OK`, `Скасувати`, хрестик), а не одразу після відкриття, щоб вікно параметрів встигло стабільно прочитати повний список вибраних блоків.
 - **Перевірка:** `ReadLints` для `main_app/ui/dripcad_legacy.py` — без помилок; `python -m py_compile main_app/ui/dripcad_legacy.py` — OK.
 
-*Останнє оновлення опису: 2026-04-26 — UI-фікс вибраних блоків у властивостях + синхронізація PROJECT_CONTEXT / PROJECT_STATE / memory-bank.*
+## Нотатка сесії 2026-04-26 (магістраль HW: display H та підписи труб)
+
+- **Display H після автопідбору:** у `modules/hydraulic_module/trunk_irrigation_schedule_hydro.py` додано `use_required_source_head_per_slot`. Після оптимізації труб `main_app/ui/dripcad_legacy.py` формує кеш відображення з мінімальним потрібним H джерела для кожного слота, тому hover показує регульований тиск слота, а не глобальний worst-case насос.
+- **Регресія `atest`:** для `designs/atest/atest.json` споживач **C2/T6** у поливі 2 тепер у display-режимі дає `source≈22.45 м`, `H≈17.00 м` замість `H≈50.60 м` при `max_pump_head_m=55`.
+- **Підписи труб магістралі:** hover/pick підпис труби у режимі труб переведено на формат **`ABBR ØOD/PN Lм`** через `_format_pipe_signature` (`ПВХ Ø150/6 629.2м` або `ABBR` з `pipes_db`).
+- **Перевірка:** `c:\DRD\.venv\Scripts\python.exe -m pytest tests/test_trunk_irrigation_schedule_hydro.py` → **16 passed**; `c:\DRD\.venv\Scripts\python.exe -m py_compile main_app/ui/dripcad_legacy.py` → OK; `ReadLints` для змінених файлів — без помилок.
+- **Операційно:** запущений Tk-процес треба перезапустити й заново натиснути **«Оптимізація»**, щоб побачити новий кеш/підписи.
+
+*Останнє оновлення опису: 2026-04-26 — магістраль HW display H по слотах, формат підпису труб, UI-фікс вибраних блоків + синхронізація PROJECT_CONTEXT / PROJECT_STATE / memory-bank.*

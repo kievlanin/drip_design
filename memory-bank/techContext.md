@@ -30,3 +30,4 @@ or `python -m main_app.main`. On Windows, prefer **`py`** if `python` points at 
 ## Tooling
 
 - VS Code / Cursor: see “favorite files” table in `PROJECT_STATE.md` for quick navigation.
+- Focused refactor tests in this branch use pytest style, e.g. `py -m pytest tests/test_project_serialization.py tests/test_project_normalizers.py`.

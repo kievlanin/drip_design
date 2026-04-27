@@ -1,5 +1,6 @@
 from shapely.geometry import LineString
 
+from main_app.contracts import BomSnapshot, HydraulicResultsSnapshot, HydraulicRunSnapshot
 from modules.geo_module.engine import GeoModule
 from modules.hydraulic_module.engine import HydraulicModule
 from modules.bom_module.engine import BOMModule
@@ -13,9 +14,9 @@ class IrrigationOrchestrator:
         self.hydraulic_module = HydraulicModule()
         self.bom_module = BOMModule()
 
-        self.last_hydraulic = {"report": "", "results": {"sections": [], "valves": {}, "emitters": {}}}
-        self.last_bom = {"items": [], "fitting_items": [], "frozen_count": 0}
-        self.last_stress = {"report": "", "results": {"sections": [], "valves": {}, "emitters": {}}}
+        self.last_hydraulic = HydraulicRunSnapshot().to_dict()
+        self.last_bom = BomSnapshot().to_dict()
+        self.last_stress = HydraulicRunSnapshot().to_dict()
 
     def get_default_pipe_db(self):
         return self.hydraulic_module.get_pipes_db()
@@ -66,8 +67,8 @@ class IrrigationOrchestrator:
 
     def run_hydraulic_preset(self, dto):
         result = self.hydraulic_module.run(dto)
-        self.last_hydraulic = result
-        return result
+        self.last_hydraulic = HydraulicRunSnapshot.from_mapping(result).to_dict()
+        return self.last_hydraulic
 
     def run_bom(self, sections, pipes_db, quantization=None):
         dto = {
@@ -75,7 +76,7 @@ class IrrigationOrchestrator:
             "pipes_db": pipes_db,
             "quantization": quantization or {},
         }
-        self.last_bom = self.bom_module.build_bom(dto)
+        self.last_bom = BomSnapshot.from_mapping(self.bom_module.build_bom(dto)).to_dict()
         return self.last_bom
 
     def freeze_bom(self):
@@ -83,17 +84,13 @@ class IrrigationOrchestrator:
 
     def trim_auxiliary_results_after_persist(self) -> None:
         """Звільнити великі допоміжні структури після збереження проєкту / PDF (звіт уже на диску)."""
-        bom = self.last_bom or {}
-        self.last_bom = {
-            "items": list(bom.get("items") or []),
-            "fitting_items": [],
-            "frozen_count": int(bom.get("frozen_count", 0)),
-        }
-        stress = self.last_stress or {}
-        self.last_stress = {
-            "report": str(stress.get("report", "") or ""),
-            "results": {"sections": [], "valves": {}, "emitters": {}},
-        }
+        bom = BomSnapshot.from_mapping(self.last_bom)
+        bom.fitting_items = []
+        self.last_bom = bom.to_dict()
+
+        stress = HydraulicRunSnapshot.from_mapping(self.last_stress)
+        stress.results = HydraulicResultsSnapshot()
+        self.last_stress = stress.to_dict()
 
     def run_stress_test(self, hydraulic_dto):
         adjusted = dict(hydraulic_dto)
@@ -109,6 +106,6 @@ class IrrigationOrchestrator:
                 if len(coords) > 1
             ]
         result = self.hydraulic_module.run(adjusted)
-        self.last_stress = result
-        return result
+        self.last_stress = HydraulicRunSnapshot.from_mapping(result).to_dict()
+        return self.last_stress
 
