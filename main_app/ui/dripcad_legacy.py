@@ -4460,10 +4460,11 @@ class DripCAD:
         path: List[Tuple[float, float]],
         slot_row: dict,
         nodes: List[dict],
-    ) -> Optional[Tuple[List[Tuple[float, float, float, float, float]], float]]:
+    ) -> Optional[List[Tuple[float, float, float, float, float, float]]]:
         """
-        (ділянки, Q_m3s): кожна ділянка — (s0, s1, H0, H1, d_inner_mm) у метрах вздовж path[0]→path[-1],
-        лінійний H у межах HW-секції телескопа (як у compute_trunk_tree_steady). Q — для v у ψ=H−v²/(2g).
+        Ділянки профілю вздовж path[0]→path[-1]:
+        (s0, s1, H0, H1, d_inner_mm, q_m3s), де H лінійний у межах HW-секції телескопа.
+        Локальний q_m3s потрібен для коректного ψ=H−v²/(2g) без "штучних" ступенів на гілці.
         None — якщо не вдалося зібрати ребра кешу.
         """
         if not isinstance(seg, dict) or len(path) < 2:
@@ -4474,8 +4475,6 @@ class DripCAD:
         try:
             idxs = [int(x) for x in ni]
         except (TypeError, ValueError):
-            return None
-        if len(idxs) >= 3 and len(path) != len(idxs):
             return None
         if len(idxs) == 2 and len(path) < 2:
             return None
@@ -4488,10 +4487,9 @@ class DripCAD:
                 return f"T{idx}"
             return str(n.get("id", "")).strip() or f"T{idx}"
 
-        pieces: List[Tuple[float, float, float, float, float]] = []
+        pieces: List[Tuple[float, float, float, float, float, float]] = []
         s_off = 0.0
         h_prev_end: Optional[float] = None
-        q_track = 0.0
         for j in range(len(idxs) - 1):
             u, v = idxs[j], idxs[j + 1]
             id_u, id_v = _nid(u), _nid(v)
@@ -4499,11 +4497,33 @@ class DripCAD:
                 if len(idxs) == 2:
                     leg_geom = float(DripCAD._polyline_length_m(path))
                 else:
-                    leg_geom = math.hypot(
-                        float(path[j + 1][0]) - float(path[j][0]),
-                        float(path[j + 1][1]) - float(path[j][1]),
+                    # Для режиму "вздовж гілки" path — це зшита полілінія всієї гілки,
+                    # тож довжину конкретного ребра беремо з його реальної геометрії.
+                    seg_idx = DripCAD._trunk_map_segment_index_for_node_pair(
+                        list(getattr(self, "trunk_map_segments", []) or []),
+                        int(u),
+                        int(v),
                     )
-            except (TypeError, ValueError):
+                    if seg_idx is not None:
+                        segs_all = list(getattr(self, "trunk_map_segments", []) or [])
+                        if 0 <= int(seg_idx) < len(segs_all):
+                            edge_path = self._trunk_segment_world_path(segs_all[int(seg_idx)])
+                            leg_geom = (
+                                float(self._polyline_length_m(edge_path))
+                                if len(edge_path) >= 2
+                                else 0.0
+                            )
+                        else:
+                            leg_geom = 0.0
+                    else:
+                        leg_geom = 0.0
+                    if leg_geom <= 1e-9:
+                        # Fallback тільки якщо геометрія ребра недоступна.
+                        leg_geom = math.hypot(
+                            float(nodes[v]["x"]) - float(nodes[u]["x"]),
+                            float(nodes[v]["y"]) - float(nodes[u]["y"]),
+                        )
+            except (TypeError, ValueError, KeyError, IndexError):
                 return None
             if leg_geom <= 1e-9:
                 continue
@@ -4512,7 +4532,6 @@ class DripCAD:
                 return None
             pid, cid, hu, hd = ed[0], ed[1], float(ed[2]), float(ed[3])
             q = self._trunk_edge_q_m3s(slot_row, pid, cid)
-            q_track = max(q_track, float(q))
             trow = self._trunk_tree_edge_row_by_pair(pid, cid)
             forward = id_u == pid and id_v == cid
             reverse = id_u == cid and id_v == pid
@@ -4526,7 +4545,7 @@ class DripCAD:
                     d_leg = float(seg.get("d_inner_mm", 90.0) or 90.0)
                 except (TypeError, ValueError):
                     d_leg = 90.0
-                pieces.append((s_off, s_off + leg_geom, h_a, h_b, d_leg))
+                pieces.append((s_off, s_off + leg_geom, h_a, h_b, d_leg, float(q)))
                 h_prev_end = h_b
                 s_off += leg_geom
                 continue
@@ -4548,12 +4567,12 @@ class DripCAD:
                     g0 = s_off + s_loc
                     g1 = s_off + s_loc + Lm * scale_s
                     h1 = h_run - hf
-                    pieces.append((g0, g1, h_run, h1, float(dmm)))
+                    pieces.append((g0, g1, h_run, h1, float(dmm), float(q)))
                     h_run = h1
                     s_loc += Lm * scale_s
                 if pieces:
-                    s0l, s1l, h0l, _h1l, d_last = pieces[-1]
-                    pieces[-1] = (s0l, s1l, h0l, float(hd), d_last)
+                    s0l, s1l, h0l, _h1l, d_last, q_last = pieces[-1]
+                    pieces[-1] = (s0l, s1l, h0l, float(hd), d_last, q_last)
                 h_prev_end = float(hd)
             else:
                 h_run = float(hd)
@@ -4566,17 +4585,17 @@ class DripCAD:
                     g0 = s_off + s_loc
                     g1 = s_off + s_loc + Lm * scale_s
                     h1 = h_run + hf
-                    pieces.append((g0, g1, h_run, h1, float(dmm)))
+                    pieces.append((g0, g1, h_run, h1, float(dmm), float(q)))
                     h_run = h1
                     s_loc += Lm * scale_s
                 if pieces:
-                    s0l, s1l, h0l, _h1l, d_last = pieces[-1]
-                    pieces[-1] = (s0l, s1l, h0l, float(hu), d_last)
+                    s0l, s1l, h0l, _h1l, d_last, q_last = pieces[-1]
+                    pieces[-1] = (s0l, s1l, h0l, float(hu), d_last, q_last)
                 h_prev_end = float(hu)
             s_off += leg_geom
         if not pieces:
             return None
-        return (pieces, float(q_track))
+        return pieces
 
     @staticmethod
     def _trunk_head_at_s_on_pieces(s: float, pieces: Sequence[Tuple]) -> float:
@@ -4625,6 +4644,31 @@ class DripCAD:
         return 90.0
 
     @staticmethod
+    def _trunk_q_m3s_at_s_on_pieces(s: float, pieces: Sequence[Tuple], fallback_q: float = 0.0) -> float:
+        """Локальна витрата на відстані s по шматках профілю (6-й елемент), інакше fallback."""
+        s = max(0.0, float(s))
+        if not pieces:
+            return max(0.0, float(fallback_q))
+        ordered = sorted(pieces, key=lambda p: (min(p[0], p[1]), max(p[0], p[1])))
+        for p in ordered:
+            if len(p) < 6:
+                break
+            s0, s1 = float(p[0]), float(p[1])
+            lo, hi = (s0, s1) if s0 <= s1 else (s1, s0)
+            if lo - 1e-9 <= s <= hi + 1e-7:
+                try:
+                    return max(0.0, float(p[5]))
+                except (TypeError, ValueError):
+                    return max(0.0, float(fallback_q))
+        try:
+            lp = ordered[-1]
+            if len(lp) >= 6:
+                return max(0.0, float(lp[5]))
+        except (TypeError, ValueError, IndexError):
+            pass
+        return max(0.0, float(fallback_q))
+
+    @staticmethod
     def _trunk_bernoulli_psi_static_m(h_line_m: float, q_m3s: float, d_inner_mm: float) -> float:
         """Статична складова повного напору (лінія енергії): ψ = H − v²/(2g), v=Q/A."""
         g = 9.80665
@@ -4669,44 +4713,11 @@ class DripCAD:
         nodes = list(getattr(self, "trunk_map_nodes", []) or [])
         raw_seg = segs[si] if isinstance(segs[si], dict) else {}
         seg = raw_seg
-        br = self._trunk_combined_path_from_pump_for_segment(si) if bool(along_branch) else None
+        br = None
         pressure_branch_multi = False
-        if (
-            br
-            and str(br.get("mode")) == "branch"
-            and int(br.get("n_edges", 1) or 0) > 1
-            and isinstance(br.get("node_chain"), list)
-            and len(br["node_chain"]) >= 2
-        ):
-            nch = [int(c) for c in br["node_chain"]]
-            path_v: List[Tuple[float, float]] = []
-            _ok = True
-            for idx in nch:
-                if not (0 <= idx < len(nodes)):
-                    _ok = False
-                    break
-                row = nodes[idx]
-                if not isinstance(row, dict):
-                    _ok = False
-                    break
-                try:
-                    path_v.append((float(row["x"]), float(row["y"])))
-                except (KeyError, TypeError, ValueError):
-                    _ok = False
-                    break
-            if _ok and len(path_v) >= 2 and len(path_v) == len(nch):
-                seg = {"node_indices": nch}
-                path = path_v
-                pressure_branch_multi = True
-        if not pressure_branch_multi:
-            seg = raw_seg
-            path = self._trunk_segment_world_path(raw_seg)
+        path = self._trunk_segment_world_path(raw_seg)
         if len(path) < 2:
             silent_showwarning(self.root, "Напір вздовж ребра", "Некоректна геометрія відрізка.")
-            return
-        total_len = float(self._polyline_length_m(path))
-        if total_len <= 1e-6:
-            silent_showwarning(self.root, "Напір вздовж ребра", "Довжина відрізка ≈ 0 м.")
             return
         h = getattr(self, "trunk_irrigation_hydro_cache", None)
         if not isinstance(h, dict) or not DripCAD._trunk_irrigation_hydro_dict_has_results(h):
@@ -4734,6 +4745,164 @@ class DripCAD:
         if not isinstance(slot_row, dict):
             silent_showwarning(self.root, "Напір вздовж ребра", f"Немає даних для слота {dom_slot + 1}.")
             return
+
+        def _active_branch_path_for_slot() -> Optional[dict]:
+            ni0 = raw_seg.get("node_indices")
+            if not isinstance(ni0, list) or len(ni0) != 2:
+                return None
+            try:
+                a0, b0 = int(ni0[0]), int(ni0[1])
+            except (TypeError, ValueError):
+                return None
+            directed, _ = build_oriented_edges(nodes, segs)
+            if not directed:
+                return None
+            parent: Dict[int, int] = {}
+            children: Dict[int, List[int]] = {}
+            for u, v in directed:
+                ui, vi = int(u), int(v)
+                parent[vi] = ui
+                children.setdefault(ui, []).append(vi)
+
+            src = next(
+                (
+                    i
+                    for i, row in enumerate(nodes)
+                    if isinstance(row, dict) and is_trunk_root_kind(str(row.get("kind", "")).strip().lower())
+                ),
+                None,
+            )
+            if src is None:
+                return None
+            if parent.get(b0) == a0:
+                up, down = a0, b0
+            elif parent.get(a0) == b0:
+                up, down = b0, a0
+            else:
+                return None
+
+            down_to_src = [int(down)]
+            pcur = parent.get(int(down))
+            while pcur is not None:
+                down_to_src.append(int(pcur))
+                pcur = parent.get(int(pcur))
+            if not down_to_src or int(down_to_src[-1]) != int(src):
+                return None
+            chain: List[int] = list(reversed(down_to_src))
+
+            def _nid(idx: int) -> str:
+                if not (0 <= idx < len(nodes)):
+                    return f"T{idx}"
+                n = nodes[idx]
+                if not isinstance(n, dict):
+                    return f"T{idx}"
+                return str(n.get("id", "")).strip() or f"T{idx}"
+
+            cur = int(down)
+            for _ in range(max(0, len(nodes) * 2)):
+                ch = [int(x) for x in (children.get(cur) or [])]
+                if not ch:
+                    break
+                best: Optional[int] = None
+                best_q = 0.0
+                id_cur = _nid(cur)
+                for nxt in ch:
+                    qv = DripCAD._trunk_edge_q_m3s(slot_row, id_cur, _nid(nxt))
+                    if qv > best_q:
+                        best_q = float(qv)
+                        best = int(nxt)
+                if best is None or best_q <= 1e-9:
+                    break
+                chain.append(int(best))
+                cur = int(best)
+
+            if len(chain) < 2:
+                return None
+
+            def _node_xy(i: int) -> Optional[Tuple[float, float]]:
+                if not (0 <= i < len(nodes)):
+                    return None
+                row = nodes[i]
+                if not isinstance(row, dict):
+                    return None
+                try:
+                    return float(row["x"]), float(row["y"])
+                except (KeyError, TypeError, ValueError):
+                    return None
+
+            def _orient_path_uv(pl: List[Tuple[float, float]], u: int, v: int) -> List[Tuple[float, float]]:
+                if len(pl) < 2:
+                    return pl
+                pu = _node_xy(u)
+                pv = _node_xy(v)
+                if pu is None or pv is None:
+                    return pl
+                fwd = math.hypot(pl[0][0] - pu[0], pl[0][1] - pu[1]) + math.hypot(pl[-1][0] - pv[0], pl[-1][1] - pv[1])
+                rev = math.hypot(pl[0][0] - pv[0], pl[0][1] - pv[1]) + math.hypot(pl[-1][0] - pu[0], pl[-1][1] - pu[1])
+                return list(reversed(pl)) if rev + 1e-6 < fwd else pl
+
+            seg_order: List[int] = []
+            path_full: List[Tuple[float, float]] = []
+            for j in range(len(chain) - 1):
+                u, v = int(chain[j]), int(chain[j + 1])
+                k = DripCAD._trunk_map_segment_index_for_node_pair(segs, u, v)
+                if k is None:
+                    return None
+                seg_order.append(int(k))
+                pl = self._trunk_segment_world_path(segs[int(k)])
+                if len(pl) < 2:
+                    return None
+                pl = _orient_path_uv(pl, u, v)
+                if not path_full:
+                    path_full.extend(pl)
+                elif DripCAD._trunk_point_equal(path_full[-1], pl[0]):
+                    path_full.extend(pl[1:])
+                else:
+                    path_full.extend(pl)
+            if len(path_full) < 2:
+                return None
+            return {
+                "mode": "branch",
+                "path_world": path_full,
+                "total_len_m": float(self._polyline_length_m(path_full)),
+                "n_edges": int(len(seg_order)),
+                "node_chain": chain,
+                "seg_indices": seg_order,
+            }
+
+        if bool(along_branch):
+            br_try = _active_branch_path_for_slot()
+            if (
+                isinstance(br_try, dict)
+                and int(br_try.get("n_edges", 0) or 0) > 1
+                and isinstance(br_try.get("node_chain"), list)
+                and isinstance(br_try.get("path_world"), list)
+            ):
+                try:
+                    nch = [int(c) for c in (br_try.get("node_chain") or [])]
+                except (TypeError, ValueError):
+                    nch = []
+                path_w_raw = br_try.get("path_world") or []
+                path_w: List[Tuple[float, float]] = []
+                for p in path_w_raw:
+                    if not isinstance(p, (list, tuple)) or len(p) < 2:
+                        path_w = []
+                        break
+                    try:
+                        path_w.append((float(p[0]), float(p[1])))
+                    except (TypeError, ValueError):
+                        path_w = []
+                        break
+                if len(path_w) >= 2 and len(nch) >= 2:
+                    br = br_try
+                    pressure_branch_multi = True
+                    seg = {"node_indices": nch}
+                    path = path_w
+
+        total_len = float(self._polyline_length_m(path))
+        if total_len <= 1e-6:
+            silent_showwarning(self.root, "Напір вздовж ребра", "Довжина відрізка ≈ 0 м.")
+            return
         heads = self._trunk_segment_pressure_heads_polyline_order_m(seg, slot_row, nodes)
         if heads is None:
             silent_showwarning(
@@ -4750,17 +4919,22 @@ class DripCAD:
         hq = self._trunk_hw_pressure_pieces_along_polyline(seg, path, slot_row, nodes)
         use_hw_telescope = hq is not None
         if use_hw_telescope:
-            profile_pieces, q_edge = hq
+            profile_pieces = hq
+            try:
+                q_edge = max(0.0, max(float(p[5]) for p in profile_pieces if len(p) >= 6))
+            except (TypeError, ValueError):
+                q_edge = 0.0
         else:
             try:
                 d_lin = float(hover.get("d_inner_mm", seg.get("d_inner_mm", 90.0)) or 90.0)
             except (TypeError, ValueError):
                 d_lin = 90.0
-            profile_pieces = [(0.0, total_len, h0, h1, d_lin)]
+            profile_pieces = [(0.0, total_len, h0, h1, d_lin, 0.0)]
             try:
                 q_edge = float(hover.get("q_m3s", 0.0) or 0.0)
             except (TypeError, ValueError):
                 q_edge = 0.0
+            profile_pieces = [(0.0, total_len, h0, h1, d_lin, float(q_edge))]
         if q_edge <= 1e-18:
             try:
                 q_edge = float(hover.get("q_m3s", 0.0) or 0.0)
@@ -4780,7 +4954,7 @@ class DripCAD:
         psi_vals = [
             DripCAD._trunk_bernoulli_psi_static_m(
                 head_vals[i],
-                q_edge,
+                DripCAD._trunk_q_m3s_at_s_on_pieces(d_vals[i], profile_pieces, q_edge),
                 DripCAD._trunk_d_inner_mm_at_s_on_pieces(d_vals[i], profile_pieces),
             )
             for i in range(len(d_vals))
@@ -5104,10 +5278,11 @@ class DripCAD:
                 dp = max(0.0, min(float(d_probe), total_len))
                 hp = float(DripCAD._trunk_head_at_s_on_pieces(dp, profile_pieces))
                 dpr = DripCAD._trunk_d_inner_mm_at_s_on_pieces(dp, profile_pieces)
+                q_local = DripCAD._trunk_q_m3s_at_s_on_pieces(dp, profile_pieces, q_edge)
                 od_probe = self._trunk_pipe_row_outer_d_mm_str(None, seg, float(dpr))
                 if not od_probe or od_probe == "—":
                     od_probe = f"{float(dpr):.0f}"
-                psip = float(DripCAD._trunk_bernoulli_psi_static_m(hp, q_edge, dpr))
+                psip = float(DripCAD._trunk_bernoulli_psi_static_m(hp, q_local, dpr))
                 xp = sx(dp)
                 p_psi = panel_by_id.get("psi")
                 yp = sy_for_panel(p_psi, psip) if p_psi is not None else chart_bottom * 0.5
@@ -5192,7 +5367,7 @@ class DripCAD:
                     ("v²/2g", f"{vq_p:.4f} м"),
                     ("ψ", f"{psip:.2f} м"),
                     ("Ø", f"{od_probe} мм"),
-                    ("Q", f"{q_edge:.4f} м³/с"),
+                    ("Q", f"{q_local:.4f} м³/с"),
                 ]
                 if has_relief:
                     try:
@@ -5316,36 +5491,22 @@ class DripCAD:
             if not br or not isinstance(br.get("seg_indices"), list) or not isinstance(br.get("node_chain"), list):
                 return None
             seg_order = [int(x) for x in (br.get("seg_indices") or [])]
-            node_chain = [int(x) for x in (br.get("node_chain") or [])]
-            if len(seg_order) < 1 or len(node_chain) < 2:
+            if len(seg_order) < 1:
                 return None
             acc = 0.0
             last_candidate: Optional[Tuple[int, float]] = None
-            for j, seg_idx in enumerate(seg_order):
+            for seg_idx in seg_order:
                 if not (0 <= int(seg_idx) < len(segs)):
                     continue
-                display_len = 0.0
-                if j + 1 < len(node_chain):
-                    try:
-                        na = nodes[int(node_chain[j])]
-                        nb = nodes[int(node_chain[j + 1])]
-                        display_len = math.hypot(
-                            float(nb["x"]) - float(na["x"]),
-                            float(nb["y"]) - float(na["y"]),
-                        )
-                    except (KeyError, TypeError, ValueError, IndexError):
-                        display_len = 0.0
                 edge_path = self._trunk_segment_world_path(segs[int(seg_idx)])
                 edge_len = float(self._polyline_length_m(edge_path)) if len(edge_path) >= 2 else 0.0
-                if display_len <= 1e-9:
-                    display_len = edge_len
-                if display_len <= 1e-9 or edge_len <= 1e-9:
+                if edge_len <= 1e-9:
                     continue
-                local = max(0.0, min(edge_len, ((d - acc) / display_len) * edge_len))
+                local = max(0.0, min(edge_len, d - acc))
                 last_candidate = (int(seg_idx), local)
-                if d <= acc + display_len + 1e-9:
+                if d <= acc + edge_len + 1e-9:
                     return last_candidate
-                acc += display_len
+                acc += edge_len
             return last_candidate
 
         def _insert_picket_from_chart_event(ev: tk.Event) -> None:
