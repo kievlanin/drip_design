@@ -1783,8 +1783,6 @@ class ControlPanel:
     def _ensure_schedule_trunk_field_vars(self) -> None:
         """StringVar для параметрів магістралі (віджети на правій панелі «Магістраль»)."""
         if hasattr(self, "var_schedule_max_pump_head_m"):
-            if not hasattr(self, "var_trunk_picket_head_m"):
-                self.var_trunk_picket_head_m = tk.StringVar(value="60")
             return
         self.var_schedule_max_pump_head_m = tk.StringVar(value="50")
         self.var_schedule_trunk_v_max_mps = tk.StringVar(value="0")
@@ -1794,7 +1792,6 @@ class ControlPanel:
         self.var_schedule_use_fixed_trunk_pipes = tk.BooleanVar(value=False)
         self.var_schedule_test_q_m3h = tk.StringVar(value="60")
         self.var_schedule_test_h_m = tk.StringVar(value="40")
-        self.var_trunk_picket_head_m = tk.StringVar(value="60")
 
     def build_trunk_hw_tab(self) -> None:
         """Вкладка керування: розрахунок магістралі за поливами (HW). Інструменти траси — зліва, вкладка «Магістраль»."""
@@ -1824,120 +1821,6 @@ class ControlPanel:
             wraplength=300,
             justify=tk.LEFT,
         ).pack(anchor=tk.W, pady=(0, 8))
-
-        app = self.app
-        _show_trunk_map_tools = hasattr(app, "add_trunk_picket_at_head_drop") or hasattr(
-            app, "apply_trunk_display_velocity_warn_from_ui"
-        )
-        lf_trunk_map = None
-        if _show_trunk_map_tools:
-            lf_trunk_map = tk.LabelFrame(
-                wrap,
-                text="На полотні / карті",
-                bg="#181818",
-                fg="#88DDFF",
-                font=("Segoe UI", 8, "bold"),
-            )
-            lf_trunk_map.pack(fill=tk.X, pady=(0, 8))
-        _inner_map = tk.Frame(lf_trunk_map, bg="#181818") if lf_trunk_map else None
-        if _inner_map is not None:
-            _inner_map.pack(fill=tk.X, padx=6, pady=4)
-        if hasattr(app, "add_trunk_picket_at_head_drop") and _inner_map is not None:
-            row_h = tk.Frame(_inner_map, bg="#181818")
-            row_h.pack(fill=tk.X, pady=(0, 4))
-            tk.Label(
-                row_h,
-                text="H, м:",
-                bg="#181818",
-                fg="#9CC6E6",
-                font=("Segoe UI", 8, "bold"),
-            ).pack(side=tk.LEFT, padx=(0, 4))
-            ent_ph = tk.Entry(
-                row_h,
-                textvariable=self.var_trunk_picket_head_m,
-                width=7,
-                bg="#333333",
-                fg="#ECEFF1",
-                font=("Consolas", 10, "bold"),
-                insertbackground="white",
-            )
-            ent_ph.pack(side=tk.LEFT, padx=(0, 6))
-
-            def _run_add_trunk_picket_at_h() -> None:
-                raw = str(self.var_trunk_picket_head_m.get()).replace(",", ".").strip()
-                try:
-                    hv = float(raw)
-                except (TypeError, ValueError):
-                    self.var_trunk_picket_head_m.set("60")
-                    hv = 60.0
-                hv = max(0.0, min(400.0, hv))
-                self.var_trunk_picket_head_m.set(str(hv).rstrip("0").rstrip("."))
-                app.add_trunk_picket_at_head_drop(hv)
-
-            btn_ph = tk.Button(
-                row_h,
-                text="➕ Пікет @ H",
-                command=_run_add_trunk_picket_at_h,
-                bg="#1e2f44",
-                fg="#B3E5FC",
-                relief=tk.FLAT,
-                font=("Segoe UI", 8, "bold"),
-            )
-            btn_ph.pack(side=tk.LEFT, fill=tk.X, expand=True)
-            self._attach_tooltip(
-                btn_ph,
-                "За результатами «Магістраль за поливами» знайти точку падіння до введеного H (м) у peak-слоті й вставити пікет, розірвавши ребро.",
-            )
-            self._attach_tooltip(
-                ent_ph,
-                "Цільовий напір H (м), у точці якого вставляється пікет.",
-            )
-        if hasattr(app, "apply_trunk_display_velocity_warn_from_ui") and _inner_map is not None:
-            if hasattr(app, "normalize_consumer_schedule"):
-                app.normalize_consumer_schedule()
-            row_vw = tk.Frame(_inner_map, bg="#181818")
-            row_vw.pack(fill=tk.X, pady=(2, 0))
-            tk.Label(
-                row_vw,
-                text="Vmax≥",
-                bg="#181818",
-                fg="#E57373",
-                font=("Segoe UI", 8, "bold"),
-            ).pack(side=tk.LEFT, padx=(0, 4))
-            if hasattr(app, "var_trunk_display_velocity_warn_mps"):
-                try:
-                    vv0 = float(app.consumer_schedule.get("trunk_display_velocity_warn_mps", 0.0) or 0.0)
-                    app.var_trunk_display_velocity_warn_mps.set("0" if vv0 < 1e-12 else f"{vv0:g}")
-                except (tk.TclError, TypeError, ValueError):
-                    pass
-            ent_vw = tk.Entry(
-                row_vw,
-                textvariable=app.var_trunk_display_velocity_warn_mps,
-                width=5,
-                bg="#333333",
-                fg="#ECEFF1",
-                font=("Consolas", 10, "bold"),
-                insertbackground="white",
-            )
-            ent_vw.pack(side=tk.LEFT, padx=(0, 4))
-
-            def _apply_vw(_event=None) -> None:
-                app.apply_trunk_display_velocity_warn_from_ui()
-
-            ent_vw.bind("<Return>", _apply_vw)
-            ent_vw.bind("<FocusOut>", _apply_vw)
-            tk.Label(
-                row_vw,
-                text="м/с",
-                bg="#181818",
-                fg="#B0BEC5",
-                font=("Segoe UI", 8),
-            ).pack(side=tk.LEFT)
-            self._attach_tooltip(
-                ent_vw,
-                "Поріг для підсвітки магістралі: v ≥ Vmax (м/с) за останнім розрахунком «Магістраль за поливами». "
-                "0 — вимкнено. Не впливає на підбір труб (оптимізація лише за ΔH і каталогом).",
-            )
 
         calc = tk.Frame(wrap, bg="#181818", highlightthickness=1, highlightbackground="#3d3d3d")
         calc.pack(fill=tk.BOTH, expand=True, padx=4, pady=(0, 4))

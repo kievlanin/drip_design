@@ -31,7 +31,11 @@ from .pipe_weight_optimizer import (
     optimize_fixed_topology_by_weight,
     optimize_single_line_allocation_by_weight,
 )
-from .hydraulics_constants import hazen_c_from_pipe_entry
+from .allowed_pipes_common import (
+    allowed_pipe_candidates_sorted_common,
+    normalize_allowed_pipes_map_common,
+    pn_sort_tuple_common,
+)
 from .trunk_tree_compute import (
     TrunkTreeEdge,
     TrunkTreeNode,
@@ -1222,80 +1226,18 @@ def compute_trunk_irrigation_schedule_hydro(
 
 def _normalize_allowed_pipes_map_simple(ap: Any) -> Dict[str, Any]:
     """Легка копія normalize_allowed_pipes_map без залежності від hydraulics_core (shapely)."""
-    out: Dict[str, Any] = {}
-    if not isinstance(ap, dict):
-        return out
-    for mat, pns in ap.items():
-        if not isinstance(pns, dict):
-            continue
-        mkey = str(mat).strip()
-        if not mkey:
-            continue
-        sub: Dict[str, Any] = {}
-        for pn, ods in pns.items():
-            if not isinstance(ods, list):
-                continue
-            pk = str(pn).strip()
-            olist = [str(o).strip() for o in ods if str(o).strip()]
-            sub[pk] = olist
-        if sub:
-            out[mkey] = sub
-    return out
+    return normalize_allowed_pipes_map_common(ap)
 
 
 def _pn_sort_tuple_simple(pn_val: Any) -> Tuple[Any, Any]:
-    s = str(pn_val).replace(",", ".").strip()
-    try:
-        return (0, float(s))
-    except ValueError:
-        return (1, s)
+    return pn_sort_tuple_common(pn_val)
 
 
 def _allowed_pipe_candidates_sorted_trunk(
     eff_allowed: Mapping[str, Any], pipes_db: Mapping[str, Any]
 ) -> List[Dict[str, Any]]:
     """Плоский список дозволених позицій каталогу (як allowed_pipe_candidates_sorted), без shapely."""
-    out: List[Dict[str, Any]] = []
-    eff = _normalize_allowed_pipes_map_simple(eff_allowed) or {}
-    pdb = dict(pipes_db)
-    for mat, pns in eff.items():
-        mat_db = pdb.get(mat)
-        if not isinstance(mat_db, dict):
-            continue
-        if not isinstance(pns, dict):
-            continue
-        for pn, ods in pns.items():
-            if not isinstance(ods, list) or not ods:
-                continue
-            avail = mat_db.get(str(pn), {})
-            if not avail:
-                continue
-            allowed_set = {str(o).strip() for o in ods if str(o).strip()}
-            for d_nom, pipe_data in avail.items():
-                if str(d_nom).strip() not in allowed_set:
-                    continue
-                d_inner = float(
-                    pipe_data.get("id", float(d_nom))
-                    if isinstance(pipe_data, dict)
-                    else float(d_nom)
-                )
-                color = (
-                    pipe_data.get("color", "#FFFFFF")
-                    if isinstance(pipe_data, dict)
-                    else "#FFFFFF"
-                )
-                out.append(
-                    {
-                        "mat": str(mat),
-                        "pn": str(pn),
-                        "d": int(float(d_nom)),
-                        "inner": d_inner,
-                        "color": color,
-                        "c_hw": hazen_c_from_pipe_entry(pipe_data),
-                    }
-                )
-    out.sort(key=lambda c: (c["inner"], c["mat"], _pn_sort_tuple_simple(c["pn"]), c["d"]))
-    return out
+    return allowed_pipe_candidates_sorted_common(eff_allowed, pipes_db)
 
 
 def estimate_min_pump_head_m_uniform_largest_allowed_pipe(

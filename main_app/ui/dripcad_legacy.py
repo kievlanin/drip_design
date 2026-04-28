@@ -212,7 +212,7 @@ class DripCAD:
         self.scene_lines = []
         # Вузли магістралі на карті (WGS84 + локальні XY); kind: source | bend | junction | consumption — у JSON (застарілий valve нормалізується при завантаженні).
         self.trunk_map_nodes = []
-        # Відрізки магістралі: один запис = одне ребро (два вузли); path_local дзеркалить кінці вузлів (пряма труба).
+        # Відрізки магістралі: один запис = одне ребро (два вузли); path_local може зберігати реальну полілінію траси.
         self.trunk_map_segments = []
         self._trunk_route_last_node_idx = None
         self._trunk_panel_active_offcanvas = False
@@ -249,6 +249,7 @@ class DripCAD:
         self._canvas_trunk_draft_world = None
         self._canvas_polyline_draft = []
         self._canvas_trunk_route_draft_indices = []
+        self._canvas_trunk_route_draft_world = []
         # Траса труби (ребра): ЛКМ+ПКМ на вузлі — кінець; далі ЛКМ — початок і ламана; ПКМ — з’єднати з кінцем.
         self._trunk_route_endpoint_pending_idx: Optional[int] = None
         self._trunk_route_edge_end_idx: Optional[int] = None
@@ -1216,6 +1217,7 @@ class DripCAD:
             self._canvas_trunk_draft_world = None
             self._canvas_polyline_draft = []
             self._canvas_trunk_route_draft_indices = []
+            self._canvas_trunk_route_draft_world = []
             self._trunk_route_endpoint_pending_idx = None
             self._trunk_route_edge_end_idx = None
             self._cancel_trunk_node_drag()
@@ -1279,6 +1281,7 @@ class DripCAD:
             self._canvas_polyline_draft = []
             if not preserve_trunk_chain_draft:
                 self._canvas_trunk_route_draft_indices = []
+                self._canvas_trunk_route_draft_world = []
                 self._trunk_route_endpoint_pending_idx = None
                 self._trunk_route_edge_end_idx = None
             self.redraw()
@@ -1308,6 +1311,7 @@ class DripCAD:
         self._canvas_trunk_draft_world = None
         self._canvas_polyline_draft = []
         self._canvas_trunk_route_draft_indices = []
+        self._canvas_trunk_route_draft_world = []
         self._trunk_route_endpoint_pending_idx = None
         self._trunk_route_edge_end_idx = None
         self._canvas_selection_keys = []
@@ -1475,7 +1479,7 @@ class DripCAD:
         self.redraw()
 
     def sync_trunk_segment_paths_from_nodes(self) -> None:
-        """Оновлює path_local: для ребра з двома вузлами — лише прямий відрізок між ними (топологія = граф)."""
+        """Оновлює кінці path_local за вузлами, не затираючи реальну полілінію двовузлового ребра."""
         nodes = list(getattr(self, "trunk_map_nodes", []) or [])
         for seg in list(getattr(self, "trunk_map_segments", []) or []):
             if not isinstance(seg, dict):
@@ -1495,7 +1499,24 @@ class DripCAD:
                     bx, by = float(nodes[ib]["x"]), float(nodes[ib]["y"])
                 except (KeyError, TypeError, ValueError):
                     continue
-                seg["path_local"] = [(ax, ay), (bx, by)]
+                path_local: List[Tuple[float, float]] = []
+                raw_path = seg.get("path_local")
+                if isinstance(raw_path, list):
+                    for p in raw_path:
+                        if not isinstance(p, (list, tuple)) or len(p) < 2:
+                            path_local = []
+                            break
+                        try:
+                            path_local.append((float(p[0]), float(p[1])))
+                        except (TypeError, ValueError):
+                            path_local = []
+                            break
+                if len(path_local) >= 2:
+                    path_local[0] = (ax, ay)
+                    path_local[-1] = (bx, by)
+                    seg["path_local"] = path_local
+                else:
+                    seg["path_local"] = [(ax, ay), (bx, by)]
                 continue
             path: list = []
             ok = True
@@ -3470,6 +3491,121 @@ class DripCAD:
             raise ValueError("Failed to split polyline")
         return left, right, split_pt
 
+    def _insert_trunk_picket_on_segment_at_distance(
+        self,
+        segment_index: int,
+        split_dist_m: float,
+        *,
+        show_message: bool = True,
+        message_prefix: str = "Додано пікет",
+    ) -> bool:
+        """Вставити bend у вибране ребро на відстані вздовж його реального path_local."""
+        nodes = list(getattr(self, "trunk_map_nodes", []) or [])
+        segs = list(getattr(self, "trunk_map_segments", []) or [])
+        try:
+            si = int(segment_index)
+        except (TypeError, ValueError):
+            silent_showwarning(self.root, "Магістраль", "Некоректний індекс ребра для вставки пікета.")
+            return False
+        if not (0 <= si < len(segs)):
+            silent_showwarning(self.root, "Магістраль", "Ребро для вставки пікета не знайдено.")
+            return False
+        seg = segs[si]
+        if not isinstance(seg, dict):
+            silent_showwarning(self.root, "Магістраль", "Некоректне ребро для вставки пікета.")
+            return False
+        ni = seg.get("node_indices")
+        if not isinstance(ni, list) or len(ni) != 2:
+            silent_showwarning(self.root, "Магістраль", "Пікет можна вставити лише у канонічне ребро з двома вузлами.")
+            return False
+        try:
+            a, b = int(ni[0]), int(ni[1])
+        except (TypeError, ValueError):
+            silent_showwarning(self.root, "Магістраль", "Некоректні вузли ребра.")
+            return False
+        if not (0 <= a < len(nodes) and 0 <= b < len(nodes)):
+            silent_showwarning(self.root, "Магістраль", "Вузли ребра не знайдено.")
+            return False
+        path = self._trunk_segment_world_path(seg)
+        if len(path) < 2:
+            silent_showwarning(self.root, "Магістраль", "Некоректна геометрія ребра.")
+            return False
+        plen = self._polyline_length_m(path)
+        if plen <= 1e-9:
+            silent_showwarning(self.root, "Магістраль", "Довжина ребра ≈ 0 м.")
+            return False
+        try:
+            left_path, right_path, split_pt = self._split_polyline_at_dist(path, float(split_dist_m))
+        except ValueError as ex:
+            silent_showwarning(self.root, "Магістраль", f"Не вдалося вставити пікет: {ex}")
+            return False
+        new_node: Dict[str, object] = {
+            "kind": "bend",
+            "x": float(split_pt[0]),
+            "y": float(split_pt[1]),
+        }
+        try:
+            from modules.geo_module import srtm_tiles
+
+            gr = getattr(self, "geo_ref", None)
+            if gr and len(gr) >= 2:
+                ref_lon, ref_lat = float(gr[0]), float(gr[1])
+                lat, lon = srtm_tiles.local_xy_to_lat_lon(
+                    float(split_pt[0]), float(split_pt[1]), ref_lon, ref_lat
+                )
+                new_node["lat"] = float(lat)
+                new_node["lon"] = float(lon)
+        except Exception:
+            pass
+        if "lat" not in new_node or "lon" not in new_node:
+            try:
+                n0 = nodes[a]
+                n1 = nodes[b]
+                la0, lo0 = float(n0.get("lat")), float(n0.get("lon"))
+                la1, lo1 = float(n1.get("lat")), float(n1.get("lon"))
+                frac = max(0.0, min(1.0, float(split_dist_m) / max(plen, 1e-9)))
+                new_node["lat"] = la0 + (la1 - la0) * frac
+                new_node["lon"] = lo0 + (lo1 - lo0) * frac
+            except Exception:
+                pass
+        new_idx = len(nodes)
+        nodes.append(new_node)
+        pipe_keys = ("d_inner_mm", "c_hw", "pipe_material", "pipe_pn", "pipe_od", "bom_length_zero")
+        attrs = {k: seg[k] for k in pipe_keys if k in seg}
+        seg_left = {"node_indices": [a, new_idx], "path_local": left_path, **attrs}
+        seg_right = {"node_indices": [new_idx, b], "path_local": right_path, **attrs}
+        new_segs = [s for i, s in enumerate(segs) if i != si]
+        new_segs.extend([seg_left, seg_right])
+        self.trunk_map_nodes = nodes
+        self.trunk_map_segments = new_segs
+        ensure_trunk_node_ids(self.trunk_map_nodes)
+        new_id = str(self.trunk_map_nodes[new_idx].get("id", "")).strip()
+        self._trunk_last_inserted_node_id = new_id if new_id else None
+        self.sync_trunk_segment_paths_from_nodes()
+        self.trunk_irrigation_hydro_cache = None
+        try:
+            self.sync_trunk_tree_data_from_trunk_map()
+        except Exception:
+            pass
+        self.redraw()
+        try:
+            self._schedule_embedded_map_overlay_refresh()
+        except Exception:
+            pass
+        try:
+            if self._trunk_last_inserted_node_id:
+                self._focus_trunk_node_after_insert(self._trunk_last_inserted_node_id)
+        except Exception:
+            pass
+        if show_message:
+            silent_showinfo(
+                self.root,
+                "Магістраль",
+                f"{message_prefix} на s={float(split_dist_m):.1f} м від початку ребра. "
+                "Перерахуйте гідравліку магістралі.",
+            )
+        return True
+
     def add_trunk_picket_at_head_drop(self, target_head_m: float = 60.0) -> bool:
         """
         Додати пікет (bend), розірвавши одне ребро у точці, де за розрахунком поливів H перетинає target_head_m.
@@ -3753,6 +3889,10 @@ class DripCAD:
                 m.add_command(
                     label="Графік тиску вздовж ребра",
                     command=lambda s=si: self.open_trunk_segment_pressure_profile(s),
+                )
+                m.add_command(
+                    label="Графік тиску вздовж гілки від насоса…",
+                    command=lambda s=si: self.open_trunk_segment_pressure_profile(s, along_branch=True),
                 )
                 m.add_separator()
                 m.add_command(
@@ -4356,10 +4496,13 @@ class DripCAD:
             u, v = idxs[j], idxs[j + 1]
             id_u, id_v = _nid(u), _nid(v)
             try:
-                leg_geom = math.hypot(
-                    float(path[j + 1][0]) - float(path[j][0]),
-                    float(path[j + 1][1]) - float(path[j][1]),
-                )
+                if len(idxs) == 2:
+                    leg_geom = float(DripCAD._polyline_length_m(path))
+                else:
+                    leg_geom = math.hypot(
+                        float(path[j + 1][0]) - float(path[j][0]),
+                        float(path[j + 1][1]) - float(path[j][1]),
+                    )
             except (TypeError, ValueError):
                 return None
             if leg_geom <= 1e-9:
@@ -4498,7 +4641,12 @@ class DripCAD:
         v = float(q_m3s) / area
         return float(h_line_m) - (v * v) / (2.0 * g)
 
-    def open_trunk_segment_pressure_profile(self, segment_index: Optional[int] = None) -> None:
+    def open_trunk_segment_pressure_profile(
+        self,
+        segment_index: Optional[int] = None,
+        *,
+        along_branch: bool = False,
+    ) -> None:
         """Графік ψ(s)=H−v²/(2g) (Бернуллі, статична складова), H(s) пунктиром, ΔZ(s) по рельєфу; сітка 10 м + стики HW."""
         if segment_index is None:
             si = self._selected_trunk_segment_index()
@@ -4521,7 +4669,7 @@ class DripCAD:
         nodes = list(getattr(self, "trunk_map_nodes", []) or [])
         raw_seg = segs[si] if isinstance(segs[si], dict) else {}
         seg = raw_seg
-        br = self._trunk_combined_path_from_pump_for_segment(si)
+        br = self._trunk_combined_path_from_pump_for_segment(si) if bool(along_branch) else None
         pressure_branch_multi = False
         if (
             br
@@ -4747,7 +4895,7 @@ class DripCAD:
         if pressure_branch_multi and br and int(br.get("n_edges", 1) or 0) > 1:
             ne = int(br.get("n_edges", 1) or 0)  # type: ignore[union-attr]
             win.title(
-                f"Напір вздовж гілки · {ne} рёбр (від насоса) · L≈{total_len:.0f} м · полив #{int(dom_slot) + 1}"
+                f"Напір вздовж гілки · {ne} ребер (від насоса) · L≈{total_len:.0f} м · полив #{int(dom_slot) + 1}"
             )
         else:
             win.title(f"Напір вздовж ребра · відрізок #{si + 1} · полив #{int(dom_slot) + 1}")
@@ -5155,6 +5303,86 @@ class DripCAD:
             self._set_trunk_profile_probe(None, None, None)
             _draw_chart()
 
+        def _distance_from_chart_event(ev: tk.Event) -> float:
+            ml = float(geom["ml"])
+            pw = float(geom["pw"])
+            xm = max(ml, min(ml + pw, float(ev.x)))
+            return max(0.0, min(((xm - ml) / max(1e-6, pw)) * total_len, total_len))
+
+        def _segment_and_local_dist_for_profile_s(profile_s: float) -> Optional[Tuple[int, float]]:
+            d = max(0.0, min(float(profile_s), total_len))
+            if not pressure_branch_multi:
+                return int(si), d
+            if not br or not isinstance(br.get("seg_indices"), list) or not isinstance(br.get("node_chain"), list):
+                return None
+            seg_order = [int(x) for x in (br.get("seg_indices") or [])]
+            node_chain = [int(x) for x in (br.get("node_chain") or [])]
+            if len(seg_order) < 1 or len(node_chain) < 2:
+                return None
+            acc = 0.0
+            last_candidate: Optional[Tuple[int, float]] = None
+            for j, seg_idx in enumerate(seg_order):
+                if not (0 <= int(seg_idx) < len(segs)):
+                    continue
+                display_len = 0.0
+                if j + 1 < len(node_chain):
+                    try:
+                        na = nodes[int(node_chain[j])]
+                        nb = nodes[int(node_chain[j + 1])]
+                        display_len = math.hypot(
+                            float(nb["x"]) - float(na["x"]),
+                            float(nb["y"]) - float(na["y"]),
+                        )
+                    except (KeyError, TypeError, ValueError, IndexError):
+                        display_len = 0.0
+                edge_path = self._trunk_segment_world_path(segs[int(seg_idx)])
+                edge_len = float(self._polyline_length_m(edge_path)) if len(edge_path) >= 2 else 0.0
+                if display_len <= 1e-9:
+                    display_len = edge_len
+                if display_len <= 1e-9 or edge_len <= 1e-9:
+                    continue
+                local = max(0.0, min(edge_len, ((d - acc) / display_len) * edge_len))
+                last_candidate = (int(seg_idx), local)
+                if d <= acc + display_len + 1e-9:
+                    return last_candidate
+                acc += display_len
+            return last_candidate
+
+        def _insert_picket_from_chart_event(ev: tk.Event) -> None:
+            profile_s = _distance_from_chart_event(ev)
+            target = _segment_and_local_dist_for_profile_s(profile_s)
+            if target is None:
+                silent_showwarning(self.root, "Магістраль", "Не вдалося визначити ребро під позицією графіка.")
+                return
+            seg_idx, local_s = target
+            m = tk.Menu(win, tearoff=0)
+            label = f"Вставити пікет тут (s≈{profile_s:.1f} м)"
+            if pressure_branch_multi:
+                label += f" · ребро #{int(seg_idx) + 1}"
+            m.add_command(
+                label=label,
+                command=lambda sidx=int(seg_idx), sd=float(local_s), ps=float(profile_s): _do_insert_picket_from_chart(
+                    sidx, sd, ps
+                ),
+            )
+            try:
+                m.tk_popup(int(ev.x_root), int(ev.y_root))
+            finally:
+                try:
+                    m.grab_release()
+                except tk.TclError:
+                    pass
+
+        def _do_insert_picket_from_chart(seg_idx: int, local_s: float, profile_s: float) -> None:
+            ok = self._insert_trunk_picket_on_segment_at_distance(
+                int(seg_idx),
+                float(local_s),
+                show_message=True,
+                message_prefix=f"Додано пікет з графіка (s≈{float(profile_s):.1f} м)",
+            )
+            if ok:
+                _on_close()
+
         def _apply_vscale(_ev=None) -> None:
             _persist_vscales()
             for cid, var in var_vscale_by_id.items():
@@ -5176,6 +5404,7 @@ class DripCAD:
         cv.bind("<Motion>", _on_motion, add="+")
         cv.bind("<Enter>", _on_motion, add="+")
         cv.bind("<Leave>", _on_leave, add="+")
+        cv.bind("<Button-3>", _insert_picket_from_chart_event, add="+")
         win.protocol("WM_DELETE_WINDOW", _on_close)
         _draw_chart()
 
@@ -6219,6 +6448,7 @@ class DripCAD:
             self._canvas_trunk_draft_world = None
             self._canvas_polyline_draft = []
             self._canvas_trunk_route_draft_indices = []
+            self._canvas_trunk_route_draft_world = []
             self._trunk_route_endpoint_pending_idx = None
             self._trunk_route_edge_end_idx = None
             if not self._ensure_embedded_map_panel():
@@ -6811,6 +7041,8 @@ class DripCAD:
             return True
         if len(getattr(self, "_canvas_trunk_route_draft_indices", []) or []) > 0:
             return True
+        if len(getattr(self, "_canvas_trunk_route_draft_world", []) or []) > 0:
+            return True
         if getattr(self, "_trunk_route_endpoint_pending_idx", None) is not None:
             return True
         if getattr(self, "_trunk_route_edge_end_idx", None) is not None:
@@ -6828,6 +7060,7 @@ class DripCAD:
             self._canvas_trunk_draft_world = None
             self._canvas_polyline_draft = []
             self._canvas_trunk_route_draft_indices = []
+            self._canvas_trunk_route_draft_world = []
             self._trunk_route_endpoint_pending_idx = None
             self._trunk_route_edge_end_idx = None
             if getattr(self, "_canvas_special_tool", None) in _CANVAS_TRUNK_POINT_TOOLS:
@@ -11927,15 +12160,23 @@ class DripCAD:
         """Жорсткий радіус прив’язки до вузла магістралі у world-метрах (без залежності від zoom)."""
         return float(_TRUNK_NODE_SNAP_CANVAS_M)
 
+    def _trunk_route_snap_radius_m(self) -> float:
+        """Більш «липкий» snap для трасування ребер магістралі (стабільний у px)."""
+        return max(self._trunk_snap_radius_m(), self._world_m_from_screen_px(18.0))
+
     def _pick_tolerance_m(self, min_m: float, px: float = 22.0) -> float:
         """Поріг попадання в об’єкт при підборі: мінімум у метрах або ~px пікселів на полотні."""
         return max(min_m, self._world_m_from_screen_px(px))
 
-    def _nearest_trunk_node_index_world(self, wx: float, wy: float):
+    def _nearest_trunk_node_index_world(self, wx: float, wy: float, snap_radius_m: Optional[float] = None):
         nodes = list(getattr(self, "trunk_map_nodes", []) or [])
         if not nodes:
             return None, None
-        r_snap = self._trunk_snap_radius_m()
+        r_snap = (
+            float(snap_radius_m)
+            if snap_radius_m is not None
+            else self._trunk_snap_radius_m()
+        )
         best_i = None
         best_d = r_snap + 1.0
         for i, node in enumerate(nodes):
@@ -11954,10 +12195,17 @@ class DripCAD:
 
     def _trunk_route_preview_snap(self, wx: float, wy: float) -> Tuple[Optional[int], bool]:
         """(індекс вузла в радіусі snap або None, чи ЛКМ зараз додасть вузол без відмови)."""
-        ni, _dist = self._nearest_trunk_node_index_world(wx, wy)
+        ni, _dist = self._nearest_trunk_node_index_world(
+            wx,
+            wy,
+            snap_radius_m=self._trunk_route_snap_radius_m(),
+        )
         if ni is None:
             return None, False
+        end_idx = getattr(self, "_trunk_route_edge_end_idx", None)
         draft_i = list(getattr(self, "_canvas_trunk_route_draft_indices", []) or [])
+        if not draft_i and end_idx is not None and int(ni) == int(end_idx):
+            return ni, False
         if draft_i and ni == draft_i[-1]:
             return ni, False
         return ni, True
@@ -11984,6 +12232,7 @@ class DripCAD:
     def _finish_canvas_trunk_route_segment_to_end(self, end_idx: int) -> None:
         """Фіксує одне ребро-трубу: чернетка ламаної + вузол кінця; path_local = реальна трас."""
         draft = list(getattr(self, "_canvas_trunk_route_draft_indices", []) or [])
+        draft_world = list(getattr(self, "_canvas_trunk_route_draft_world", []) or [])
         nodes = list(getattr(self, "trunk_map_nodes", []) or [])
         if len(draft) < 1:
             silent_showwarning(self.root, "Магістраль", "Додайте хоча б початкову вершину труби (ЛКМ).")
@@ -11998,21 +12247,38 @@ class DripCAD:
             silent_showwarning(self.root, "Магістраль", "Потрібні щонайменше дві різні вершини (початок і кінець).")
             return
         path_local: List[Tuple[float, float]] = []
-        for ii in idxs:
-            if not (0 <= ii < len(nodes)):
-                silent_showerror(self.root, "Магістраль", "Некоректні індекси вузлів у трасі.")
-                return
+        if len(draft_world) >= 1:
+            for p in draft_world:
+                try:
+                    path_local.append((float(p[0]), float(p[1])))
+                except (TypeError, ValueError, IndexError):
+                    silent_showerror(self.root, "Магістраль", "Некоректна проміжна точка траси.")
+                    return
             try:
-                path_local.append((float(nodes[ii]["x"]), float(nodes[ii]["y"])))
+                ex = float(nodes[int(end_idx)]["x"])
+                ey = float(nodes[int(end_idx)]["y"])
             except (KeyError, TypeError, ValueError):
-                silent_showerror(self.root, "Магістраль", "Не вдалося прочитати координати вузла.")
+                silent_showerror(self.root, "Магістраль", "Не вдалося прочитати координати вузла кінця.")
                 return
+            if not path_local or math.hypot(path_local[-1][0] - ex, path_local[-1][1] - ey) > 1e-9:
+                path_local.append((ex, ey))
+        else:
+            for ii in idxs:
+                if not (0 <= ii < len(nodes)):
+                    silent_showerror(self.root, "Магістраль", "Некоректні індекси вузлів у трасі.")
+                    return
+                try:
+                    path_local.append((float(nodes[ii]["x"]), float(nodes[ii]["y"])))
+                except (KeyError, TypeError, ValueError):
+                    silent_showerror(self.root, "Магістраль", "Не вдалося прочитати координати вузла.")
+                    return
         segs = self.trunk_map_segments
         proposed = {"node_indices": list(idxs), "path_local": path_local}
         ensure_trunk_node_ids(nodes)
         segs.append(proposed)
         self._trunk_route_last_node_idx = int(end_idx)
         self._canvas_trunk_route_draft_indices = []
+        self._canvas_trunk_route_draft_world = []
         self._reset_trunk_route_endpoint_state()
         self.normalize_trunk_segments_to_graph_edges()
         try:
@@ -12031,8 +12297,24 @@ class DripCAD:
         draft = list(getattr(self, "_canvas_trunk_route_draft_indices", []) or [])
 
         if pending is not None:
-            ni, _d = self._nearest_trunk_node_index_world(wx, wy)
-            if ni is None or ni != pending:
+            pending_i = int(pending)
+            r_snap_route = self._trunk_route_snap_radius_m()
+            pending_ok = False
+            if 0 <= pending_i < len(nodes):
+                try:
+                    px = float(nodes[pending_i].get("x"))
+                    py = float(nodes[pending_i].get("y"))
+                    pending_ok = math.hypot(float(wx) - px, float(wy) - py) <= r_snap_route
+                except (TypeError, ValueError):
+                    pending_ok = False
+            if not pending_ok:
+                ni, _d = self._nearest_trunk_node_index_world(
+                    wx,
+                    wy,
+                    snap_radius_m=r_snap_route,
+                )
+                pending_ok = ni is not None and int(ni) == pending_i
+            if not pending_ok:
                 self._trunk_route_endpoint_pending_idx = None
                 silent_showinfo(
                     self.root,
@@ -12040,7 +12322,7 @@ class DripCAD:
                     "Позначку кінця скасовано. ЛКМ на вузол призначення, потім ПКМ на тому ж вузлі.",
                 )
                 return False
-            self._trunk_route_edge_end_idx = int(pending)
+            self._trunk_route_edge_end_idx = pending_i
             self._trunk_route_endpoint_pending_idx = None
             nid = str(nodes[int(self._trunk_route_edge_end_idx)].get("id", "")).strip()
             if not nid:
@@ -12049,7 +12331,8 @@ class DripCAD:
                 self.root,
                 "Магістраль",
                 f"Кінець труби: {nid}. Далі ЛКМ — початковий вузол, потім ЛКМ по трасі "
-                f"(вузли або вільні точки — додаються пікети); ПКМ — з’єднати останню точку з кінцем.",
+                f"(лише по вузлах); пікети додавайте окремим інструментом «Пікет». "
+                f"ПКМ — з’єднати останню точку з кінцем.",
             )
             return False
 
@@ -12177,54 +12460,55 @@ class DripCAD:
         nodes = list(getattr(self, "trunk_map_nodes", []) or [])
         if not nodes:
             return
+        r_snap_route = self._trunk_route_snap_radius_m()
         end_idx = getattr(self, "_trunk_route_edge_end_idx", None)
         if end_idx is None:
-            ni, _dist = self._nearest_trunk_node_index_world(wx, wy)
+            ni, _dist = self._nearest_trunk_node_index_world(
+                wx,
+                wy,
+                snap_radius_m=r_snap_route,
+            )
             if ni is None:
-                r_m = int(max(1, round(self._trunk_snap_radius_m())))
-                silent_showinfo(
-                    self.root,
-                    "Магістраль",
-                    f"Кінець ребра: ЛКМ на вузол призначення, потім ПКМ на тому ж вузлі "
-                    f"(радіус прив’язки ~{r_m} м).",
-                )
                 return
             self._trunk_route_endpoint_pending_idx = int(ni)
             self.redraw()
             return
 
         draft_i = list(getattr(self, "_canvas_trunk_route_draft_indices", []) or [])
-        r_snap = self._trunk_snap_radius_m()
-        ni, dist = self._nearest_trunk_node_index_world(wx, wy)
+        draft_world = list(getattr(self, "_canvas_trunk_route_draft_world", []) or [])
+        r_snap = r_snap_route
+        ni, dist = self._nearest_trunk_node_index_world(
+            wx,
+            wy,
+            snap_radius_m=r_snap_route,
+        )
         if not draft_i:
             if ni is None or dist > r_snap:
-                silent_showinfo(
-                    self.root,
-                    "Магістраль",
-                    "Початок труби: ЛКМ на існуючий вузол магістралі (у радіусі прив’язки). "
-                    "Далі можна ЛКМ по вільній трасі — додадуться пікети.",
-                )
                 return
             if int(ni) == int(end_idx):
-                silent_showinfo(self.root, "Магістраль", "Початок не може збігатися з кінцем ребра.")
                 return
             draft_i.append(int(ni))
+            try:
+                sx = float(nodes[int(ni)]["x"])
+                sy = float(nodes[int(ni)]["y"])
+                draft_world.append((sx, sy))
+            except (KeyError, TypeError, ValueError):
+                return
         else:
             if ni is not None and dist <= r_snap:
                 if int(ni) == int(draft_i[-1]):
-                    silent_showinfo(
-                        self.root,
-                        "Магістраль",
-                        "Оберіть наступну вершину траси (не дублюйте попередню).",
-                    )
                     return
                 draft_i.append(int(ni))
-            else:
-                new_i = self._append_trunk_bend_at_world_xy(float(wx), float(wy))
-                if draft_i and int(new_i) == int(draft_i[-1]):
+                try:
+                    sx = float(nodes[int(ni)]["x"])
+                    sy = float(nodes[int(ni)]["y"])
+                    draft_world.append((sx, sy))
+                except (KeyError, TypeError, ValueError):
                     return
-                draft_i.append(int(new_i))
+            else:
+                draft_world.append((float(wx), float(wy)))
         self._canvas_trunk_route_draft_indices = draft_i
+        self._canvas_trunk_route_draft_world = draft_world
         self.redraw()
 
     def _finish_canvas_trunk_route_segment_legacy(self) -> bool:
@@ -12252,6 +12536,7 @@ class DripCAD:
                 segs.append(proposed)
                 self._trunk_route_last_node_idx = idxs[-1]
                 self._canvas_trunk_route_draft_indices = []
+                self._canvas_trunk_route_draft_world = []
                 self._reset_trunk_route_endpoint_state()
                 self.normalize_trunk_segments_to_graph_edges()
                 try:
@@ -12264,6 +12549,7 @@ class DripCAD:
             self.redraw()
             return True
         self._canvas_trunk_route_draft_indices = []
+        self._canvas_trunk_route_draft_world = []
         self.redraw()
         return True
 
@@ -15333,17 +15619,13 @@ class DripCAD:
     def _draw_canvas_polyline_and_route_drafts(self) -> None:
         ct = getattr(self, "_canvas_special_tool", None)
         if ct == "trunk_route" and len(getattr(self, "trunk_map_nodes", []) or []) > 0:
-            idxs = getattr(self, "_canvas_trunk_route_draft_indices", []) or []
-            nodes = self.trunk_map_nodes
+            pts = list(getattr(self, "_canvas_trunk_route_draft_world", []) or [])
             scr = []
-            for ii in idxs:
-                if 0 <= ii < len(nodes):
-                    try:
-                        scr.extend(
-                            self.to_screen(float(nodes[ii]["x"]), float(nodes[ii]["y"]))
-                        )
-                    except (KeyError, TypeError, ValueError):
-                        pass
+            for p in pts:
+                try:
+                    scr.extend(self.to_screen(float(p[0]), float(p[1])))
+                except (TypeError, ValueError, IndexError):
+                    pass
             if len(scr) >= 4:
                 self.canvas.create_line(
                     scr,
@@ -16554,23 +16836,21 @@ class DripCAD:
             elif ct_pv == "trunk_route":
                 nodes = getattr(self, "trunk_map_nodes", []) or []
                 if len(nodes) > 0:
-                    draft_i = getattr(self, "_canvas_trunk_route_draft_indices", []) or []
-                    if draft_i:
-                        last = draft_i[-1]
-                        if 0 <= last < len(nodes):
-                            try:
-                                nx, ny = float(nodes[last]["x"]), float(nodes[last]["y"])
-                                self.canvas.create_line(
-                                    self.to_screen(nx, ny),
-                                    event.x,
-                                    event.y,
-                                    fill="#D1C4E9",
-                                    dash=(6, 4),
-                                    width=2,
-                                    tags="preview",
-                                )
-                            except (KeyError, TypeError, ValueError):
-                                pass
+                    draft_world = list(getattr(self, "_canvas_trunk_route_draft_world", []) or [])
+                    if draft_world:
+                        try:
+                            nx, ny = float(draft_world[-1][0]), float(draft_world[-1][1])
+                            self.canvas.create_line(
+                                self.to_screen(nx, ny),
+                                event.x,
+                                event.y,
+                                fill="#D1C4E9",
+                                dash=(6, 4),
+                                width=2,
+                                tags="preview",
+                            )
+                        except (TypeError, ValueError, IndexError):
+                            pass
                     ni_vis, snap_ok = self._trunk_route_preview_snap(wx, wy)
                     if ni_vis is not None and 0 <= ni_vis < len(nodes):
                         try:
@@ -16589,9 +16869,9 @@ class DripCAD:
                                 tags="preview",
                             )
                             if snap_ok:
-                                hint = "Прив'язка: ЛКМ додасть вузол"
+                                hint = "Прив'язка: ЛКМ обере вузол"
                             else:
-                                hint = "Оберіть інший вузол (не дублюйте попередній у чернетці)"
+                                hint = "ЛКМ: інший вузол або проміжна точка траси"
                             self.canvas.create_text(
                                 sx + rad + 8,
                                 sy,
@@ -18516,6 +18796,7 @@ class DripCAD:
         self._canvas_trunk_draft_world = None
         self._canvas_polyline_draft = []
         self._canvas_trunk_route_draft_indices = []
+        self._canvas_trunk_route_draft_world = []
         self._trunk_route_endpoint_pending_idx = None
         self._trunk_route_edge_end_idx = None
         if hasattr(self, "var_trunk_display_velocity_warn_mps"):
